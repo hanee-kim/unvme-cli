@@ -18,6 +18,8 @@
 static bool draining, io_rand;
 static unsigned int queued;
 static uint64_t nsze, slba;
+static struct unvme_vcq __vcq;
+static uint32_t __vcq_qid;
 const int data_size = 4096;
 
 static struct {
@@ -44,6 +46,7 @@ static int unvmed_perf_issue(struct unvme_cmd *cmd)
 	iod->sqe.slba = cpu_to_le64(slba);
 	iod->tsubmit = get_ticks();
 
+	cmd->vcq = __vcq_qid;
 	unvmed_cmd_post(cmd, (union nvme_cmd *)&iod->sqe, UNVMED_CMD_F_NODB);
 
 	queued++;
@@ -96,7 +99,7 @@ static int unvmed_perf_reap(struct unvme *u, struct unvme_sq *usq, struct unvme_
 	int ret;
 
 	do {
-		ret = __unvmed_cq_run_n(u, usq, ucq, NULL, cqe, 1, true);
+		ret = __unvmed_cq_run_n(u, usq, ucq, &__vcq, cqe, 1, true);
 		if (!ret)
 			break;
 		reaped++;
@@ -172,6 +175,12 @@ int unvmed_perf(struct unvme *u, uint32_t sqid, uint32_t nsid,
 	usq = unvmed_sq_get(u, sqid);
 	unvmed_cq_get(u, unvmed_sq_cqid(usq));
 
+	if (unvmed_vcq_init(&__vcq, usq->ucq->qsize, &__vcq_qid)) {
+		printf("failed to init vcq\n");
+		ret = -errno;
+		goto out;
+	}
+
 	do {
 		struct iod *iod;
 
@@ -238,6 +247,7 @@ int unvmed_perf(struct unvme *u, uint32_t sqid, uint32_t nsid,
 		unvmed_perf_reap(u, usq, cmd);
 	} while (queued);
 
+	unvmed_vcq_free(&__vcq);
 	unvmed_cq_put(u, usq->ucq);
 	unvmed_sq_put(u, usq);
 

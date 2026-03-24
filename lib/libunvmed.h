@@ -215,7 +215,6 @@ struct name {			\
 	struct unvme_cq *ucq;	\
 	struct unvme_cmd *cmds; \
 	struct unvme_timer timer;	\
-	struct unvme_vcq vcq;	\
 	struct unvme_bitmap cids;\
 	int nr_cmds;		\
 	uint64_t cmd_count[CMD_COUNT_RANGE];	\
@@ -611,17 +610,17 @@ void unvmed_vcq_free(struct unvme_vcq *vcq);
  * unvmed_cmd_get_vcq - Get @vcq instance of the given @cmd
  * @cmd: command instance
  *
- * If application sets @cmd->vcq for their own @vcq qid, it will return the
- * corresponding @vcq looked up by the qid, otherwise @cmd->usq->vcq.
+ * Return the @vcq instance corresponding to @cmd->vcq qid, or NULL if
+ * @cmd->vcq is not set.
  *
- * Return: @vcq instance
+ * Return: @vcq instance, or NULL
  */
 static inline struct unvme_vcq *unvmed_cmd_get_vcq(struct unvme_cmd *cmd)
 {
 	if (cmd->vcq)
 		return unvmed_vcq_get(cmd->vcq);
 
-	return &cmd->usq->vcq;
+	return NULL;
 }
 
 /**

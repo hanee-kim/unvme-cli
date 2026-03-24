@@ -1530,19 +1530,12 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 			return NULL;
 		}
 
-		if (unvmed_vcq_init(&usq->vcq, qsize, &usq->vcq.qid)) {
-			if (alloc)
-				free(usq);
-			return NULL;
-		}
-
 		/*
 		 * @usq instance is safe to be passed to the timeout hander in
 		 * the future since @usq instance will never be freed without
 		 * terminating the pending timer.
 		 */
 		if (unvmed_timer_init(&usq->timer, usq)) {
-			unvmed_vcq_free(&usq->vcq);
 			unvmed_cid_free(usq);
 			free(usq->cmds);
 			free(usq);
@@ -1604,7 +1597,6 @@ static void __unvmed_free_usq(struct unvme *u, struct unvme_sq *usq)
 
 	unvmed_timer_free(&usq->timer);
 	unvmed_cid_free(usq);
-	unvmed_vcq_free(&usq->vcq);
 
 	free(usq->cmds);
 	free(usq);
@@ -2046,13 +2038,7 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq)
 	if (!usq->q)
 		return;
 
-	/*
-	 * Ensure that @usq->ucq to be drained before starting the cancel
-	 * behavior which actually _manipulates_ the @vcq itself by pushing
-	 * fake cq entries with tail pointer being updated to avoid race.
-	 */
 	unvmed_cq_drain(u, usq->ucq);
-	unvmed_vcq_drain(&usq->vcq);
 
 	unvmed_cancel_sq(u, usq);
 
@@ -3006,7 +2992,7 @@ static struct nvme_cqe *__unvmed_get_completion(struct unvme *u,
 	struct unvme_cmd *cmd;
 	struct nvme_cqe __cqe;
 	struct nvme_cqe *cqe = &__cqe;
-	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
+	struct unvme_vcq *__vcq = vcq;
 
 	ret = unvmed_vcq_pop(__vcq, &__cqe);
 	if (ret != -ENOENT) {
@@ -3040,7 +3026,7 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 		      struct unvme_vcq *vcq, struct nvme_cqe *cqes, int nr_cqes,
 		      bool nowait)
 {
-	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
+	struct unvme_vcq *__vcq = vcq;
 	struct nvme_cqe __cqe;
 	struct nvme_cqe *cqe = &__cqe;
 	struct unvme_cmd *cmd;
