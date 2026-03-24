@@ -4294,24 +4294,6 @@ struct json_object *unvmed_to_json(struct unvme *u)
 	}
 	json_object_object_add(status, "sq", sq_array);
 
-	/* Virtual Completion Queues */
-	struct json_object *vcq_array = json_object_new_array();
-	for (int i = 0; i < nr_sqs; i++) {
-		struct unvme_sq *usq = usqs[i];
-		struct json_object *vcq_obj = json_object_new_object();
-
-		json_object_object_add(vcq_obj, "sqid",
-				       json_object_new_int(usq->id));
-		json_object_object_add(vcq_obj, "head",
-				       json_object_new_int(usq->vcq.head));
-		json_object_object_add(vcq_obj, "tail",
-				       json_object_new_int(usq->vcq.tail));
-		json_object_object_add(vcq_obj, "qsize",
-				       json_object_new_int(usq->vcq.qsize));
-		json_object_array_add(vcq_array, vcq_obj);
-	}
-	json_object_object_add(status, "vcq", vcq_array);
-
 	/* Completion Queues */
 	struct json_object *cq_array = json_object_new_array();
 	for (int i = 0; i < nr_cqs; i++) {
