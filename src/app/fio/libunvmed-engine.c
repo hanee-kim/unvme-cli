@@ -1067,7 +1067,7 @@ static int fio_libunvmed_iomem_alloc(struct thread_data *td, size_t total_mem)
 	 * prp_list_iomem / prp_iomem은 read/write 전용이므로 skip한다.
 	 */
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
-		size = unvmed_pgmap(u, &ptr, 0);
+		size = unvmed_pgmap(u, &ptr, 1);
 		if (size < 0) {
 			libunvmed_log("failed to allocate trim placeholder buffer\n");
 			pthread_mutex_unlock(&g_serialize);
