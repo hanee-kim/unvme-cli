@@ -3103,6 +3103,10 @@ static struct nvme_cqe *__unvmed_get_completion(struct unvme *u,
 	}
 
 	unvmed_cq_enter(ucq);
+	if (!ucq->q) {
+		unvmed_cq_exit(ucq);
+		return NULL;
+	}
 	cqe = unvmed_get_completion(u, ucq);
 	if (cqe) {
 		cmd = unvmed_get_cmd(usq, cqe->cid);
