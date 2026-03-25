@@ -127,20 +127,23 @@ size_t unvmed_pagesize(struct unvme *u)
 int __unvmed_mem_alloc(struct unvme *u, size_t size,
 		       struct iommu_dmabuf *buf, size_t pagesize)
 {
+	unvmed_log_debug("allocating DMA buffer (size=%zu, pagesize=%zu)", size, pagesize);
+
 	buf->ctx = __iommu_ctx(&u->ctrl);
 	buf->len = unvmed_pgmap_aligned(u, &buf->vaddr, size, pagesize);
 	if (buf->len < 0) {
-		unvmed_log_err("failed to allocate a buffer");
+		unvmed_log_err("failed to allocate a buffer (size=%zu)", size);
 		return -1;
 	}
 
 	buf->iova = (uint64_t)buf->vaddr;
 	if (iommu_map_vaddr(buf->ctx, buf->vaddr, buf->len, &buf->iova, IOMMU_MAP_FIXED_IOVA)) {
 		unvmed_pgunmap(buf->vaddr);
-		unvmed_log_err("failed to map a buffer to IOMMU");
+		unvmed_log_err("failed to map a buffer to IOMMU (vaddr=%p, len=%zu)", buf->vaddr, buf->len);
 		return -1;
 	}
 
+	unvmed_log_debug("DMA buffer allocated (vaddr=%p, iova=%#lx, len=%zu)", buf->vaddr, buf->iova, buf->len);
 	return 0;
 }
 
@@ -827,8 +830,12 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 	struct unvme *u;
 
 	u = unvmed_get(bdf);
-	if (u)
+	if (u) {
+		unvmed_log_debug("controller already exists, returning existing instance (bdf=%s)", bdf);
 		return u;
+	}
+
+	unvmed_log_info("initializing controller (bdf=%s, max_nr_ioqs=%u)", bdf, max_nr_ioqs);
 
 	u = zmalloc(sizeof(struct unvme));
 
@@ -840,6 +847,7 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 	opts.ncqr = max_nr_ioqs - 1;
 
 	if (nvme_ctrl_init(&u->ctrl, bdf, &opts)) {
+		unvmed_log_err("failed to init nvme_ctrl (bdf=%s)", bdf);
 		free(u);
 		return NULL;
 	}
@@ -891,6 +899,9 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 
 	list_head_init(&u->mem_list);
 	pthread_rwlock_init(&u->mem_list_lock, NULL);
+
+	unvmed_log_info("controller initialized (bdf=%s, nr_sqs=%u, nr_cqs=%u)",
+			bdf, u->nr_sqs, u->nr_cqs);
 
 	return u;
 }
@@ -978,6 +989,8 @@ int unvmed_init_ns(struct unvme *u, uint32_t nsid, void *identify)
 	struct unvme_ns *prev;
 	uint8_t format_idx;
 
+	unvmed_log_debug("initializing namespace (nsid=%u)", nsid);
+
 	if (!id_ns) {
 		unvmed_pgmap(u, (void **)&id_ns, sizeof(struct nvme_id_ns));
 		if (!id_ns) {
@@ -1032,6 +1045,9 @@ int unvmed_init_ns(struct unvme *u, uint32_t nsid, void *identify)
 	}
 
 	ns->enabled = true;
+
+	unvmed_log_info("namespace initialized (nsid=%u, lba_size=%u, nr_lbas=%llu)",
+			nsid, ns->lba_size, (unsigned long long)ns->nr_lbas);
 
 	if (id_ns != identify)
 		unvmed_pgunmap(id_ns);
@@ -1582,17 +1598,21 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 
 void unvmed_enable_sq(struct unvme_sq *usq)
 {
+	unvmed_log_debug("enabling sq (qid=%u)", unvmed_sq_id(usq));
 	atomic_store_release(&usq->enabled, true);
 }
 
 void unvmed_disable_sq(struct unvme_sq *usq)
 {
+	unvmed_log_debug("disabling sq (qid=%u)", unvmed_sq_id(usq));
 	atomic_store_release(&usq->enabled, false);
 }
 
 static void __unvmed_free_usq(struct unvme *u, struct unvme_sq *usq)
 {
 	uint32_t qid = unvmed_sq_id(usq);
+
+	unvmed_log_debug("freeing sq (qid=%u)", qid);
 
 	/*
 	 * Prevent accessing @u->sqs array after free(usq) by NULL-ing first.
@@ -1667,17 +1687,21 @@ static struct unvme_cq *unvmed_init_ucq(struct unvme *u, uint32_t qid,
 
 void unvmed_enable_cq(struct unvme_cq *ucq)
 {
+	unvmed_log_debug("enabling cq (qid=%u)", unvmed_cq_id(ucq));
 	atomic_store_release(&ucq->enabled, true);
 }
 
 void unvmed_disable_cq(struct unvme_cq *ucq)
 {
+	unvmed_log_debug("disabling cq (qid=%u)", unvmed_cq_id(ucq));
 	atomic_store_release(&ucq->enabled, false);
 }
 
 static void __unvmed_free_ucq(struct unvme *u, struct unvme_cq *ucq)
 {
 	uint32_t qid = unvmed_cq_id(ucq);
+
+	unvmed_log_debug("freeing cq (qid=%u)", qid);
 
 	/*
 	 * Prevent accessing @u->cqs array after free(ucq) by NULL-ing first.
@@ -1710,6 +1734,8 @@ static void unvmed_free_ns_all(struct unvme *u)
 void unvmed_free_ctrl(struct unvme *u)
 {
 	int qid;
+
+	unvmed_log_info("freeing controller (bdf=%s)", unvmed_bdf(u));
 
 	/*
 	 * Make sure reaper thread to read the proper state value.
@@ -1772,19 +1798,25 @@ static int __unvme_reset_ctrl(struct unvme *u)
 	uint32_t cc;
 	uint32_t csts;
 
+	unvmed_log_info("resetting controller (bdf=%s)", unvmed_bdf(u));
+
 	if (!unvmed_ctrl_set_state(u, UNVME_RESETTING)) {
+		unvmed_log_err("failed to transition to RESETTING state (bdf=%s)", unvmed_bdf(u));
 		errno = EBUSY;
 		return -1;
 	}
 
 	cc = unvmed_read32(u, NVME_REG_CC);
 	unvmed_write32(u, NVME_REG_CC, cc & ~(1 << NVME_CC_EN_SHIFT));
+
+	unvmed_log_debug("waiting for CSTS.RDY to clear (bdf=%s)", unvmed_bdf(u));
 	while (1) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
 		if (!NVME_CSTS_RDY(csts))
 			break;
 	}
 
+	unvmed_log_info("controller reset complete (bdf=%s)", unvmed_bdf(u));
 	return 0;
 }
 
@@ -2403,7 +2435,11 @@ int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 	uint32_t cc;
 	uint32_t csts;
 
+	unvmed_log_info("enabling controller (bdf=%s, iosqes=%u, iocqes=%u, mps=%u, ams=%u, css=%u, timeout=%d)",
+			unvmed_bdf(u), iosqes, iocqes, mps, ams, css, timeout);
+
 	if (!unvmed_ctrl_set_state(u, UNVME_ENABLING)) {
+		unvmed_log_err("failed to transition to ENABLING state (bdf=%s)", unvmed_bdf(u));
 		errno = EBUSY;
 		return -1;
 	}
@@ -2423,6 +2459,7 @@ int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 		1 << NVME_CC_EN_SHIFT;
 	unvmed_write32(u, NVME_REG_CC, cc);
 
+	unvmed_log_debug("waiting for CSTS.RDY (bdf=%s, CC=%#x)", unvmed_bdf(u), cc);
 	while (1) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
 		if (NVME_CSTS_RDY(csts))
@@ -2441,6 +2478,7 @@ int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 		unvmed_enable_sq(u->asq);
 
 	unvmed_ctrl_set_state(u, UNVME_ENABLED);
+	unvmed_log_info("controller enabled (bdf=%s)", unvmed_bdf(u));
 	return 0;
 }
 
@@ -2453,6 +2491,8 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 	struct nvme_cmd_create_cq *sqe;
 	uint16_t qflags = 0;
 	uint16_t iv = 0;
+
+	unvmed_log_debug("creating iocq (qid=%u, qsize=%u, vector=%d, pc=%u)", qid, qsize, vector, pc);
 
 	if (vector >= 0 && unvmed_init_irq(u, vector)) {
 		unvmed_log_err("failed to initialize irq (nr_irqs=%d, vector=%d, errno=%d \"%s\")",
@@ -2548,6 +2588,8 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 
 	unvmed_enable_cq(ucq);
 
+	unvmed_log_info("iocq created (qid=%u, qsize=%u, vector=%d)", qid, qsize, vector);
+
 	unvmed_cmd_put(cmd);
 	unvmed_sq_put(u, asq);
 	return 0;
@@ -2558,6 +2600,8 @@ static void __unvmed_delete_cq(struct unvme *u, struct unvme_cq *ucq)
 	uint32_t qid = unvmed_cq_id(ucq);
 	int vector = unvmed_cq_iv(ucq);
 	bool irq = unvmed_cq_irq_enabled(ucq);
+
+	unvmed_log_debug("deleting cq (qid=%u, vector=%d, irq=%d)", qid, vector, irq);
 
 	unvmed_discard_cq(u, qid);
 	unvmed_cq_put(u, ucq);
@@ -2664,7 +2708,11 @@ int unvmed_create_sq(struct unvme *u, uint32_t qid, uint32_t qsize,
 	struct nvme_cmd_create_sq *sqe;
 	uint16_t qflags = 0;
 
+	unvmed_log_debug("creating iosq (qid=%u, qsize=%u, cqid=%u, qprio=%u, pc=%u)",
+			 qid, qsize, cqid, qprio, pc);
+
 	if (!unvmed_ctrl_enabled(u)) {
+		unvmed_log_err("controller not enabled, cannot create sq (qid=%u)", qid);
 		errno = EPERM;
 		return -1;
 	}
@@ -2760,6 +2808,8 @@ int unvmed_create_sq(struct unvme *u, uint32_t qid, uint32_t qsize,
 	}
 	unvmed_enable_sq(usq);
 
+	unvmed_log_info("iosq created (qid=%u, qsize=%u, cqid=%u)", qid, qsize, cqid);
+
 	unvmed_cmd_put(cmd);
 	unvmed_cq_put(u, ucq);
 	unvmed_sq_put(u, asq);
@@ -2769,6 +2819,8 @@ int unvmed_create_sq(struct unvme *u, uint32_t qid, uint32_t qsize,
 static void __unvmed_delete_sq(struct unvme *u, struct unvme_sq *usq)
 {
 	uint32_t qid = unvmed_sq_id(usq);
+
+	unvmed_log_debug("deleting sq (qid=%u)", qid);
 
 	unvmed_discard_sq(u, qid);
 	unvmed_sq_put(u, usq);
