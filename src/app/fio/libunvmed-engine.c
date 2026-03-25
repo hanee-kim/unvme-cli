@@ -905,11 +905,12 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 	}
 
 	/*
-	 * .open_file() is not called in trim-only workloads at all.  To avoid
-	 * 0-sized memory allocation, we should check the orig_buffer_size
-	 * here.
+	 * trim-only 워크로드는 orig_buffer가 1 page짜리 placeholder이고
+	 * 실제 NVMe 커맨드에 사용되지 않으므로 IOMMU 매핑을 skip한다.
+	 * read/write의 경우 orig_buffer_size가 0일 수 있으므로 기존 체크 유지.
 	 */
-	if (ld->orig_buffer_size) {
+	if (ld->orig_buffer_size &&
+	    td->o.td_ddir != TD_DDIR_TRIM && td->o.td_ddir != TD_DDIR_RANDTRIM) {
 		if (o->cmb_data)
 			unvmed_to_iova(u, td->orig_buffer, &ld->orig_buffer_iova);
 		else {
@@ -1021,7 +1022,8 @@ static int fio_libunvmed_close_file(struct thread_data *td,
 			libunvmed_log("failed to unmap prp iomem from iommu\n");
 	}
 
-	if (td->orig_buffer && !o->cmb_data) {
+	if (td->orig_buffer && !o->cmb_data &&
+	    td->o.td_ddir != TD_DDIR_TRIM && td->o.td_ddir != TD_DDIR_RANDTRIM) {
 		ret = unvmed_unmap_vaddr(ld->u, td->orig_buffer);
 		if (ret)
 			libunvmed_log("failed to unmap io_u buffers from iommu\n");
@@ -1054,6 +1056,27 @@ static int fio_libunvmed_iomem_alloc(struct thread_data *td, size_t total_mem)
 	if (ret) {
 		libunvmed_log("failed to grab mutex lock\n");
 		return ret;
+	}
+
+	/*
+	 * trim-only 워크로드는 data buffer가 필요 없고 trim_iomem을 사용한다.
+	 * 그러나 fio가 iomem_alloc 호출 후 td->orig_buffer 기반으로 io_u->buf를
+	 * 세팅할 수 있으므로 NULL을 피하기 위해 1 page만 할당한다.
+	 * (엔진이 io_u_init에서 io_u->buf를 trim_iomem으로 덮어쓰기 때문에
+	 *  orig_buffer는 실제로 NVMe 커맨드에 사용되지 않는다.)
+	 * prp_list_iomem / prp_iomem은 read/write 전용이므로 skip한다.
+	 */
+	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
+		size = unvmed_pgmap(u, &ptr, 1);
+		if (size < 0) {
+			libunvmed_log("failed to allocate trim placeholder buffer\n");
+			pthread_mutex_unlock(&g_serialize);
+			return 1;
+		}
+		td->orig_buffer = (char *)ptr;
+		ld->orig_buffer_size = size;
+		pthread_mutex_unlock(&g_serialize);
+		return 0;
 	}
 
 	if (o->cmb_data) {
