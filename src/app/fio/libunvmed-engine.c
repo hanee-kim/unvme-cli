@@ -1393,7 +1393,14 @@ static enum fio_q_status fio_libunvmed_rw(struct thread_data *td,
 	void *list = NULL;
 	size_t len = io_u->xfer_buflen;
 	void *mbuf = mo->mbuf;
-	size_t mlen = mo->mlen;
+	/*
+	 * Calculate the actual metadata length for this I/O based on the
+	 * actual transfer size, not the maximum (md_per_io_size).  This
+	 * matches fio's io_uring engine behavior where metadata_len is
+	 * computed as (nlb + 1) * ms per I/O, enabling correct operation
+	 * with bsrange when pi_act=0 and pi_chk=GUARD.
+	 */
+	size_t mlen = mbuf ? (io_u->xfer_buflen / ns->lba_size) * ns->ms : 0;
 	int ret;
 
 	if (o->prp1_offset)
