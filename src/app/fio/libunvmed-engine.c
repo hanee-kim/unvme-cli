@@ -662,20 +662,31 @@ static int libunvmed_init_data(struct thread_data *td)
 	/*
 	 * The given ``bs`` may not be fit with the namespace format.  To prevent
 	 * variable error cases, we have to handle this as an error and notice to user.
+	 *
+	 * For DIF mode, ``bs`` is accepted as a multiple of the data lba_size only.
+	 * The engine internally extends it to include ms per LBA so that FIO
+	 * allocates buffers of the correct size for the interleaved data+metadata
+	 * layout, and file size is reported in DIF-space accordingly.
 	 */
-	if (!libunvmed_ns_meta_is_dif(ns))
-		lba_size = ns->lba_size;
-	else
-		lba_size = ns->lba_size + ns->ms;
+	lba_size = ns->lba_size;
 
 	for_each_rw_ddir(ddir) {
-		if (td->o.max_bs[ddir] > max_xfer_size) {
-			libunvmed_log("bs must be smaller than max_xfer_size (%ld bytes)\n", max_xfer_size);
+		if (td->o.min_bs[ddir] % lba_size || td->o.max_bs[ddir] % lba_size) {
+			libunvmed_log("bs must be multiple of %d\n", lba_size);
 			return -EINVAL;
 		}
 
-		if (td->o.min_bs[ddir] % lba_size || td->o.max_bs[ddir] % lba_size) {
-			libunvmed_log("bs must be multiple of %d\n", lba_size);
+		/*
+		 * Extend bs to DIF-space (data + ms per LBA) so that FIO allocates
+		 * the right buffer size for interleaved data and metadata.
+		 */
+		if (libunvmed_ns_meta_is_dif(ns) && ns->ms) {
+			td->o.min_bs[ddir] = (td->o.min_bs[ddir] / lba_size) * (lba_size + ns->ms);
+			td->o.max_bs[ddir] = (td->o.max_bs[ddir] / lba_size) * (lba_size + ns->ms);
+		}
+
+		if (td->o.max_bs[ddir] > max_xfer_size) {
+			libunvmed_log("bs must be smaller than max_xfer_size (%ld bytes)\n", max_xfer_size);
 			return -EINVAL;
 		}
 
@@ -1931,7 +1942,10 @@ static int fio_libunvmed_get_file_size(struct thread_data *td, struct fio_file *
 
 	ld = td->io_ops_data;
 
-	f->real_file_size = ld->ns->lba_size * ld->ns->nr_lbas;
+	if (libunvmed_ns_meta_is_dif(ld->ns) && ld->ns->ms)
+		f->real_file_size = (ld->ns->lba_size + ld->ns->ms) * ld->ns->nr_lbas;
+	else
+		f->real_file_size = ld->ns->lba_size * ld->ns->nr_lbas;
 	fio_file_set_size_known(f);
 
 	return 0;
