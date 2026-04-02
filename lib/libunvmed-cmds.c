@@ -188,8 +188,11 @@ static int unvmed_sqe_set_tags(struct unvme *u, uint32_t nsid, struct nvme_cmd_r
 
 static void unvmed_buf_free(struct unvme *u, struct unvme_buf *buf)
 {
-	if (buf->flags & UNVME_CMD_BUF_F_IOVA_UNMAP)
-		unvmed_unmap_vaddr(u, buf->va);
+	if (buf->flags & UNVME_CMD_BUF_F_IOVA_UNMAP) {
+		if (unvmed_unmap_vaddr(u, buf->va))
+			unvmed_log_err("failed to unmap vaddr=%p, possible IOMMU mapping leak",
+					buf->va);
+	}
 
 	if (buf->flags & UNVME_CMD_BUF_F_VA_UNMAP)
 		unvmed_pgunmap(buf->va);
