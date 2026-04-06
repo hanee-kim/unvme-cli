@@ -19,13 +19,24 @@ static void unvmed_fio_reset(const char *libfio)
 {
 	void *handle;
 
-	handle = dlopen(libfio, RTLD_NOLOAD);
-	if (handle)
-		dlclose(handle);
-
+	/*
+	 * Close ioengine first since it depends on fio's symbols.
+	 *
+	 * dlopen(RTLD_NOLOAD) increments the reference count, so we must call
+	 * dlclose() twice: once to undo the RTLD_NOLOAD reference and once to
+	 * actually release the previously leaked handle.
+	 */
 	handle = dlopen(UNVME_FIO_IOENGINE, RTLD_NOLOAD);
-	if (handle)
+	if (handle) {
 		dlclose(handle);
+		dlclose(handle);
+	}
+
+	handle = dlopen(libfio, RTLD_NOLOAD);
+	if (handle) {
+		dlclose(handle);
+		dlclose(handle);
+	}
 }
 
 int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
@@ -128,8 +139,13 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 out:
 	free(__argv);
 
-	dlclose(fio);
+	/*
+	 * Close ioengine before fio since the ioengine destructor
+	 * (fio_libunvmed_unregister) calls back into fio's unregister_ioengine().
+	 * Closing fio first would leave the destructor calling into freed memory.
+	 */
 	dlclose(ioengine);
+	dlclose(fio);
 
 	return ret;
 }
