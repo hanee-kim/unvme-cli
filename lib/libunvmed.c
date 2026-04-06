@@ -148,6 +148,19 @@ static int __unvmed_mem_free(struct unvme *u, uint64_t iova);
 
 static LIST_HEAD(unvme_list);
 
+static int __unvmed_pack_bdf(const char *bdf, uint32_t *devid)
+{
+	unsigned int domain, bus, device, func;
+
+	if (sscanf(bdf, "%x:%x:%x.%x", &domain, &bus, &device, &func) != 4) {
+		unvmed_log_err("failed to parse bdf string: '%s'", bdf);
+		return -EINVAL;
+	}
+
+	*devid = (domain << 16) | (bus << 8) | (device << 3) | func;
+	return 0;
+}
+
 static int unvmed_create_logfile(const char *logfile)
 {
 	int fd;
@@ -973,6 +986,11 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 
 	list_head_init(&u->mem_list);
 	pthread_rwlock_init(&u->mem_list_lock, NULL);
+
+	if (__unvmed_pack_bdf(unvmed_bdf(u), &u->devid)) {
+		unvmed_free_ctrl(u);
+		return NULL;
+	}
 
 	unvmed_log_info("%s: controller initialized (nr_sqs=%u, nr_cqs=%u)",
 			unvmed_bdf(u), u->nr_sqs, u->nr_cqs);
@@ -3110,12 +3128,13 @@ static struct nvme_cqe *__unvmed_get_completion(struct unvme *u,
 {
 	int ret;
 	struct unvme_cmd *cmd;
-	struct nvme_cqe __cqe;
-	struct nvme_cqe *cqe = &__cqe;
+	struct unvme_vcqe __entry;
+	struct nvme_cqe *cqe;
 	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
 
-	ret = unvmed_vcq_pop(__vcq, &__cqe);
+	ret = unvmed_vcq_pop(__vcq, &__entry);
 	if (ret != -ENOENT) {
+		cqe = &__entry.cqe;
 		cmd = unvmed_get_cmd(usq, cqe->cid);
 		if (cmd) {
 			__unvmed_cmd_cmpl(cmd, cqe);
@@ -3147,8 +3166,8 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 		      bool nowait)
 {
 	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
-	struct nvme_cqe __cqe;
-	struct nvme_cqe *cqe = &__cqe;
+	struct unvme_vcqe __entry;
+	struct nvme_cqe *cqe;
 	struct unvme_cmd *cmd;
 	int nr_cmds;
 	int nr = 0;
@@ -3157,12 +3176,13 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 	while (nr < nr_cqes) {
 		if (unvmed_cq_irq_enabled(ucq)) {
 			do {
-				ret = unvmed_vcq_pop(__vcq, &__cqe);
+				ret = unvmed_vcq_pop(__vcq, &__entry);
 			} while (ret == -ENOENT && !nowait);
 
 			if (ret)
 				break;
 
+			cqe = &__entry.cqe;
 			cmd = unvmed_get_cmd(usq, cqe->cid);
 			if (cmd)
 				__unvmed_cmd_cmpl(cmd, cqe);

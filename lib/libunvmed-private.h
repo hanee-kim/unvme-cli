@@ -84,6 +84,13 @@ struct unvme {
 	int shmem_fd;
 	char shmem_name[64];
 
+	/*
+	 * BDF packed as a uint32_t: (domain<<16)|(bus<<8)|(device<<3)|func.
+	 * Precomputed at unvmed_init_ctrl() time so vcqe push is a single
+	 * 4-byte store with no string copy.
+	 */
+	uint32_t devid;
+
 	struct list_node list;
 };
 

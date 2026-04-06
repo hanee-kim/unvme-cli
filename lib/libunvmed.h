@@ -134,6 +134,43 @@ struct unvme_bitmap {
 	int top;
 };
 
+/*
+ * struct unvme_vcqe - Virtual CQ entry wrapping an NVMe CQE
+ * @cqe: standard NVMe completion queue entry (16 bytes)
+ * @devid: BDF of the source controller encoded as
+ *              (domain<<16)|(bus<<8)|(device<<3)|func.  Precomputed at
+ *              init time so push is a single 4-byte store.  Self-contained:
+ *              remains valid after controller teardown, no map lookup needed.
+ * @rsvd: padding to reach 32 bytes
+ *
+ * Sized to 32 bytes (power-of-2) so that entries are always contained within
+ * a single 64-byte cache line (2 entries per line), avoiding cache line splits
+ * that would occur with an 18-byte layout (entry 3, 6, 9... would straddle
+ * two cache lines).
+ */
+struct unvme_vcqe {
+	struct nvme_cqe cqe;         /* 16 bytes */
+	uint32_t        devid;  /*  4 bytes: (domain<<16)|(bus<<8)|(dev<<3)|fn */
+	uint8_t         rsvd[12];    /* 12 bytes: padding to 32 */
+};                               /* 32 bytes, 2 per cache line */
+
+_Static_assert(sizeof(struct unvme_vcqe) == 32,
+	       "unvme_vcqe must be 32 bytes");
+
+/**
+ * unvmed_unpack_bdf - Decode a packed BDF value into a BDF string
+ * @packed: value produced by unvmed_init_ctrl() stored in unvme_vcqe.devid
+ * @bdf: output buffer of at least 13 bytes ("dddd:bb:dd.f\0")
+ */
+static inline void unvmed_unpack_bdf(uint32_t packed, char *bdf)
+{
+	snprintf(bdf, 13, "%04x:%02x:%02x.%d",
+		 (packed >> 16) & 0xffff,
+		 (packed >>  8) & 0xff,
+		 (packed >>  3) & 0x1f,
+		 (packed >>  0) & 0x7);
+}
+
 struct unvme_vcq {
 	uint32_t qid;
 	int qsize;
@@ -142,8 +179,8 @@ struct unvme_vcq {
 
 	pthread_spinlock_t tail_lock;
 
-	/* CQE array for @qsize */
-	struct nvme_cqe *cqe;
+	/* Entry array for @qsize; each entry carries the CQE and its source controller */
+	struct unvme_vcqe *vcqe;
 };
 
 /*
@@ -625,16 +662,17 @@ static inline struct unvme_vcq *unvmed_cmd_get_vcq(struct unvme_cmd *cmd)
 }
 
 /**
- * unvmed_vcq_pop - Pop a CQE from the virtual completion queue
+ * unvmed_vcq_pop - Pop an entry from the virtual completion queue
  * @q: virtual completion queue instance
- * @cqe: output completion queue entry
+ * @entry: output entry carrying the CQE and the source controller BDF
  *
- * Pop a single CQE from @q.  The caller is the sole consumer; no locking is
- * required on the head side.
+ * Pop a single entry from @q.  The caller is the sole consumer; no locking is
+ * required on the head side.  @entry->devid encodes the source controller
+ * BDF; use unvmed_unpack_bdf() to decode it to a human-readable string.
  *
  * Return: ``0`` on success, ``-ENOENT`` if @q is empty.
  */
-int unvmed_vcq_pop(struct unvme_vcq *q, struct nvme_cqe *cqe);
+int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *entry);
 
 /**
  * unvmed_vcq_drain - Wait until the virtual completion queue is empty
@@ -648,14 +686,14 @@ void unvmed_vcq_drain(struct unvme_vcq *vcq);
  * unvmed_vcq_run_n - Run the given @vcq for [min, max]
  * @u: &struct unvme
  * @vcq: virtual completion queue instance to reap
- * @cqes: output completion queue entry list array
+ * @vcqe: output vcqe array; each element carries the CQE and source controller
  * @min: minimum number of to fetch (mandatory)
  * @max: maximum number of to fetch (best effort)
  *
- * Return: Number of cq entries fetched
+ * Return: Number of vcqe fetched
  */
 int unvmed_vcq_run_n(struct unvme *u, struct unvme_vcq *vcq,
-		     struct nvme_cqe *cqes, int min, int max);
+		     struct unvme_vcqe *vcqe, int min, int max);
 
 /**
  * unvmed_vcq_push - Push the given @cqe to @cmd->vcq
