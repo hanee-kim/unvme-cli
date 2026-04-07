@@ -2659,38 +2659,58 @@ struct json_object *unvmed_to_json(struct unvme *u);
  * each handle returned by unvmed_fio_run(); both free the handle.
  */
 
-struct unvmed_fio;
-
-/**
- * unvmed_fio_run - Run fio as a background pthread
- * @libfio: path to the fio shared object
- * @argc:   number of elements in @argv
- * @argv:   fio argument vector (argv[0] is the program name)
+/*
+ * fio thread runner API
  *
- * Return: opaque handle on success, ``NULL`` on error with ``errno`` set.
+ * Run fio (built as a shared library) in a background pthread.  Only one fio
+ * instance runs at a time; state is maintained globally inside libunvmed.
+ *
+ * Typical usage:
+ *
+ *   unvmed_fio_set_libpath("/path/to/libfio.so");   // once at startup
+ *
+ *   unvmed_fio_run("test.fio");
+ *
+ *   while (!unvmed_fio_done(&ret)) {
+ *       // ... do other work or sleep ...
+ *       if (something_wrong)
+ *           ret = unvmed_fio_cancel();
+ *   }
  */
-struct unvmed_fio *unvmed_fio_run(const char *libfio, int argc, char *argv[]);
 
 /**
- * unvmed_fio_wait - Wait for a fio thread to finish naturally
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_set_libpath - Set the path to the fio shared library
+ * @libfio: path to fio built as a shared object
  *
- * Blocks until the fio thread exits.  Frees @fio.
- *
- * Return: fio exit status.
+ * Must be called once before the first unvmed_fio_run() call.
  */
-int unvmed_fio_wait(struct unvmed_fio *fio);
+void unvmed_fio_set_libpath(const char *libfio);
 
 /**
- * unvmed_fio_cancel - Terminate a running fio thread
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_run - Run fio with the given job file in a background thread
+ * @jobfile: path to the fio job file
  *
- * Sends SIGINT to the fio thread.  If the thread does not exit within the
- * cancellation timeout, pthread_cancel() is used as a last resort.
- * Blocks until the thread has fully exited, then frees @fio.
+ * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
+ */
+int unvmed_fio_run(char *jobfile);
+
+/**
+ * unvmed_fio_done - Non-blocking check whether fio has finished
+ * @ret: if non-NULL and fio is done, receives the fio exit status
+ *
+ * Return: ``true`` if fio has completed (or was never started), ``false``
+ * if still running.
+ */
+bool unvmed_fio_done(int *ret);
+
+/**
+ * unvmed_fio_cancel - Terminate the running fio thread
+ *
+ * Sends SIGINT; if the thread does not exit within the cancellation timeout,
+ * falls back to pthread_cancel().  Blocks until the thread has fully exited.
  *
  * Return: fio exit status, or ``-ETIMEDOUT`` if force-cancelled.
  */
-int unvmed_fio_cancel(struct unvmed_fio *fio);
+int unvmed_fio_cancel(void);
 
 #endif
