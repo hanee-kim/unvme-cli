@@ -500,7 +500,24 @@ static void unvme_signal_job(struct unvme_msg *msg)
 	}
 
 	pthread_kill(job->thread, unvme_msg_signum(msg));
-	pthread_join(job->thread, NULL);
+
+	/*
+	 * Wait for the job thread to terminate gracefully.  If it doesn't
+	 * respond within the timeout (e.g., stuck in I/O), force-cancel it.
+	 * pthread_cancel() causes the thread to exit at the next cancellation
+	 * point; cleanup handlers registered via pthread_cleanup_push() ensure
+	 * dlopen'd libraries are properly closed even in this path.
+	 */
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += 5;
+
+	if (pthread_timedjoin_np(job->thread, NULL, &ts) != 0) {
+		unvmed_log_err("job (pid=%d) did not terminate within timeout, "
+				"force-cancelling", job->client_pid);
+		pthread_cancel(job->thread);
+		pthread_join(job->thread, NULL);
+	}
 
 	if (unvme_msg_signum(msg) == SIGINT || unvme_msg_signum(msg) == SIGTERM)
 		unvme_del_job(unvme_msg_pid(msg));

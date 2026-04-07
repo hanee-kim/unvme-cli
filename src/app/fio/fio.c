@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <setjmp.h>
 #include <string.h>
+#include <pthread.h>
 
 #define UNVME_FIO_IOENGINE	"libunvmed-ioengine.so"
 
@@ -28,17 +29,48 @@ static void unvmed_fio_reset(const char *libfio)
 		dlclose(handle);
 }
 
+struct __fio_cleanup_args {
+	void **fio;
+	void **ioengine;
+	char ***argv;
+};
+
+static void __fio_cleanup(void *arg)
+{
+	struct __fio_cleanup_args *args = (struct __fio_cleanup_args *)arg;
+
+	free(*args->argv);
+
+	if (*args->fio)
+		dlclose(*args->fio);
+	if (*args->ioengine)
+		dlclose(*args->ioengine);
+}
+
 int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 {
 	int (*main)(int, char *[], char *[]);
-	char **__argv;
+	char **__argv = NULL;
 	const int nr_def_argc = 2;
 	int ret = 0;
 
-	void *fio;
-	void *ioengine;
+	void *fio = NULL;
+	void *ioengine = NULL;
 
 	jmp_buf jump;
+
+	/*
+	 * Register a cleanup handler so that dlopen'd libraries are properly
+	 * closed even when the thread is force-cancelled via pthread_cancel().
+	 * In the normal or longjmp exit path we call pthread_cleanup_pop(0) to
+	 * skip the handler and do cleanup ourselves at the 'out' label below.
+	 */
+	struct __fio_cleanup_args __cleanup_args = {
+		.fio = &fio,
+		.ioengine = &ioengine,
+		.argv = &__argv,
+	};
+	pthread_cleanup_push(__fio_cleanup, &__cleanup_args);
 
 	/*
 	 * If the previous app handle has not been closed yet, close here
@@ -60,7 +92,8 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	if (!fio) {
 		fprintf(stderr, "failed to load shared object '%s'.  "
 				"Give proper path to 'unvme start --with-fio=<path/to/fio/so>'\n", libfio);
-		return -1;
+		ret = -1;
+		goto out;
 	}
 
 	/*
@@ -71,14 +104,16 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	ioengine = dlopen(UNVME_FIO_IOENGINE, RTLD_LAZY);
 	if (!ioengine) {
 		fprintf(stderr, "failed to load ioengine %s\n", UNVME_FIO_IOENGINE);
-		return -1;
+		ret = -1;
+		goto out;
 	}
 
 	main = dlsym(fio, "main");
 	if (dlerror()) {
 		fprintf(stderr, "failed to load 'main' symbol in fio. "
 				"Maybe forgot to give 'unvme start --with-fio=<path/to/fio/so>'\n");
-		return errno;
+		ret = errno;
+		goto out;
 	}
 
 	/*
@@ -99,7 +134,8 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 
 			if (asprintf(&__argv[i], "--output=%s", output) < 0) {
 				fprintf(stderr, "failed to form --output=\n");
-				return errno;
+				ret = errno;
+				goto out;
 			}
 		} else
 			__argv[i] = argv[i];
@@ -126,10 +162,19 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	ret = main(argc + nr_def_argc, __argv, environ);
 
 out:
+	/*
+	 * Pop the cleanup handler without executing it; we handle cleanup
+	 * explicitly below.  The handler only runs when pthread_cancel()
+	 * unwinds the thread before reaching this point.
+	 */
+	pthread_cleanup_pop(0);
+
 	free(__argv);
 
-	dlclose(fio);
-	dlclose(ioengine);
+	if (fio)
+		dlclose(fio);
+	if (ioengine)
+		dlclose(ioengine);
 
 	return ret;
 }
