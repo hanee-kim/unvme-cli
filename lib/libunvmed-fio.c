@@ -180,7 +180,7 @@ out:
 	}
 
 	g_ret = ret;
-	return NULL;
+	return (void *)(intptr_t)ret;
 }
 
 /**
@@ -241,12 +241,14 @@ bool unvmed_fio_done(int *ret)
 		return true;
 	}
 
-	if (pthread_tryjoin_np(g_thread, NULL) != 0)
+	void *retval;
+
+	if (pthread_tryjoin_np(g_thread, &retval) != 0)
 		return false;
 
 	g_running = false;
 	if (ret)
-		*ret = g_ret;
+		*ret = (int)(intptr_t)retval;
 	return true;
 }
 
@@ -266,6 +268,7 @@ bool unvmed_fio_done(int *ret)
 int unvmed_fio_cancel(void)
 {
 	struct timespec ts;
+	void *retval;
 
 	if (!g_running)
 		return g_ret;
@@ -275,16 +278,16 @@ int unvmed_fio_cancel(void)
 	clock_gettime(CLOCK_REALTIME, &ts);
 	ts.tv_sec += UNVME_FIO_CANCEL_TIMEOUT_SEC;
 
-	if (pthread_timedjoin_np(g_thread, NULL, &ts) == 0) {
+	if (pthread_timedjoin_np(g_thread, &retval, &ts) == 0) {
 		g_running = false;
-		return g_ret;
+		return (int)(intptr_t)retval;
 	}
 
 	unvmed_log_err("fio thread did not exit within %d seconds, "
 			"force-cancelling", UNVME_FIO_CANCEL_TIMEOUT_SEC);
 
 	pthread_cancel(g_thread);
-	pthread_join(g_thread, NULL);
+	pthread_join(g_thread, &retval);
 	g_running = false;
 	return -ETIMEDOUT;
 }
