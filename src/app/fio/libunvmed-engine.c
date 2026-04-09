@@ -456,6 +456,42 @@ static int g_initialized_threads;
 static int g_total_threads;
 static bool g_all_threads_initialized;
 
+/* Job thread tracking for unvmed_fio_cancel_threads() */
+#define UNVME_FIO_MAX_THREADS	256
+static pthread_t g_job_threads[UNVME_FIO_MAX_THREADS];
+static int g_nr_job_threads;
+
+/*
+ * unvmed_fio_cancel_threads - cancel all tracked fio job threads
+ *
+ * Called from unvmed_fio_cancel() (via dlsym) when fio is stuck and the
+ * main fio thread doesn't exit within the timeout.  Cancels each job thread
+ * and waits for it to finish before returning, so the caller can safely
+ * join the main fio thread afterward.
+ *
+ * pthread_testcancel() must be present in any spin loop inside libunvmed
+ * (e.g. __unvmed_cq_run_n) for deferred cancellation to take effect there.
+ */
+void unvmed_fio_cancel_threads(void)
+{
+	int nr;
+
+	pthread_mutex_lock(&g_serialize);
+	for (int i = 0; i < g_nr_job_threads; i++)
+		pthread_cancel(g_job_threads[i]);
+	nr = g_nr_job_threads;
+	g_nr_job_threads = 0;
+	pthread_mutex_unlock(&g_serialize);
+
+	/*
+	 * Join outside the lock: a job thread's cleanup handler may call
+	 * fio_libunvmed_close_file() which acquires g_serialize.  Holding
+	 * the lock here while joining would deadlock.
+	 */
+	for (int i = 0; i < nr; i++)
+		pthread_join(g_job_threads[i], NULL);
+}
+
 /*
  * This function is used to determine whether all threads have completed
  * initialization. If a similar function is added to the FIO core framework,
@@ -821,7 +857,18 @@ unlock:
 static void fio_libunvmed_cleanup(struct thread_data *td)
 {
 	struct libunvmed_data *ld = td->io_ops_data;
+	pthread_t self = pthread_self();
 	int refcnt;
+
+	/* Untrack this job thread */
+	pthread_mutex_lock(&g_serialize);
+	for (int i = 0; i < g_nr_job_threads; i++) {
+		if (pthread_equal(g_job_threads[i], self)) {
+			g_job_threads[i] = g_job_threads[--g_nr_job_threads];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_serialize);
 
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
 		unvmed_unmap_vaddr(ld->u, ld->trim_iomem);
@@ -991,6 +1038,10 @@ err:
 
 	if (g_initialized_threads >= g_total_threads)
 		g_all_threads_initialized = true;
+
+	/* Track this job thread for unvmed_fio_cancel_threads() */
+	if (g_nr_job_threads < UNVME_FIO_MAX_THREADS)
+		g_job_threads[g_nr_job_threads++] = pthread_self();
 
 	pthread_mutex_unlock(&g_serialize);
 	return ret;

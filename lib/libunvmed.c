@@ -3158,6 +3158,7 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 		if (unvmed_cq_irq_enabled(ucq)) {
 			do {
 				ret = unvmed_vcq_pop(__vcq, &__cqe);
+				pthread_testcancel();
 			} while (ret == -ENOENT && !nowait);
 
 			if (ret)

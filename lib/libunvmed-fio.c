@@ -267,6 +267,7 @@ bool unvmed_fio_done(int *ret)
  */
 int unvmed_fio_cancel(void)
 {
+	void (*engine_cancel)(void);
 	struct timespec ts;
 	void *retval;
 
@@ -283,11 +284,51 @@ int unvmed_fio_cancel(void)
 		return (int)(intptr_t)retval;
 	}
 
+	/*
+	 * Timed out: job threads are stuck in the CQ spin loop waiting for
+	 * an NVMe completion that never arrives.  Cancel them one by one via
+	 * the engine; pthread_testcancel() inside the spin loop makes deferred
+	 * cancellation take effect there.  Once all job threads are gone the
+	 * main fio thread can exit and pthread_join returns.
+	 */
 	unvmed_log_err("fio thread did not exit within %d seconds, "
-			"force-cancelling", UNVME_FIO_CANCEL_TIMEOUT_SEC);
+			"cancelling job threads", UNVME_FIO_CANCEL_TIMEOUT_SEC);
 
+	*(void **)&engine_cancel = dlsym(g_ioengine, "unvmed_fio_cancel_threads");
+	if (engine_cancel)
+		engine_cancel();
+
+	/*
+	 * After job threads exit, fio's main thread proceeds to cleanup and
+	 * calls wait_for_helper_thread(), which signals hd->done and joins
+	 * the helper thread.  If the helper thread is stuck (e.g., performing
+	 * disk-utilization I/O), fio_terminate_helper_thread() kicks it out
+	 * of its pthread_cond_timedwait() loop directly so that the join
+	 * inside wait_for_helper_thread() can return and fio_main() can exit.
+	 */
+	void (*term_helper)(void);
+	*(void **)&term_helper = dlsym(g_fio, "fio_terminate_helper_thread");
+	if (term_helper)
+		term_helper();
+
+	/* Give fio time to join the helper thread and exit normally. */
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += 2;
+
+	if (pthread_timedjoin_np(g_thread, &retval, &ts) == 0) {
+		g_running = false;
+		return (int)(intptr_t)retval;
+	}
+
+	/*
+	 * Still stuck.  The helper thread has had at least 2 seconds since
+	 * we signalled it; assume it is gone.  Force-cancel fio's main thread
+	 * so its pthread_cleanup handler runs dlclose() and we can return.
+	 */
+	unvmed_log_err("fio main thread still stuck; force-cancelling");
 	pthread_cancel(g_thread);
 	pthread_join(g_thread, &retval);
+
 	g_running = false;
-	return -ETIMEDOUT;
+	return (int)(intptr_t)retval;
 }
