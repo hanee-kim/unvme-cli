@@ -320,12 +320,12 @@ int unvmed_fio_cancel(void)
 		return (int)(intptr_t)retval;
 	}
 
-	/*
-	 * Still stuck.  The helper thread has had at least 2 seconds since
-	 * we signalled it; assume it is gone.  Force-cancel fio's main thread
-	 * so its pthread_cleanup handler runs dlclose() and we can return.
-	 */
-	unvmed_log_err("fio main thread still stuck; force-cancelling");
+	unvmed_log_err("fio and its internal threads (job threads, helper thread) "
+			"did not terminate within the grace period after SIGINT. "
+			"This typically means NVMe completions never arrived (device "
+			"unresponsive or controller reset) so job threads remained stuck "
+			"in the CQ spin loop even after pthread_cancel(), and fio's main "
+			"thread could not finish cleanup.  Killing the process.");
 	pthread_cancel(g_thread);
 	pthread_join(g_thread, &retval);
 
