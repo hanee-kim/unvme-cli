@@ -8,7 +8,8 @@ Typical usage::
     import unvmed_fio
 
     unvmed_fio.set_libpath("/usr/lib/libfio.so")
-    unvmed_fio.run("test.fio", eta="never", output_format="json")
+    unvmed_fio.run("test.fio",
+                   opts="--eta=always, --eta-interval=1, --output-format=normal")
 
     while True:
         is_done, ret = unvmed_fio.done()
@@ -34,7 +35,7 @@ cdef extern from "libunvmed.h":
 #
 # unvmed_fio_run() is non-blocking: it spawns a pthread and returns
 # immediately.  The char* strings in the argv it builds must remain valid
-# until the thread exits (i.e. until done() or cancel() returns True/a value).
+# until the thread exits (i.e. until done() or cancel() returns).
 #
 # Strategy:
 #   - _g_jobfile_b and _g_extra_list hold Python bytes objects.
@@ -81,50 +82,23 @@ def set_libpath(str path):
     unvmed_fio_set_libpath(path.encode())
 
 
-def run(str jobfile,
-        *,
-        str eta=None,
-        object eta_interval=None,
-        bint eta_newline=False,
-        str output_format=None,
-        bint minimal=False,
-        list extra=None):
+def run(str jobfile, str opts=None):
     """
     Start fio with *jobfile* in a background thread.
 
-    The keyword arguments map directly to fio CLI options:
+    :param jobfile:
+        Path to the fio job file.
+    :param opts:
+        Comma-separated fio CLI option string, e.g.::
 
-    :param eta:
-        ``--eta=<value>`` — controls ETA display.
-        Accepted values: ``'always'``, ``'never'``, ``'auto'``,
-        ``'percentage'``.  When omitted, libunvmed defaults to
-        ``--eta=always``.
-    :param eta_interval:
-        ``--eta-interval=<secs>`` — seconds between ETA updates (int or
-        float; converted to string).
-    :param eta_newline:
-        ``--eta-newline`` — emit a newline for each ETA update instead of
-        overwriting the current line.
-    :param output_format:
-        ``--output-format=<value>`` — output format.
-        Accepted values: ``'normal'``, ``'json'``, ``'json+'``,
-        ``'terse'``.
-    :param minimal:
-        ``--minimal`` — terse/minimal output (equivalent to
-        ``--output-format=terse``).
-    :param extra:
-        List of raw fio CLI option strings appended after the options
-        above.  Use this for any other fio option not covered by the
-        keyword arguments.
+            "--eta=always, --eta-interval=1, --output-format=normal"
+
+        Each token is stripped of surrounding whitespace before being
+        passed to fio.  Pass ``None`` (default) to use the libunvmed
+        default (``--eta=always``).
 
     ``--thread=1`` is always appended automatically (required by the
     libunvmed ioengine).
-
-    The string values passed here are *borrowed*: they must remain valid
-    until :func:`done` returns ``True`` or :func:`cancel` returns.
-    This function pins them internally so you do not need to worry about
-    lifetime as long as you call :func:`done` or :func:`cancel` before
-    the process exits.
 
     :returns: ``0`` on success.
     :raises OSError: if fio fails to start.
@@ -132,33 +106,23 @@ def run(str jobfile,
     """
     global _g_extra_c, _g_extra_list, _g_jobfile_b
 
-    cdef int  ret      = 0
-    cdef int  nr_extra = 0
-    cdef int  i
+    cdef int   ret      = 0
+    cdef int   nr_extra = 0
+    cdef int   i
     cdef bytes bitem
 
     # Drop any leftover state from a previous run.
     _release()
     _release_py()
 
-    # Build the list of option strings from keyword args.
-    opts = []
-    if eta is not None:
-        opts.append(f'--eta={eta}')
-    if eta_interval is not None:
-        opts.append(f'--eta-interval={eta_interval}')
-    if eta_newline:
-        opts.append('--eta-newline')
-    if output_format is not None:
-        opts.append(f'--output-format={output_format}')
-    if minimal:
-        opts.append('--minimal')
-    if extra:
-        opts.extend(extra)
+    # Parse the comma-separated opts string into individual tokens.
+    extra_strs = []
+    if opts:
+        extra_strs = [o.strip() for o in opts.split(',') if o.strip()]
 
     # Pin bytes objects so the GC cannot collect them while the thread runs.
     _g_jobfile_b  = jobfile.encode()
-    _g_extra_list = [o.encode() for o in opts]
+    _g_extra_list = [o.encode() for o in extra_strs]
     nr_extra      = len(_g_extra_list)
 
     # Build char** array pointing into the pinned bytes buffers.
@@ -169,8 +133,8 @@ def run(str jobfile,
             _g_jobfile_b  = None
             raise MemoryError()
         for i in range(nr_extra):
-            bitem          = _g_extra_list[i]
-            _g_extra_c[i]  = bitem
+            bitem         = _g_extra_list[i]
+            _g_extra_c[i] = bitem
 
     cdef bytes jfb = _g_jobfile_b
     ret = unvmed_fio_run(jfb, nr_extra, _g_extra_c)
@@ -212,3 +176,4 @@ def cancel():
     _release()
     _release_py()
     return ret
+
