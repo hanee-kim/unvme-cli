@@ -2688,11 +2688,17 @@ void unvmed_fio_set_libpath(const char *libfio);
 
 /**
  * unvmed_fio_run - Run fio with the given job file in a background thread
- * @jobfile: path to the fio job file
+ * @jobfile:  path to the fio job file
+ * @nr_extra: number of extra CLI options in @extra (0 for none)
+ * @extra:    extra fio CLI option strings (e.g. ``"--eta=never"``,
+ *            ``"--eta-interval=30"``, ``"--eta-newline"``,
+ *            ``"--output-format=json"``, ``"--minimal"``).  Borrowed;
+ *            must remain valid until unvmed_fio_done() or
+ *            unvmed_fio_cancel() returns.  May be NULL when @nr_extra is 0.
  *
  * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
  */
-int unvmed_fio_run(char *jobfile);
+int unvmed_fio_run(char *jobfile, int nr_extra, char **extra);
 
 /**
  * unvmed_fio_done - Non-blocking check whether fio has finished

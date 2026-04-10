@@ -31,6 +31,13 @@ static pthread_t	 g_thread;
 static bool		 g_running;
 static int		 g_ret;
 
+/* Arguments passed from unvmed_fio_run() to the worker thread. */
+struct __fio_run_args {
+	char	 *jobfile;
+	int	  nr_extra;
+	char	**extra;	/* borrowed: caller must keep valid until done */
+};
+
 /*
  * TLS pointer set just before calling fio main().  Our exit() override uses
  * it to longjmp() back to the setjmp() checkpoint in the fio thread instead
@@ -95,13 +102,20 @@ static void __fio_reset(void)
 
 static void *__fio_thread_run(void *opaque)
 {
-	char *jobfile = (char *)opaque;
+	struct __fio_run_args *run_args = (struct __fio_run_args *)opaque;
+	char *jobfile  = run_args->jobfile;
+	int   nr_extra = run_args->nr_extra;
+	char **extra   = run_args->extra;
 	int (*fio_main)(int, char *[], char *[]);
 	char **argv = NULL;
 	jmp_buf jump;
 	int ret = 0;
+	int total_argc, idx;
+	bool has_eta = false;
 
 	extern char **environ;
+
+	free(run_args);
 
 	struct __fio_cleanup_ctx ctx = { .argv = NULL };
 	pthread_cleanup_push(__fio_cleanup, &ctx);
@@ -131,24 +145,43 @@ static void *__fio_thread_run(void *opaque)
 		goto out;
 	}
 
+	/* Check if caller already supplied --eta so we don't duplicate it. */
+	for (int i = 0; i < nr_extra; i++) {
+		if (!strncmp(extra[i], "--eta=", 6)) {
+			has_eta = true;
+			break;
+		}
+	}
+
 	/*
-	 * argv[0]  : program name ("fio")
-	 * argv[1]  : jobfile path
-	 * argv[2]  : --eta=always  (keep progress output flowing)
-	 * argv[3]  : --thread=1    (required by libunvmed-engine)
-	 * argv[4]  : NULL
+	 * Build argv:
+	 *   argv[0]                : "fio"
+	 *   argv[1]                : jobfile path
+	 *   argv[2..2+nr_extra-1]  : caller-supplied extra options
+	 *                            (e.g. --eta, --eta-interval, --eta-newline,
+	 *                             --output-format, --minimal, ...)
+	 *   argv[2+nr_extra]       : "--eta=always" (only if no --eta in extras)
+	 *   argv[last-1]           : "--thread=1"   (required by libunvmed-engine)
+	 *   argv[last]             : NULL
 	 */
-	argv = malloc(sizeof(char *) * 5);
+	total_argc = 2 + nr_extra + (has_eta ? 0 : 1) + 1;
+	argv = malloc(sizeof(char *) * (total_argc + 1));
 	if (!argv) {
 		ret = ENOMEM;
 		goto out;
 	}
-	ctx.argv   = argv;
-	argv[0]    = "fio";
-	argv[1]    = jobfile;
-	argv[2]    = "--eta=always";
-	argv[3]    = "--thread=1";
-	argv[4]    = NULL;
+	ctx.argv = argv;
+
+	argv[0] = "fio";
+	argv[1] = jobfile;
+	for (int i = 0; i < nr_extra; i++)
+		argv[2 + i] = extra[i];
+
+	idx = 2 + nr_extra;
+	if (!has_eta)
+		argv[idx++] = "--eta=always";
+	argv[idx++] = "--thread=1";
+	argv[idx]   = NULL;
 
 	/*
 	 * If fio calls exit() (e.g., on SIGINT), our exit() override above
@@ -160,7 +193,7 @@ static void *__fio_thread_run(void *opaque)
 	if (ret == EINTR)
 		goto out;
 
-	ret = fio_main(4, argv, environ);
+	ret = fio_main(total_argc, argv, environ);
 
 out:
 	__fio_jump = NULL;
@@ -196,15 +229,28 @@ void unvmed_fio_set_libpath(const char *libfio)
 
 /**
  * unvmed_fio_run - Run fio with the given job file in a background thread
- * @jobfile: path to the fio job file
+ * @jobfile:  path to the fio job file
+ * @nr_extra: number of extra CLI options in @extra (0 for none)
+ * @extra:    array of extra fio CLI option strings, e.g.
+ *            ``"--eta=never"``, ``"--eta-interval=30"``,
+ *            ``"--eta-newline"``, ``"--output-format=json"``,
+ *            ``"--minimal"``.  The strings are borrowed; the caller must keep
+ *            them valid until unvmed_fio_done() or unvmed_fio_cancel() returns.
+ *            May be NULL when @nr_extra is 0.
  *
  * Starts fio in a new pthread.  Only one fio instance may run at a time;
  * returns -EBUSY if a run is already in progress.
  *
+ * ``--thread=1`` is always appended automatically (required by the
+ * libunvmed ioengine).  ``--eta=always`` is appended as a default only when
+ * @extra does not already contain an ``--eta=`` option.
+ *
  * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
  */
-int unvmed_fio_run(char *jobfile)
+int unvmed_fio_run(char *jobfile, int nr_extra, char **extra)
 {
+	struct __fio_run_args *run_args;
+
 	if (g_running) {
 		unvmed_log_err("fio is already running");
 		return -EBUSY;
@@ -215,11 +261,20 @@ int unvmed_fio_run(char *jobfile)
 		return -EINVAL;
 	}
 
+	run_args = malloc(sizeof(*run_args));
+	if (!run_args)
+		return -ENOMEM;
+
+	run_args->jobfile  = jobfile;
+	run_args->nr_extra = nr_extra;
+	run_args->extra    = extra;
+
 	g_ret     = 0;
 	g_running = true;
 
-	if (pthread_create(&g_thread, NULL, __fio_thread_run, jobfile)) {
+	if (pthread_create(&g_thread, NULL, __fio_thread_run, run_args)) {
 		g_running = false;
+		free(run_args);
 		return -1;
 	}
 
