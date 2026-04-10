@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>
@@ -34,6 +35,7 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	char **__argv;
 	const int nr_def_argc = 2;
 	int ret = 0;
+	bool machine_readable = false;
 
 	void *fio;
 	void *ioengine;
@@ -86,6 +88,10 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	 * successfully and '--thread=1' for those who forget to give this
 	 * mandatory option for libunvmed ioengine.
 	 * The last +1 is for NULL.
+	 *
+	 * When machine-readable output formats (json, json+, terse) or
+	 * --minimal are requested, use '--eta=never' instead to avoid mixing
+	 * ETA lines into the structured output.
 	 */
 	__argv = malloc(sizeof(char *) * (argc + nr_def_argc + 1));
 	for (int i = 0; i < argc; i++) {
@@ -103,8 +109,25 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 			}
 		} else
 			__argv[i] = argv[i];
+
+		/*
+		 * Detect machine-readable output format options so that
+		 * --eta=always is not injected and does not corrupt the output.
+		 *
+		 * --output-format=<fmt>: machine-readable if fmt is not "normal"
+		 * --minimal: shorthand for terse (machine-readable) output
+		 */
+		if (!strncmp(argv[i], "--output-format=", 16) ||
+				!strncmp(argv[i], "-output-format=", 15)) {
+			char *val = strstr(argv[i], "=") + 1;
+			if (strcmp(val, "normal") != 0)
+				machine_readable = true;
+		} else if (!strcmp(argv[i], "--minimal") ||
+				!strcmp(argv[i], "-minimal")) {
+			machine_readable = true;
+		}
 	}
-	__argv[argc] = "--eta=always";
+	__argv[argc] = machine_readable ? "--eta=never" : "--eta=always";
 	__argv[argc + 1] = "--thread=1";
 	__argv[argc + 2] = NULL;
 
