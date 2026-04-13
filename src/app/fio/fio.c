@@ -7,13 +7,57 @@
 #include <errno.h>
 #include <setjmp.h>
 #include <string.h>
+#include <limits.h>
+#include <unistd.h>
 
 #define UNVME_FIO_IOENGINE	"libunvmed-ioengine.so"
 
 extern char **environ;
 extern __thread jmp_buf *__jump;
 
+extern const char *unvmed_get_libfio(void);
 extern char *unvme_get_filepath(char *pwd, const char *filename);
+
+/*
+ * Parse a whitespace-separated options string into an argv array.
+ * Caller must free each element and the array itself.
+ * Returns the number of tokens parsed.
+ */
+static int parse_opts_to_argv(const char *opts, char ***out_argv)
+{
+	char *opts_copy;
+	char *token;
+	char **argv = NULL;
+	int argc = 0;
+	int capacity = 0;
+
+	if (!opts || opts[0] == '\0') {
+		*out_argv = NULL;
+		return 0;
+	}
+
+	opts_copy = strdup(opts);
+	if (!opts_copy)
+		return -ENOMEM;
+
+	token = strtok(opts_copy, " \t\n");
+	while (token) {
+		if (argc >= capacity) {
+			capacity = capacity ? capacity * 2 : 8;
+			argv = realloc(argv, sizeof(char *) * capacity);
+			if (!argv) {
+				free(opts_copy);
+				return -ENOMEM;
+			}
+		}
+		argv[argc++] = strdup(token);
+		token = strtok(NULL, " \t\n");
+	}
+
+	free(opts_copy);
+	*out_argv = argv;
+	return argc;
+}
 
 static void unvmed_fio_reset(const char *libfio)
 {
@@ -130,6 +174,69 @@ out:
 
 	dlclose(fio);
 	dlclose(ioengine);
+
+	return ret;
+}
+
+/*
+ * unvmed_fio_run - run fio with a job file and a CLI options string.
+ *
+ * @jobfile: path to the fio job file
+ * @opts:    space-separated fio CLI options
+ *           e.g. "--eta=always --eta-interval=1 --output-format=json"
+ *
+ * libfio is resolved via unvmed_get_libfio(); falls back to "fio.so".
+ * pwd is set to the current working directory.
+ * "--thread=1" is always appended to satisfy the libunvmed ioengine
+ * requirement unless the caller already includes it in @opts.
+ */
+int unvmed_fio_run(const char *jobfile, const char *opts)
+{
+	const char *libfio;
+	char pwd[PATH_MAX];
+	char **opts_argv = NULL;
+	char **argv = NULL;
+	int opts_argc;
+	int total_argc;
+	int ret;
+
+	libfio = unvmed_get_libfio();
+	if (!libfio)
+		libfio = "fio.so";
+
+	if (!getcwd(pwd, sizeof(pwd))) {
+		perror("getcwd");
+		return -errno;
+	}
+
+	opts_argc = parse_opts_to_argv(opts, &opts_argv);
+	if (opts_argc < 0)
+		return opts_argc;
+
+	/*
+	 * Build argv as: [jobfile, <opts tokens...>, "--thread=1"]
+	 * --thread=1 is mandatory for the libunvmed ioengine.
+	 */
+	total_argc = 1 + opts_argc + 1;
+	argv = malloc(sizeof(char *) * total_argc);
+	if (!argv) {
+		ret = -ENOMEM;
+		goto free_opts;
+	}
+
+	argv[0] = unvme_get_filepath(pwd, jobfile);
+	for (int i = 0; i < opts_argc; i++)
+		argv[1 + i] = opts_argv[i];
+	argv[1 + opts_argc] = "--thread=1";
+
+	ret = unvmed_run_fio(total_argc, argv, libfio, pwd);
+
+	free(argv[0]);
+	free(argv);
+free_opts:
+	for (int i = 0; i < opts_argc; i++)
+		free(opts_argv[i]);
+	free(opts_argv);
 
 	return ret;
 }
