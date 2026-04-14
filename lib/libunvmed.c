@@ -2109,12 +2109,22 @@ update:
 	}
 
 	for (int i = 0; i < usq->qsize; i++) {
-		cmd = unvmed_get_cmd(usq, i);
-		if (!cmd)
-			continue;
+		struct unvme_cmd *cmd_ref;
 
-		if (LOAD(cmd->state) == UNVME_CMD_S_SUBMITTED)
+		cmd = &usq->cmds[i];
+
+		if (LOAD(cmd->state) == UNVME_CMD_S_SUBMITTED) {
 			unvmed_put_cqe(u, ucq, cmd);
+			continue;
+		}
+
+		cmd_ref = unvmed_cmd_get(usq, i);
+		if (!cmd_ref)
+			continue;
+		if (LOAD(cmd->state) == UNVME_CMD_S_INIT)
+			unvmed_put_cqe(u, ucq, cmd_ref);
+
+		unvmed_cmd_put(cmd_ref);
 	}
 
 	unvmed_cq_exit(ucq);
