@@ -1594,6 +1594,33 @@ static inline struct unvme_cmd *unvmed_get_cmd(struct unvme_sq *usq,
 void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq);
 
 /**
+ * unvmed_cancel_unissued_cmds - Cancel all commands not yet issued to the device
+ * @u: &struct unvme
+ *
+ * Cancel all commands that have not yet reached the device across all
+ * submission queues.  This covers two categories:
+ *
+ * - INIT state: allocated but never written to the SQ ring buffer.
+ * - SUBMITTED + NODB: written to the ring buffer but doorbell not yet rung,
+ *   so the device has no knowledge of them.
+ *
+ * For each such command a synthetic CQE with status "Command Aborted By Host"
+ * (SCT=PATH(0x3), SC=0x71, i.e. 0x371) is generated and delivered through
+ * the normal completion path — either via futex wake-up
+ * (UNVMED_CMD_F_WAKEUP_ON_CQE mode) or by pushing to the command's virtual CQ.
+ *
+ * The caller is responsible for consuming the resulting completions from the
+ * virtual CQ and calling unvmed_cmd_put() on each command, which decrements
+ * usq->nr_cmds.  Once all non-issued commands are cleaned up,
+ * unvmed_reset_ctrl_graceful() will only block on commands that have truly
+ * reached the device (doorbell rung), which the device will complete normally.
+ *
+ * This API must be called with all submission queues already quiesced (locked)
+ * via unvmed_quiesce_sq_all() to prevent concurrent SQE posts during the scan.
+ */
+void unvmed_cancel_unissued_cmds(struct unvme *u);
+
+/**
  * __unvmed_cq_run_n - Reap CQ entries from a completion queue
  * @u: &struct unvme
  * @ucq: completion queue (&struct unvme_cq)
