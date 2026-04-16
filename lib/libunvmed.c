@@ -2191,16 +2191,15 @@ void unvmed_cancel_init_cmds(struct unvme *u)
 	struct unvme_cmd *cmd;
 	int qid;
 
+	/*
+	 * Caller must have already quiesced (locked) all submission queues via
+	 * unvmed_quiesce_sq_all() before calling this function to ensure no new
+	 * SQEs are posted while we scan for INIT state commands.
+	 */
 	for (qid = 0; qid < u->nr_sqs; qid++) {
 		usq = unvmed_sq_get(u, qid);
 		if (!usq)
 			continue;
-
-		/*
-		 * Hold the SQ lock to prevent concurrent command allocations
-		 * or doorbell updates from racing with our INIT state scan.
-		 */
-		unvmed_sq_enter(usq);
 
 		for (int i = 0; i < usq->qsize - 1; i++) {
 			cmd = unvmed_cmd_get(usq, i);
@@ -2216,7 +2215,6 @@ void unvmed_cancel_init_cmds(struct unvme *u)
 			unvmed_cmd_put(cmd);
 		}
 
-		unvmed_sq_exit(usq);
 		unvmed_sq_put(u, usq);
 	}
 }

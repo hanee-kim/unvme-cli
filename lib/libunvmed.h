@@ -1610,7 +1610,8 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq);
  * unvmed_reset_ctrl_graceful() will no longer block waiting for usq->nr_cmds
  * to reach zero.
  *
- * This API is thread-safe.
+ * This API must be called with all submission queues already quiesced (locked)
+ * via unvmed_quiesce_sq_all() to prevent concurrent SQE posts during the scan.
  */
 void unvmed_cancel_init_cmds(struct unvme *u);
 
