@@ -2185,6 +2185,42 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq)
 		;
 }
 
+void unvmed_cancel_init_cmds(struct unvme *u)
+{
+	struct unvme_sq *usq;
+	struct unvme_cmd *cmd;
+	int qid;
+
+	for (qid = 0; qid < u->nr_sqs; qid++) {
+		usq = unvmed_sq_get(u, qid);
+		if (!usq)
+			continue;
+
+		/*
+		 * Hold the SQ lock to prevent concurrent command allocations
+		 * or doorbell updates from racing with our INIT state scan.
+		 */
+		unvmed_sq_enter(usq);
+
+		for (int i = 0; i < usq->qsize - 1; i++) {
+			cmd = unvmed_cmd_get(usq, i);
+			if (!cmd)
+				continue;
+
+			if (LOAD(cmd->state) == UNVME_CMD_S_INIT) {
+				unvmed_put_cqe(u, usq->ucq, cmd);
+				unvmed_log_info("%s: sq%d: canceled init cmd (cid=%u)",
+						unvmed_bdf(u), qid, cmd->cid);
+			}
+
+			unvmed_cmd_put(cmd);
+		}
+
+		unvmed_sq_exit(usq);
+		unvmed_sq_put(u, usq);
+	}
+}
+
 static inline void unvmed_cancel_cmd_all(struct unvme *u)
 {
 	struct unvme_sq *usq;

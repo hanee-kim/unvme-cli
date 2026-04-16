@@ -1594,6 +1594,27 @@ static inline struct unvme_cmd *unvmed_get_cmd(struct unvme_sq *usq,
 void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq);
 
 /**
+ * unvmed_cancel_init_cmds - Cancel all non-issued (INIT state) commands
+ * @u: &struct unvme
+ *
+ * Cancel all commands that have been allocated but not yet submitted to
+ * hardware (INIT state) across all submission queues.  For each such command
+ * a synthetic CQE with status "Command Aborted By Host" (SCT=PATH(0x3),
+ * SC=0x71, i.e. 0x371) is generated and delivered through the normal
+ * completion path — either via futex wake-up (UNVMED_CMD_F_WAKEUP_ON_CQE
+ * mode) or by pushing the entry to the command's virtual CQ.
+ *
+ * The caller is responsible for consuming the resulting completions from the
+ * virtual CQ and calling unvmed_cmd_put() on each command, which decrements
+ * usq->nr_cmds.  Once all INIT commands have been cleaned up this way,
+ * unvmed_reset_ctrl_graceful() will no longer block waiting for usq->nr_cmds
+ * to reach zero.
+ *
+ * This API is thread-safe.
+ */
+void unvmed_cancel_init_cmds(struct unvme *u);
+
+/**
  * __unvmed_cq_run_n - Reap CQ entries from a completion queue
  * @u: &struct unvme
  * @ucq: completion queue (&struct unvme_cq)
