@@ -2185,7 +2185,7 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq)
 		;
 }
 
-void unvmed_cancel_init_cmds(struct unvme *u)
+void unvmed_cancel_unissued_cmds(struct unvme *u)
 {
 	struct unvme_sq *usq;
 	struct unvme_cmd *cmd;
@@ -2194,13 +2194,18 @@ void unvmed_cancel_init_cmds(struct unvme *u)
 	/*
 	 * Caller must have already quiesced (locked) all submission queues via
 	 * unvmed_quiesce_sq_all() before calling this function to ensure no new
-	 * SQEs are posted while we scan for INIT state commands.
+	 * SQEs are posted while we scan for non-issued commands.
 	 */
 	for (qid = 0; qid < u->nr_sqs; qid++) {
 		usq = unvmed_sq_get(u, qid);
 		if (!usq)
 			continue;
 
+		/*
+		 * Cancel commands in INIT state: allocated but never written
+		 * to the SQ ring buffer, so the device has no knowledge of
+		 * them at all.
+		 */
 		for (int i = 0; i < usq->qsize - 1; i++) {
 			cmd = unvmed_cmd_get(usq, i);
 			if (!cmd)
@@ -2208,11 +2213,38 @@ void unvmed_cancel_init_cmds(struct unvme *u)
 
 			if (LOAD(cmd->state) == UNVME_CMD_S_INIT) {
 				unvmed_put_cqe(u, usq->ucq, cmd);
-				unvmed_log_info("%s: sq%d: canceled init cmd (cid=%u)",
+				unvmed_log_info("%s: sq%d: canceled INIT cmd (cid=%u)",
 						unvmed_bdf(u), qid, cmd->cid);
 			}
 
 			unvmed_cmd_put(cmd);
+		}
+
+		/*
+		 * Cancel commands that have been written to the SQ ring buffer
+		 * (SUBMITTED state) but whose doorbell has not been rung yet
+		 * (NODB).  Entries between @usq->q->ptail and @usq->q->tail
+		 * exist in the ring buffer but the device has never seen them.
+		 * Treat them the same as INIT: cancel immediately rather than
+		 * flushing to the device.
+		 */
+		{
+			union nvme_cmd *sqe;
+			uint32_t id;
+
+			unvmed_sq_for_each_entry(usq, id, sqe) {
+				cmd = unvmed_cmd_get(usq, sqe->cid);
+				if (!cmd)
+					continue;
+
+				if (LOAD(cmd->state) == UNVME_CMD_S_SUBMITTED) {
+					unvmed_put_cqe(u, usq->ucq, cmd);
+					unvmed_log_info("%s: sq%d: canceled NODB cmd (cid=%u)",
+							unvmed_bdf(u), qid, cmd->cid);
+				}
+
+				unvmed_cmd_put(cmd);
+			}
 		}
 
 		unvmed_sq_put(u, usq);
@@ -2307,14 +2339,13 @@ void unvmed_reset_ctrl_graceful(struct unvme *u)
 			continue;
 
 		/*
-		 * Update sq tail doorbell since application might have missed
-		 * to update tail doorbell after posting commad instances.
-		 * We've already quiesced all SQs here in this context, we
-		 * should update the missing doorbell update and wait for the
-		 * commands to complete gracefully.
+		 * Wait only for commands that have actually reached the device,
+		 * i.e. those whose SQ tail doorbell has already been rung.
+		 * NODB commands (written to the ring buffer but not doorbelled)
+		 * must be canceled by the caller via unvmed_cancel_unissued_cmds()
+		 * before invoking this function; flushing them here would
+		 * silently send commands the application chose not to issue.
 		 */
-		unvmed_sq_update_tail(u, usq);
-
 		while (atomic_load_acquire(&usq->nr_cmds) > 0)
 			;
 
