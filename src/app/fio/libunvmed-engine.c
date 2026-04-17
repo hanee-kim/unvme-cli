@@ -1440,11 +1440,23 @@ static enum fio_q_status fio_libunvmed_rw(struct thread_data *td,
 	 * If READ command belongs to the verification phase and the
 	 * verify_mode=compare, convert READ to COMPARE command.
 	 */
-	if (io_u->flags & IO_U_F_VER_LIST && io_u->ddir == DDIR_READ &&
-			o->verify_mode == FIO_URING_CMD_VMODE_COMPARE) {
-		populate_verify_io_u(td, io_u);
-		read_opcode = nvme_cmd_compare;
-		io_u_set(td, io_u, IO_U_F_VER_IN_DEV);
+	if (io_u->flags & IO_U_F_VER_LIST && io_u->ddir == DDIR_READ) {
+		if (o->verify_mode == FIO_URING_CMD_VMODE_COMPARE) {
+			populate_verify_io_u(td, io_u);
+			read_opcode = nvme_cmd_compare;
+			io_u_set(td, io_u, IO_U_F_VER_IN_DEV);
+		} else if (libunvmed_pi_enabled(ns) && libunvmed_ns_meta_is_dif(ns) &&
+				!o->pi_act) {
+			/*
+			 * In DIF mode, the PI fields (Guard/AppTag/RefTag) are
+			 * embedded in the data buffer and are not part of the
+			 * data pattern written by fio.  Skip fio's software
+			 * pattern verification to avoid false failures on the PI
+			 * region; PI integrity is verified by libunvmed_verify_pi()
+			 * in the event handler.
+			 */
+			io_u_set(td, io_u, IO_U_F_VER_IN_DEV);
+		}
 	}
 
 	sqe.opcode = (io_u->ddir == DDIR_READ) ? read_opcode : ld->write_opcode;
