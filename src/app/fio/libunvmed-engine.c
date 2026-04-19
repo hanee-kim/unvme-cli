@@ -1558,7 +1558,7 @@ static enum fio_q_status fio_libunvmed_trim(struct thread_data *td,
 		}
 	}
 
-	if (__unvmed_mapv_prp(cmd, (union nvme_cmd *)&sqe, &cmd->buf.iov, 1)) {
+	if (__unvmed_mapv_prp_list(cmd, (union nvme_cmd *)&sqe, NULL, &cmd->buf.iov, 1)) {
 		unvmed_cmd_put(cmd);
 		return -errno;
 	}
