@@ -905,13 +905,11 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 	}
 
 	/*
-	 * For trim-only workloads, orig_buffer is a one-page placeholder and is
-	 * never used in NVMe commands, so skip the IOMMU mapping. The existing
-	 * orig_buffer_size check is kept to handle the read/write path where
-	 * the size can be zero.
+	 * .open_file() is not called in trim-only workloads at all.  To avoid
+	 * 0-sized memory allocation, we should check the orig_buffer_size
+	 * here.
 	 */
-	if (ld->orig_buffer_size &&
-	    td->o.td_ddir != TD_DDIR_TRIM && td->o.td_ddir != TD_DDIR_RANDTRIM) {
+	if (ld->orig_buffer_size) {
 		if (o->cmb_data)
 			unvmed_to_iova(u, td->orig_buffer, &ld->orig_buffer_iova);
 		else {
@@ -1023,8 +1021,7 @@ static int fio_libunvmed_close_file(struct thread_data *td,
 			libunvmed_log("failed to unmap prp iomem from iommu\n");
 	}
 
-	if (td->orig_buffer && !o->cmb_data &&
-	    td->o.td_ddir != TD_DDIR_TRIM && td->o.td_ddir != TD_DDIR_RANDTRIM) {
+	if (td->orig_buffer && !o->cmb_data) {
 		ret = unvmed_unmap_vaddr(ld->u, td->orig_buffer);
 		if (ret)
 			libunvmed_log("failed to unmap io_u buffers from iommu\n");
@@ -1057,27 +1054,6 @@ static int fio_libunvmed_iomem_alloc(struct thread_data *td, size_t total_mem)
 	if (ret) {
 		libunvmed_log("failed to grab mutex lock\n");
 		return ret;
-	}
-
-	/*
-	 * For trim-only workloads, the data buffer is not needed; trim_iomem is
-	 * used instead.  However, fio may set io_u->buf from td->orig_buffer
-	 * after iomem_alloc, so allocate a single page as a placeholder to keep
-	 * the pointer non-NULL.  The engine overwrites io_u->buf with trim_iomem
-	 * in io_u_init, so orig_buffer is never actually used in NVMe commands.
-	 * prp_list_iomem and prp_iomem are only needed for read/write; skip them.
-	 */
-	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
-		size = unvmed_pgmap(u, &ptr, unvmed_pagesize(u));
-		if (size < 0) {
-			libunvmed_log("failed to allocate trim placeholder buffer\n");
-			pthread_mutex_unlock(&g_serialize);
-			return 1;
-		}
-		td->orig_buffer = (char *)ptr;
-		ld->orig_buffer_size = size;
-		pthread_mutex_unlock(&g_serialize);
-		return 0;
 	}
 
 	if (o->cmb_data) {
@@ -1190,8 +1166,10 @@ static int fio_libunvmed_io_u_init(struct thread_data *td, struct io_u *io_u)
 	io_u->engine_data = mo;
 
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
-		io_u->buflen = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES * io_u->index;
-		io_u->buf = ld->trim_iomem + io_u->buflen;
+		size_t per_io_size = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES;
+		io_u->buf = ld->trim_iomem + per_io_size * io_u->index;
+		io_u->buflen = per_io_size;
+		io_u->xfer_buf = io_u->buf;
 	}
 
 	return 0;
@@ -1550,12 +1528,13 @@ static enum fio_q_status fio_libunvmed_trim(struct thread_data *td,
 		sqe.cdw10 = io_u->number_trim - 1;
 
 		r = malloc(sizeof(struct trim_range) * io_u->number_trim);
-		memcpy(r , buf, sizeof(struct trim_range) * io_u->number_trim);
+		memcpy(r, buf, sizeof(struct trim_range) * io_u->number_trim);
 		for (int i = 0; i < io_u->number_trim; i++) {
 			range[i].cattr = 0;
 			range[i].nlb = cpu_to_le32(libunvmed_get_nlba(ns, r[i].len) + 1);
 			range[i].slba = cpu_to_le64(libunvmed_get_slba(ns, r[i].start));
 		}
+		free(r);
 	}
 
 	if (__unvmed_mapv_prp(cmd, (union nvme_cmd *)&sqe, &cmd->buf.iov, 1)) {
