@@ -1550,12 +1550,13 @@ static enum fio_q_status fio_libunvmed_trim(struct thread_data *td,
 		sqe.cdw10 = io_u->number_trim - 1;
 
 		r = malloc(sizeof(struct trim_range) * io_u->number_trim);
-		memcpy(r , buf, sizeof(struct trim_range) * io_u->number_trim);
+		memcpy(r, buf, sizeof(struct trim_range) * io_u->number_trim);
 		for (int i = 0; i < io_u->number_trim; i++) {
 			range[i].cattr = 0;
 			range[i].nlb = cpu_to_le32(libunvmed_get_nlba(ns, r[i].len) + 1);
 			range[i].slba = cpu_to_le64(libunvmed_get_slba(ns, r[i].start));
 		}
+		free(r);
 	}
 
 	if (__unvmed_mapv_prp(cmd, (union nvme_cmd *)&sqe, &cmd->buf.iov, 1)) {
