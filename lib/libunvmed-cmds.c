@@ -359,7 +359,7 @@ int unvmed_cmd_put(struct unvme_cmd *cmd)
 struct unvme_cmd *unvmed_alloc_cmd(struct unvme *u, struct unvme_sq *usq,
 				   uint16_t *cid, void *buf, size_t len)
 {
-	if (!len) {
+	if (!buf || !len) {
 		errno = EINVAL;
 		return NULL;
 	}

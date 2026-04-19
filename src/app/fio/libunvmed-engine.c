@@ -1190,8 +1190,10 @@ static int fio_libunvmed_io_u_init(struct thread_data *td, struct io_u *io_u)
 	io_u->engine_data = mo;
 
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
-		io_u->buflen = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES * io_u->index;
-		io_u->buf = ld->trim_iomem + io_u->buflen;
+		size_t per_io_size = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES;
+		io_u->buf = ld->trim_iomem + per_io_size * io_u->index;
+		io_u->buflen = per_io_size;
+		io_u->xfer_buf = io_u->buf;
 	}
 
 	return 0;
