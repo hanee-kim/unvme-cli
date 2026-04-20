@@ -4,6 +4,7 @@ libunvmed_src = [
   'libunvmed-vcq.c',
   'libunvmed-cmds.c',
   'libunvmed-logs.c',
+  'libunvmed-fio.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',

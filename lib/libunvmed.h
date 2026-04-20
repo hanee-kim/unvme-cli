@@ -2666,4 +2666,52 @@ int unvmed_detach_ns(struct unvme_cmd *cmd, uint32_t nsid,
  */
 struct json_object *unvmed_to_json(struct unvme *u);
 
+/*
+ * fio thread runner API
+ *
+ * These functions provide a way to run fio (loaded as a shared library) in a
+ * background pthread and to stop it cleanly when needed.
+ *
+ * Typical usage:
+ *
+ *   if (unvmed_fio_run(libfio, argc, argv) < 0) { handle error }
+ *
+ *   // Poll for completion:
+ *   int ret;
+ *   while (!unvmed_fio_done(&ret))
+ *       usleep(100000);
+ *
+ *   // Or cancel:
+ *   int ret = unvmed_fio_cancel();   // blocks until thread exits
+ */
+
+/**
+ * unvmed_fio_run - Run fio as a background pthread
+ * @libfio: path to the fio shared object
+ * @argc:   number of elements in @argv
+ * @argv:   fio argument vector (argv[0] is the program name)
+ *
+ * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
+ */
+int unvmed_fio_run(const char *libfio, int argc, char *argv[]);
+
+/**
+ * unvmed_fio_done - Non-blocking check whether fio has finished
+ * @ret: if non-NULL and fio is done, receives the fio exit status
+ *
+ * Return: ``true`` if fio has completed, ``false`` if still running.
+ */
+bool unvmed_fio_done(int *ret);
+
+/**
+ * unvmed_fio_cancel - Terminate the running fio thread
+ *
+ * Sends SIGINT to the fio thread.  If the thread does not exit within the
+ * cancellation timeout, pthread_cancel() is used as a last resort.
+ * Blocks until the thread has fully exited.
+ *
+ * Return: fio exit status, or ``-ETIMEDOUT`` if force-cancelled.
+ */
+int unvmed_fio_cancel(void);
+
 #endif
