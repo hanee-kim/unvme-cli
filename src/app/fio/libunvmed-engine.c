@@ -1192,6 +1192,14 @@ static int fio_libunvmed_io_u_init(struct thread_data *td, struct io_u *io_u)
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
 		io_u->buflen = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES * io_u->index;
 		io_u->buf = ld->trim_iomem + io_u->buflen;
+		/*
+		 * fio assigns io_u->xfer_buf from orig_buffer during init,
+		 * before io_u_init is called.  orig_buffer is a one-page
+		 * placeholder for trim-only workloads, so for iodepth > 1
+		 * xfer_buf points beyond that allocation.  Redirect it to the
+		 * IOMMU-mapped trim_iomem slice so that DMA mapping succeeds.
+		 */
+		io_u->xfer_buf = io_u->buf;
 	}
 
 	return 0;
