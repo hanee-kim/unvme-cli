@@ -2674,22 +2674,16 @@ struct json_object *unvmed_to_json(struct unvme *u);
  *
  * Typical usage:
  *
- *   struct unvmed_fio *f = unvmed_fio_run(libfio, argc, argv);
- *   if (!f) { handle error }
+ *   if (unvmed_fio_run(libfio, argc, argv) < 0) { handle error }
  *
  *   // Poll for completion:
  *   int ret;
- *   while ((ret = unvmed_fio_wait(f)) == -EBUSY)
+ *   while (!unvmed_fio_done(&ret))
  *       usleep(100000);
  *
  *   // Or cancel:
- *   int ret = unvmed_fio_cancel(f);   // blocks until thread exits
- *
- * Exactly one of unvmed_fio_wait() or unvmed_fio_cancel() must be called for
- * each handle returned by unvmed_fio_run(); both free the handle.
+ *   int ret = unvmed_fio_cancel();   // blocks until thread exits
  */
-
-struct unvmed_fio;
 
 /**
  * unvmed_fio_run - Run fio as a background pthread
@@ -2697,31 +2691,27 @@ struct unvmed_fio;
  * @argc:   number of elements in @argv
  * @argv:   fio argument vector (argv[0] is the program name)
  *
- * Return: opaque handle on success, ``NULL`` on error with ``errno`` set.
+ * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
  */
-struct unvmed_fio *unvmed_fio_run(const char *libfio, int argc, char *argv[]);
+int unvmed_fio_run(const char *libfio, int argc, char *argv[]);
 
 /**
- * unvmed_fio_wait - Non-blocking check whether fio has finished
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_done - Non-blocking check whether fio has finished
+ * @ret: if non-NULL and fio is done, receives the fio exit status
  *
- * Returns -EBUSY if fio is still running, or the fio exit status when done.
- * Frees @fio on completion.
- *
- * Return: fio exit status, or ``-EBUSY`` if still running.
+ * Return: ``true`` if fio has completed, ``false`` if still running.
  */
-int unvmed_fio_wait(struct unvmed_fio *fio);
+bool unvmed_fio_done(int *ret);
 
 /**
- * unvmed_fio_cancel - Terminate a running fio thread
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_cancel - Terminate the running fio thread
  *
  * Sends SIGINT to the fio thread.  If the thread does not exit within the
  * cancellation timeout, pthread_cancel() is used as a last resort.
- * Blocks until the thread has fully exited, then frees @fio.
+ * Blocks until the thread has fully exited.
  *
  * Return: fio exit status, or ``-ETIMEDOUT`` if force-cancelled.
  */
-int unvmed_fio_cancel(struct unvmed_fio *fio);
+int unvmed_fio_cancel(void);
 
 #endif

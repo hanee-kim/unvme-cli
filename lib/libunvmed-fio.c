@@ -14,8 +14,12 @@
 #include "libunvmed.h"
 #include "libunvmed-logs.h"
 
-#define UNVME_FIO_IOENGINE	"libunvmed-ioengine.so"
+#define UNVME_FIO_IOENGINE		"libunvmed-ioengine.so"
 #define UNVME_FIO_CANCEL_TIMEOUT_SEC	5
+
+static pthread_t	__thread;
+static bool		__running = false;
+static int		__retval  = 0;
 
 /*
  * TLS pointer set to a jmp_buf just before calling fio main().  Our exit()
@@ -29,8 +33,8 @@ static __thread jmp_buf *__fio_jump = NULL;
  * Override exit() so that when fio (loaded as a shared library) calls exit()
  * from within a worker thread we can recover without killing the process.
  *
- * If __fio_jump is set we are inside unvmed_fio_run_thread(); longjmp() back
- * to the setjmp() checkpoint and let the thread clean up normally.
+ * If __fio_jump is set we are inside __fio_thread_run(); longjmp() back to
+ * the setjmp() checkpoint and let the thread clean up normally.
  *
  * Otherwise fall through to the real libc exit() so that nothing else in the
  * process is disrupted.
@@ -42,32 +46,25 @@ void exit(int status)
 		__builtin_unreachable();
 	}
 
-	/* Not inside a fio thread — call the real exit(). */
 	void (*real_exit)(int) __attribute__((noreturn));
 	*(void **)&real_exit = dlsym(RTLD_NEXT, "exit");
 	if (real_exit)
 		real_exit(status);
 
-	/* Last-resort fallback if dlsym fails. */
 	_exit(status);
 }
-
-struct unvmed_fio {
-	pthread_t	thread;
-	int		ret;
-};
 
 struct __fio_thread_args {
 	const char	*libfio;
 	int		 argc;
 	char		**argv;
-	int		 ret;
 };
 
 struct __fio_cleanup_ctx {
-	void	**fio;
-	void	**ioengine;
-	char	***argv;
+	void		**fio;
+	void		**ioengine;
+	char		***argv;
+	struct __fio_thread_args **args;
 };
 
 static void __fio_thread_cleanup(void *arg)
@@ -75,6 +72,7 @@ static void __fio_thread_cleanup(void *arg)
 	struct __fio_cleanup_ctx *ctx = (struct __fio_cleanup_ctx *)arg;
 
 	free(*ctx->argv);
+	free(*ctx->args);
 
 	if (*ctx->fio)
 		dlclose(*ctx->fio);
@@ -108,24 +106,14 @@ static void *__fio_thread_run(void *opaque)
 
 	extern char **environ;
 
-	/*
-	 * Register a cleanup handler so that dlopen'd handles are closed even
-	 * when this thread is force-cancelled via pthread_cancel().  In all
-	 * other exit paths we call pthread_cleanup_pop(0) and do the cleanup
-	 * explicitly at the 'out' label below.
-	 */
 	struct __fio_cleanup_ctx cleanup_ctx = {
-		.fio	 = &fio,
+		.fio      = &fio,
 		.ioengine = &ioengine,
-		.argv	 = &argv,
+		.argv     = &argv,
+		.args     = &args,
 	};
 	pthread_cleanup_push(__fio_thread_cleanup, &cleanup_ctx);
 
-	/*
-	 * Close any leftover handles from a previous run before re-loading.
-	 * dlopen(RTLD_NOW | RTLD_GLOBAL) requires the same context that did
-	 * the original open.
-	 */
 	__fio_reset(args->libfio);
 
 	fio = dlopen(args->libfio, RTLD_NOW | RTLD_GLOBAL);
@@ -151,12 +139,6 @@ static void *__fio_thread_run(void *opaque)
 		goto out;
 	}
 
-	/*
-	 * Build argv: copy caller's args, then append mandatory defaults.
-	 * --eta=always  : keep progress output flowing to stdio.
-	 * --thread=1    : required by libunvmed-engine (uses pthreads, not fork).
-	 * +1 for NULL terminator.
-	 */
 	argv = malloc(sizeof(char *) * (args->argc + nr_def_argc + 1));
 	if (!argv) {
 		ret = ENOMEM;
@@ -167,11 +149,6 @@ static void *__fio_thread_run(void *opaque)
 	argv[args->argc + 1] = "--thread=1";
 	argv[args->argc + 2] = NULL;
 
-	/*
-	 * If fio calls exit() internally (e.g., on SIGINT), our exit() override
-	 * above will longjmp() here with EINTR so we can clean up properly
-	 * instead of terminating the whole process.
-	 */
 	__fio_jump = &jump;
 	ret = setjmp(*__fio_jump);
 	if (ret == EINTR)
@@ -182,17 +159,16 @@ static void *__fio_thread_run(void *opaque)
 out:
 	__fio_jump = NULL;
 
-	/* Normal exit: skip the cleanup handler and do it here. */
 	pthread_cleanup_pop(0);
 
 	free(argv);
+	free(args);
 	if (fio)
 		dlclose(fio);
 	if (ioengine)
 		dlclose(ioengine);
 
-	args->ret = ret;
-	return NULL;
+	return (void *)(intptr_t)ret;
 }
 
 /**
@@ -201,106 +177,103 @@ out:
  * @argc:   number of elements in @argv (not counting the NULL terminator)
  * @argv:   fio argument vector (argv[0] is the program name, as usual)
  *
- * Starts fio in a new thread.  The thread loads @libfio and the
- * libunvmed ioengine dynamically, then calls fio's main().
+ * Starts fio in a new thread.  Only one fio instance may run at a time.
  *
- * Return: opaque &struct unvmed_fio handle on success, ``NULL`` on error
- * with ``errno`` set.  The caller must eventually pass the handle to either
- * unvmed_fio_wait() or unvmed_fio_cancel() to release resources.
+ * Return: ``0`` on success, ``-EBUSY`` if already running, ``-1`` on error.
  */
-struct unvmed_fio *unvmed_fio_run(const char *libfio, int argc, char *argv[])
+int unvmed_fio_run(const char *libfio, int argc, char *argv[])
 {
-	struct unvmed_fio *fio;
 	struct __fio_thread_args *args;
 
-	fio = calloc(1, sizeof(*fio));
-	if (!fio)
-		return NULL;
+	if (__running) {
+		unvmed_log_err("fio is already running");
+		return -EBUSY;
+	}
 
 	args = calloc(1, sizeof(*args));
-	if (!args) {
-		free(fio);
-		return NULL;
-	}
+	if (!args)
+		return -1;
 
 	args->libfio = libfio;
 	args->argc   = argc;
 	args->argv   = argv;
 
-	if (pthread_create(&fio->thread, NULL, __fio_thread_run, args)) {
+	__retval  = 0;
+	__running = true;
+
+	if (pthread_create(&__thread, NULL, __fio_thread_run, args)) {
+		__running = false;
 		free(args);
-		free(fio);
-		return NULL;
+		return -1;
 	}
 
-	/* args is freed inside the thread after it finishes */
-	fio->ret = 0;
-	return fio;
+	return 0;
 }
 
 /**
- * unvmed_fio_wait - Non-blocking check whether fio has finished
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_done - Non-blocking check whether fio has finished
+ * @ret: if non-NULL and fio is done, receives the fio exit status
  *
- * Tries to join the fio thread without blocking.  If the thread has not yet
- * exited, returns -EBUSY so the caller can poll in a loop.  When the thread
- * has finished, frees @fio and returns the fio exit status.
- *
- * Return: fio exit status on completion, ``-EBUSY`` if still running.
+ * Returns ``true`` and sets @ret when fio has completed (or was never
+ * started).  Returns ``false`` while fio is still running.
  */
-int unvmed_fio_wait(struct unvmed_fio *fio)
+bool unvmed_fio_done(int *ret)
 {
-	struct __fio_thread_args *args = NULL;
-	int ret;
+	void *retval;
+	int __ret;
 
-	if (pthread_tryjoin_np(fio->thread, (void **)&args) != 0)
-		return -EBUSY;
+	if (!__running) {
+		if (ret)
+			*ret = __retval;
+		return true;
+	}
 
-	ret = args ? args->ret : fio->ret;
+	__ret = pthread_tryjoin_np(__thread, &retval);
+	if (__ret)
+		return false;
 
-	free(args);
-	free(fio);
-	return ret;
+	__running = false;
+	__retval  = (int)(intptr_t)retval;
+	if (ret)
+		*ret = __retval;
+	return true;
 }
 
 /**
- * unvmed_fio_cancel - Terminate a running fio thread
- * @fio: handle returned by unvmed_fio_run()
+ * unvmed_fio_cancel - Terminate the running fio thread
  *
  * Sends SIGINT to the fio thread so fio can shut down gracefully.  If the
- * thread does not exit within %UNVME_FIO_CANCEL_TIMEOUT_SEC seconds (e.g.,
- * it is stuck waiting for an NVMe completion), pthread_cancel() is called
- * as a last resort.  Cleanup handlers registered inside the thread ensure
- * that the dlopen'd libraries are closed even in the cancel path.
+ * thread does not exit within %UNVME_FIO_CANCEL_TIMEOUT_SEC seconds,
+ * pthread_cancel() is called as a last resort.
  *
- * Blocks until the thread has fully exited, then frees all resources.
+ * Blocks until the thread has fully exited.
  *
- * Return: fio exit status, or -ETIMEDOUT if the thread had to be
- * force-cancelled.
+ * Return: fio exit status, or ``-ETIMEDOUT`` if force-cancelled.
  */
-int unvmed_fio_cancel(struct unvmed_fio *fio)
+int unvmed_fio_cancel(void)
 {
-	struct __fio_thread_args *args = NULL;
 	struct timespec ts;
-	int ret;
+	void *retval;
 
-	pthread_kill(fio->thread, SIGINT);
+	if (!__running)
+		return __retval;
+
+	pthread_kill(__thread, SIGINT);
 
 	clock_gettime(CLOCK_REALTIME, &ts);
 	ts.tv_sec += UNVME_FIO_CANCEL_TIMEOUT_SEC;
 
-	if (pthread_timedjoin_np(fio->thread, (void **)&args, &ts) == 0) {
-		ret = args ? args->ret : fio->ret;
-	} else {
-		unvmed_log_err("fio thread did not exit within %d seconds, "
-				"force-cancelling",
-				UNVME_FIO_CANCEL_TIMEOUT_SEC);
-		pthread_cancel(fio->thread);
-		pthread_join(fio->thread, NULL);
-		ret = -ETIMEDOUT;
+	if (pthread_timedjoin_np(__thread, &retval, &ts) == 0) {
+		__running = false;
+		__retval  = (int)(intptr_t)retval;
+		return __retval;
 	}
 
-	free(args);
-	free(fio);
-	return ret;
+	unvmed_log_err("fio thread did not exit within %d seconds, "
+			"force-cancelling", UNVME_FIO_CANCEL_TIMEOUT_SEC);
+
+	pthread_cancel(__thread);
+	pthread_join(__thread, NULL);
+	__running = false;
+	return -ETIMEDOUT;
 }
