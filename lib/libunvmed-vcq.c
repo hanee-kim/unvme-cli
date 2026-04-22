@@ -137,9 +137,31 @@ static int __unvmed_vcq_push(struct unvme *u, struct unvme_vcq *q,
 
 	q->vcqe[tail] = (struct unvme_vcqe){ .cqe = *cqe, .bdf = u->u_bdf };
 	atomic_store_release(&q->tail, (tail + 1) % q->qsize);
-	unvmed_log_cmd_vcq_push(cqe);
 
+	/*
+	 * unvme_trace() replaces unvmed_log_cmd_vcq_push() which is called
+	 * while holding vcq->tail_lock (a spinlock).  Holding a spinlock
+	 * while doing gettimeofday + snprintf + dprintf was extending the
+	 * critical section and causing unnecessary contention with the
+	 * application thread polling vcq_pop().
+	 *
+	 * The trace call itself is outside the critical section (after the
+	 * atomic_store_release of the new tail), so it does not extend the
+	 * spinlock hold time at all when tracing is disabled.
+	 *
+	 * arg0 = dw1[63:32] | dw0[31:0]
+	 * arg1 = sfp[31:16] | sqhd[15:0]
+	 */
 	pthread_spin_unlock(&q->tail_lock);
+
+	unvme_trace(UNVME_TRACE_VCQ_PUSH,
+		    le16_to_cpu(cqe->sqid),
+		    cqe->cid,
+		    (uint64_t)le32_to_cpu(cqe->dw1) << 32 |
+			     le32_to_cpu(cqe->dw0),
+		    (uint64_t)le16_to_cpu(cqe->sfp) << 16 |
+			     le16_to_cpu(cqe->sqhd));
+
 	return 0;
 }
 
@@ -173,7 +195,23 @@ int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *vcqe)
 
 	*vcqe = q->vcqe[head];
 	atomic_store_release(&q->head, (head + 1) % q->qsize);
-	unvmed_log_cmd_vcq_pop(&vcqe->cqe);
+
+	/*
+	 * unvme_trace() replaces unvmed_log_cmd_vcq_pop().  vcq_pop() is
+	 * called in the application's tight polling loop (unvmed_vcq_run_n),
+	 * potentially thousands of times per second.  The original log call
+	 * gated on atomic_load_acquire(&__log_level) on every iteration.
+	 *
+	 * arg0 = dw1[63:32] | dw0[31:0]
+	 * arg1 = sfp[31:16] | sqhd[15:0]
+	 */
+	unvme_trace(UNVME_TRACE_VCQ_POP,
+		    le16_to_cpu(vcqe->cqe.sqid),
+		    vcqe->cqe.cid,
+		    (uint64_t)le32_to_cpu(vcqe->cqe.dw1) << 32 |
+			     le32_to_cpu(vcqe->cqe.dw0),
+		    (uint64_t)le16_to_cpu(vcqe->cqe.sfp) << 16 |
+			     le16_to_cpu(vcqe->cqe.sqhd));
 	return 0;
 }
 

@@ -54,6 +54,7 @@
 #include <vfn/nvme/rq.h>
 
 #include "libunvmed-logs.h"
+#include "libunvmed-trace.h"
 
 /*
  * `libunvmed`-specific structures
