@@ -4,10 +4,12 @@ libunvmed_src = [
   'libunvmed-vcq.c',
   'libunvmed-cmds.c',
   'libunvmed-logs.c',
+  'libunvmed-trace.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',
   'libunvmed-logs.h',
+  'libunvmed-trace.h',
 ]
 
 ver = '1.0.0'

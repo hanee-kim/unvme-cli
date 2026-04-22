@@ -1419,7 +1419,24 @@ static void unvmed_cmd_cmpl(struct unvme_cmd *cmd, struct nvme_cqe *cqe)
 	int ret;
 
 	atomic_inc(&cmd->usq->cmd_count[cmd->sqe.opcode]);
-	unvmed_log_cmd_cmpl(unvmed_bdf(cmd->u), cqe);
+
+	/*
+	 * unvme_trace() replaces unvmed_log_cmd_cmpl() in the completion hot
+	 * path.  unvmed_cmd_cmpl() is called from both the polling path
+	 * (__unvmed_cq_run_n) and the IRQ reaper thread (__unvmed_reap_cqe),
+	 * so every completed I/O passes through here — overhead matters.
+	 *
+	 * arg0 = dw1[63:32] | dw0[31:0]   (completion result + status)
+	 * arg1 = sfp[31:16] | sqhd[15:0]  (status-field-phase + sq head)
+	 *         sfp contains SC (status code), SCT (type), DNR, MORE bits
+	 */
+	unvme_trace(UNVME_TRACE_CMD_CMPL,
+		    le16_to_cpu(cqe->sqid),
+		    cqe->cid,
+		    (uint64_t)le32_to_cpu(cqe->dw1) << 32 |
+			     le32_to_cpu(cqe->dw0),
+		    (uint64_t)le16_to_cpu(cqe->sfp) << 16 |
+			     le16_to_cpu(cqe->sqhd));
 
 	if (!unvmed_cmd_cmpl_wakeup(cmd, cqe)) {
 		do {
@@ -3123,7 +3140,33 @@ uint16_t unvmed_cmd_post(struct unvme_cmd *cmd, union nvme_cmd *sqe,
 	nvme_sq_post(cmd->rq->sq, (union nvme_cmd *)sqe);
 
 	atomic_store_release(&cmd->state, UNVME_CMD_S_SUBMITTED);
-	unvmed_log_cmd_post(unvmed_bdf(cmd->u), cmd->rq->sq->id, sqe);
+
+	/*
+	 * unvme_trace() replaces unvmed_log_cmd_post() here.
+	 *
+	 * unvmed_log_cmd_post() calls unvmed_log_debug() which does:
+	 *   atomic_load_acquire(&__log_level) + gettimeofday() + snprintf + dprintf
+	 * Even when debug logging is disabled the atomic_load_acquire is a full
+	 * memory barrier executed on every I/O — measurable overhead at high IOPS.
+	 *
+	 * unvme_trace() costs:
+	 *   disabled: 1 relaxed load + predicted-not-taken branch ≈ 0 cycles
+	 *   enabled:  rdtsc + fetch_add + 5 stores + store_release ≈ 15-25 ns
+	 *
+	 * arg0 = SLBA (cdw11:cdw10 packed as 64-bit LE, the primary I/O address)
+	 * arg1 = opcode[63:56] | nsid[55:24] | nlb[15:0]
+	 *         opcode identifies the command type (read=0x02, write=0x01)
+	 *         nsid  identifies the namespace
+	 *         nlb   is the transfer length in logical blocks
+	 */
+	unvme_trace(UNVME_TRACE_CMD_POST,
+		    cmd->rq->sq->id,
+		    cmd->cid,
+		    (uint64_t)le32_to_cpu(sqe->cdw11) << 32 |
+			     le32_to_cpu(sqe->cdw10),
+		    (uint64_t)sqe->opcode << 56 |
+			     (uint64_t)(le32_to_cpu(sqe->nsid) & 0xffffffff) << 24 |
+			     (le32_to_cpu(sqe->cdw12) & 0xffffu));
 
 	do {
 		nr_cmds = cmd->u->nr_cmds;
