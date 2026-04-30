@@ -12,7 +12,7 @@
 #include <json-c/json.h>
 
 #define UNVME_FIO_IOENGINE	"libunvmed-ioengine.so"
-#define UNVME_FIO_LAST_REPORT	"/tmp/unvme-fio-last-report.json"
+#define UNVME_FIO_LAST_REPORT	"/tmp/unvme-fio-last-report"
 
 extern char **environ;
 extern __thread jmp_buf *__jump;
@@ -33,32 +33,78 @@ static void unvmed_fio_reset(const char *libfio)
 }
 
 /*
- * Parse the fio JSON report at UNVME_FIO_LAST_REPORT and print a summary
- * table of per-job stats alongside any detected errors (non-zero job error
- * code, short_ios, or drop_ios).
+ * Print the normal-text portion of the combined json+normal report to stdout,
+ * then parse the JSON block that follows and report any errors.
+ *
+ * fio with --output-format=json+normal writes the human-readable summary first
+ * and then a pretty-printed JSON object (starting with "{\n") at the end of
+ * the file.  We split on that boundary so the user sees the familiar fio
+ * output while we still get a machine-readable blob for error extraction.
  */
 static void unvmed_fio_print_report(void)
 {
-	struct json_object *root, *jobs, *job, *val, *io_obj, *lat_ns;
+	struct json_object *root, *jobs, *job, *val, *io_obj;
 	const char *io_types[] = {"read", "write", "trim"};
+	char *line = NULL;
+	char *json_buf = NULL;
+	size_t linecap = 0;
+	ssize_t linelen;
+	long json_start = -1;
+	long filesize, jsonsize;
+	size_t nread;
 	bool has_error = false;
 	int nr_jobs, i, t;
+	FILE *fp;
 
-	root = json_object_from_file(UNVME_FIO_LAST_REPORT);
-	if (!root) {
-		fprintf(stderr, "[unvme] failed to parse fio report: %s\n",
+	fp = fopen(UNVME_FIO_LAST_REPORT, "r");
+	if (!fp) {
+		fprintf(stderr, "[unvme] failed to open fio report: %s\n",
 			UNVME_FIO_LAST_REPORT);
 		return;
 	}
 
-	printf("\n[unvme] fio report (saved: %s)\n", UNVME_FIO_LAST_REPORT);
-	printf("%-24s  %-5s  %10s  %10s  %12s  %6s  %6s\n",
-	       "job", "type", "IOPS", "BW(KiB/s)", "lat_avg(us)",
-	       "short", "drop");
-	printf("%-24s  %-5s  %10s  %10s  %12s  %6s  %6s\n",
-	       "------------------------", "-----",
-	       "----------", "----------", "------------",
-	       "------", "------");
+	/*
+	 * Stream the normal-text section to stdout line by line.  Stop when we
+	 * hit the opening "{" of the JSON block (always on its own line in
+	 * fio's pretty-printed output) and remember the file offset.
+	 */
+	while ((linelen = getline(&line, &linecap, fp)) != -1) {
+		if (line[0] == '{' && (line[1] == '\n' || line[1] == '\0')) {
+			json_start = ftell(fp) - linelen;
+			break;
+		}
+		fwrite(line, 1, linelen, stdout);
+	}
+	fflush(stdout);
+	free(line);
+
+	if (json_start < 0) {
+		fclose(fp);
+		return;
+	}
+
+	/* Read the JSON portion into a buffer for parsing. */
+	fseek(fp, 0, SEEK_END);
+	filesize = ftell(fp);
+	jsonsize = filesize - json_start;
+
+	json_buf = malloc(jsonsize + 1);
+	if (!json_buf) {
+		fclose(fp);
+		return;
+	}
+
+	fseek(fp, json_start, SEEK_SET);
+	nread = fread(json_buf, 1, jsonsize, fp);
+	json_buf[nread] = '\0';
+	fclose(fp);
+
+	root = json_tokener_parse(json_buf);
+	free(json_buf);
+	if (!root) {
+		fprintf(stderr, "[unvme] failed to parse fio JSON report\n");
+		return;
+	}
 
 	if (!json_object_object_get_ex(root, "jobs", &jobs))
 		goto out;
@@ -77,52 +123,40 @@ static void unvmed_fio_print_report(void)
 
 		for (t = 0; t < 3; t++) {
 			int64_t total_ios = 0;
-			double iops = 0.0, lat_mean_us = 0.0;
-			int64_t bw = 0;
 			int short_ios = 0, drop_ios = 0;
 
 			if (!json_object_object_get_ex(job, io_types[t], &io_obj))
 				continue;
-
 			if (json_object_object_get_ex(io_obj, "total_ios", &val))
 				total_ios = json_object_get_int64(val);
 			if (total_ios == 0)
 				continue;
-
-			if (json_object_object_get_ex(io_obj, "iops", &val))
-				iops = json_object_get_double(val);
-			if (json_object_object_get_ex(io_obj, "bw", &val))
-				bw = json_object_get_int64(val);
-			if (json_object_object_get_ex(io_obj, "lat_ns", &lat_ns) &&
-			    json_object_object_get_ex(lat_ns, "mean", &val))
-				lat_mean_us = json_object_get_double(val) / 1000.0;
 			if (json_object_object_get_ex(io_obj, "short_ios", &val))
 				short_ios = json_object_get_int(val);
 			if (json_object_object_get_ex(io_obj, "drop_ios", &val))
 				drop_ios = json_object_get_int(val);
 
-			bool row_error = job_error || short_ios || drop_ios;
-			printf("%-24s  %-5s  %10.1f  %10" PRId64 "  %12.2f  %6d  %6d%s\n",
-			       jobname, io_types[t], iops, bw, lat_mean_us,
-			       short_ios, drop_ios,
-			       row_error ? "  <-- ERROR" : "");
-
-			if (row_error)
-				has_error = true;
+			if (job_error || short_ios || drop_ios) {
+				if (!has_error) {
+					fprintf(stderr,
+						"\n[unvme] Errors detected:\n");
+					has_error = true;
+				}
+				fprintf(stderr,
+					"  job=%-20s  %-5s  error=%d"
+					"  short_ios=%d  drop_ios=%d\n",
+					jobname, io_types[t], job_error,
+					short_ios, drop_ios);
+			}
 		}
-
-		if (job_error)
-			fprintf(stderr,
-				"[unvme] job '%s' exited with error %d\n",
-				jobname, job_error);
 	}
 
 	if (has_error)
-		fprintf(stderr,
-			"\n[unvme] Errors detected. Full report: %s\n",
+		fprintf(stderr, "[unvme] Full report: %s\n",
 			UNVME_FIO_LAST_REPORT);
 	else
-		printf("\n[unvme] No errors detected.\n");
+		printf("[unvme] No errors detected. Report: %s\n",
+		       UNVME_FIO_LAST_REPORT);
 
 out:
 	json_object_put(root);
@@ -198,11 +232,13 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	}
 
 	/*
-	 * If the caller did not specify either flag we inject both so that the
-	 * final report is always saved as JSON to UNVME_FIO_LAST_REPORT.
-	 * Real-time progress is still visible via --eta=always (fio writes ETA
-	 * lines directly to stderr / the controlling tty, independent of
-	 * --output).
+	 * If the caller did not specify either flag, inject --output-format=
+	 * json+normal and --output=UNVME_FIO_LAST_REPORT.  fio writes the
+	 * human-readable summary followed by the JSON block into that file.
+	 * Real-time ETA progress is unaffected because fio emits those lines
+	 * directly to the controlling tty regardless of --output.
+	 * unvmed_fio_print_report() re-emits the normal portion to stdout and
+	 * parses the JSON block for errors after fio exits.
 	 */
 	if (!has_output_format)
 		nr_extra_argc++;
@@ -237,7 +273,7 @@ int unvmed_run_fio(int argc, char *argv[], const char *libfio, const char *pwd)
 	__argv[idx++] = "--eta=always";
 	__argv[idx++] = "--thread=1";
 	if (!has_output_format)
-		__argv[idx++] = "--output-format=json";
+		__argv[idx++] = "--output-format=json+normal";
 	if (!has_output)
 		__argv[idx++] = "--output=" UNVME_FIO_LAST_REPORT;
 	__argv[idx] = NULL;
