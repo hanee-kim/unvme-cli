@@ -63,6 +63,7 @@
 #include <sys/stat.h>
 #include <linux/io_uring.h>
 #include <linux/ublk_cmd.h>
+#include <nvme/types.h>
 
 #include "libunvmed.h"
 #include "libunvmed-ublk.h"
@@ -580,10 +581,11 @@ static int ublk_submit_nvme(struct unvme_ublk_queue *q, int slot_idx,
 	iov.iov_len  = io_bytes;
 
 	/*
-	 * Allocate a NVMe command using slot_idx as the CID.  This lets us
+	 * Allocate a NVMe command pinning CID to slot_idx.  This lets us
 	 * recover the slot in O(1) from a NVMe CQE (cqe.cid == slot_idx).
 	 */
-	cmd = unvmed_alloc_cmd(dev->u, q->usq, slot_idx,
+	uint16_t cid = (uint16_t)slot_idx;
+	cmd = unvmed_alloc_cmd(dev->u, q->usq, &cid,
 			       slot->dma_buf, io_bytes);
 	if (!cmd) {
 		unvmed_log_err("ublk[%d/%d]: unvmed_alloc_cmd failed",
@@ -727,9 +729,9 @@ static void *ublk_worker(void *arg)
 			 * We used slot_idx as the NVMe CID, so recovering the
 			 * slot is O(1): just index by cid.
 			 */
-			uint16_t cid  = le16_to_cpu(nvme_cqes[i].cid);
+			uint16_t cid  = nvme_cqes[i].cid;
 			struct ublk_slot *slot = &q->slots[cid];
-			uint16_t status = le16_to_cpu(nvme_cqes[i].status) >> 1;
+			int      status = unvmed_cqe_status(&nvme_cqes[i]);
 			int32_t  result = (status == 0) ? 0 : -EIO;
 			uint8_t  op;
 
