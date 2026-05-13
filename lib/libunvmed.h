@@ -284,6 +284,7 @@ enum unvme_sq_flags {
 
 enum unvme_cmd_state {
 	UNVME_CMD_S_INIT		= 0,
+	UNVME_CMD_S_CID_ALLOCATED,
 	UNVME_CMD_S_SUBMITTED,
 	UNVME_CMD_S_COMPLETED,
 	UNVME_CMD_S_TO_BE_COMPLETED,

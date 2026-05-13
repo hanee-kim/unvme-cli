@@ -2118,8 +2118,8 @@ update:
 		}
 
 		/*
-		 * For commands in INIT state (CID allocated but not yet pushed
-		 * to SQ), use unvmed_cmd_get() to atomically acquire a
+		 * For commands in CID_ALLOCATED state (CID allocated but not yet
+		 * pushed to SQ), use unvmed_cmd_get() to atomically acquire a
 		 * reference.  This prevents a TOCTOU race where a concurrent
 		 * thread (e.g. fio without SQ lock) could free the command
 		 * between our refcnt check and unvmed_put_cqe(), which would
@@ -2129,7 +2129,7 @@ update:
 		if (!cmd_ref)
 			continue;
 
-		if (LOAD(cmd_ref->state) == UNVME_CMD_S_INIT)
+		if (LOAD(cmd_ref->state) == UNVME_CMD_S_CID_ALLOCATED)
 			unvmed_put_cqe(u, cmd_ref);
 
 		unvmed_cmd_put(cmd_ref);
@@ -2189,7 +2189,7 @@ void unvmed_cancel_init_state_cmds(struct unvme *u)
 			if (!cmd)
 				continue;
 
-			if (LOAD(cmd->state) == UNVME_CMD_S_INIT)
+			if (LOAD(cmd->state) == UNVME_CMD_S_CID_ALLOCATED)
 				unvmed_put_cqe(u, cmd);
 
 			unvmed_cmd_put(cmd);
