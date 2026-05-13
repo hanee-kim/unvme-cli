@@ -2185,13 +2185,14 @@ void unvmed_cancel_init_state_cmds(struct unvme *u)
 			continue;
 
 		for (int i = 0; i < usq->qsize - 1; i++) {
+			if (LOAD(usq->cmds[i].state) != UNVME_CMD_S_INIT)
+				continue;
+
 			cmd = unvmed_cmd_get(usq, i);
 			if (!cmd)
 				continue;
 
-			if (LOAD(cmd->state) == UNVME_CMD_S_INIT)
-				unvmed_put_cqe(u, cmd);
-
+			unvmed_put_cqe(u, cmd);
 			unvmed_cmd_put(cmd);
 		}
 		unvmed_sq_put(u, usq);
@@ -2797,6 +2798,7 @@ static int unvmed_delete_cq(struct unvme *u, uint32_t qid)
 				"(errno=%d \"%s\")", unvmed_bdf(u), errno, strerror(errno));
 
 		unvmed_sq_exit(asq);
+		unvmed_sq_put(u, asq);
 		return -1;
 	}
 

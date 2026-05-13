@@ -1031,6 +1031,8 @@ int unvme_create_iocq(int argc, char *argv[], struct unvme_msg *msg)
 				      arg_intv(vector), arg_intv(pc)) < 0) {
 		unvme_pr_err("failed to prepare Create I/O Completion Queue command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1058,7 +1060,8 @@ int unvme_create_iocq(int argc, char *argv[], struct unvme_msg *msg)
 	unvmed_enable_cq(ucq);
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 ucq:
 	if (ret)
 		unvmed_free_cq(u, arg_intv(qid));
@@ -1142,6 +1145,8 @@ int unvme_delete_iocq(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_delete_cq(cmd, arg_intv(qid)) < 0) {
 		unvme_pr_err("failed to prepare Delete I/O Completion Queue command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1176,7 +1181,8 @@ int unvme_delete_iocq(int argc, char *argv[], struct unvme_msg *msg)
 	}
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 ucq:
 	unvmed_cq_put(u, ucq);
 usq:
@@ -1309,6 +1315,8 @@ int unvme_create_iosq(int argc, char *argv[], struct unvme_msg *msg)
 				      arg_intv(pc), arg_intv(nvmsetid)) < 0) {
 		unvme_pr_err("failed to prepare Create I/O Submission Queue command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1336,7 +1344,8 @@ int unvme_create_iosq(int argc, char *argv[], struct unvme_msg *msg)
 	unvmed_enable_sq(targetq);
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 free:
 	if (ret)
 		unvmed_free_sq(u, arg_intv(qid));
@@ -1427,6 +1436,8 @@ int unvme_delete_iosq(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_delete_sq(cmd, arg_intv(qid)) < 0) {
 		unvme_pr_err("failed to prepare Delete I/O Submission Queue command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1461,7 +1472,8 @@ int unvme_delete_iosq(int argc, char *argv[], struct unvme_msg *msg)
 	}
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 targetq:
 	unvmed_sq_put(u, targetq);
 usq:
@@ -1577,6 +1589,8 @@ int unvme_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_id_ns(cmd, arg_dblv(nsid), &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Identify Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1606,7 +1620,8 @@ int unvme_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to identify namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -1713,6 +1728,8 @@ int unvme_id_ctrl(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_id_ctrl(cmd, &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Identify Controller command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1738,7 +1755,8 @@ int unvme_id_ctrl(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to identify namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -1850,6 +1868,8 @@ int unvme_id_active_nslist(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_id_active_nslist(cmd, arg_dblv(nsid), &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Identify Active NS List command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -1874,7 +1894,8 @@ int unvme_id_active_nslist(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to identify active namespace list\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -1985,6 +2006,8 @@ int unvme_nvm_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_nvm_id_ns(cmd, arg_dblv(nsid), &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare NVM Identify Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -2014,7 +2037,8 @@ int unvme_nvm_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to NVM identify namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -2138,6 +2162,9 @@ int unvme_set_features(int argc, char *argv[], struct unvme_msg *msg)
 			&iov, arg_intv(data_size) > 0 ? 1 : 0) < 0) {
 		unvme_pr_err("failed to prepare Set Features command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
+		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
 	}
@@ -2162,7 +2189,8 @@ int unvme_set_features(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to set-features\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 	if (buf && len)
 		unvmed_pgunmap(buf);
 usq:
@@ -2243,6 +2271,8 @@ int unvme_set_features_noq(int argc, char *argv[], struct unvme_msg *msg)
 			0 /* nr_iov */) < 0) {
 		unvme_pr_err("failed to prepare Set Features command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -2267,7 +2297,8 @@ int unvme_set_features_noq(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to set-features-noq\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 out:
@@ -2351,6 +2382,8 @@ int unvme_set_features_hmb(int argc, char *argv[], struct unvme_msg *msg)
 				arg_boolv(mr), arg_boolv(enable)) < 0) {
 		unvme_pr_err("failed to prepare Set Features HMB command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -2375,7 +2408,8 @@ int unvme_set_features_hmb(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to set-features\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 out:
@@ -2484,6 +2518,8 @@ int unvme_get_features(int argc, char *argv[], struct unvme_msg *msg)
 			arg_intv(data_size) > 0 ? 1 : 0) < 0) {
 		unvme_pr_err("failed to prepare Get Features command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -2517,7 +2553,8 @@ int unvme_get_features(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to get-features\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 	if (buf && len)
 		unvmed_pgunmap(buf);
 usq:
@@ -2720,6 +2757,8 @@ int unvme_read(int argc, char *argv[], struct unvme_msg *msg)
 			&iov, 1, mbuf, NULL) < 0) {
 		unvme_pr_err("failed to prepare Read Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -2774,7 +2813,8 @@ int unvme_read(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to read\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 mbuf:
 	if (arg_intv(metadata_size) && ns->mset == NVME_FORMAT_MSET_SEPARATE)
 		unvmed_pgunmap(mbuf - arg_intv(prp1_offset));
@@ -3009,6 +3049,8 @@ int unvme_write(int argc, char *argv[], struct unvme_msg *msg)
 			&iov, 1, __mbuf, NULL) < 0) {
 		unvme_pr_err("failed to prepare Identify Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -3031,7 +3073,8 @@ int unvme_write(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to write\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 mbuf:
 
 	if (arg_intv(metadata_size)) {
@@ -3255,6 +3298,8 @@ int unvme_passthru(int argc, char *argv[], struct unvme_msg *msg)
 			if (unvme_read_file(filepath, buf, arg_intv(data_len))) {
 				unvme_pr_err("failed to read file %s\n", filepath);
 
+				unvmed_cmd_put(cmd);
+				cmd = NULL;
 				unvmed_sq_exit(usq);
 				ret = ENOENT;
 				goto cmd;
@@ -3298,6 +3343,8 @@ int unvme_passthru(int argc, char *argv[], struct unvme_msg *msg)
 	}
 
 	if (arg_boolv(dry_run)) {
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = 0;
 		goto cmd;
@@ -3309,6 +3356,8 @@ int unvme_passthru(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep(cmd, &sqe, &iov, arg_intv(data_len) > 0 ? 1 : 0) < 0) {
 		unvme_pr_err("failed to prepare a command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -3342,7 +3391,8 @@ int unvme_passthru(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to passthru\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 buf:
 	if (buf && len)
 		unvmed_pgunmap(buf);
@@ -3496,6 +3546,8 @@ int unvme_format(int argc, char *argv[], struct unvme_msg *msg)
 			arg_intv(mset)) < 0) {
 		unvme_pr_err("failed to prepare Format command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -3531,7 +3583,8 @@ int unvme_format(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to format NVM\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 out:
@@ -3870,6 +3923,8 @@ int unvme_virt_mgmt(int argc, char *argv[], struct unvme_msg *msg)
 			arg_intv(act), arg_intv(nr)) < 0 ) {
 		unvme_pr_err("failed to prepare Virtualization Mgmt. command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -3893,7 +3948,8 @@ int unvme_virt_mgmt(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to submit virt-mgmt command\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 out:
@@ -3983,6 +4039,9 @@ int unvme_id_primary_ctrl_caps(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_id_primary_ctrl_caps(cmd, &iov, 1, arg_intv(cntlid)) < 0) {
 		unvme_pr_err("failed to prepare Identify Primary Controller command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
+		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
 	}
@@ -4006,7 +4065,8 @@ int unvme_id_primary_ctrl_caps(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to identify primary controller capabilities\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -4098,6 +4158,8 @@ int unvme_id_secondary_ctrl_list(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_id_secondary_ctrl_list(cmd, &iov, 1, arg_intv(cntlid)) < 0) {
 		unvme_pr_err("failed to prepare Identify Secondary Controller command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -4122,7 +4184,8 @@ int unvme_id_secondary_ctrl_list(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to identify secondary controller list\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -4430,6 +4493,8 @@ int unvme_create_ns(int argc, char *argv[], struct unvme_msg *msg)
 				      phndls->count, __phndls, &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Create Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -4458,7 +4523,8 @@ int unvme_create_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to create namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -4526,6 +4592,8 @@ int unvme_delete_ns(int argc, char *argv[], struct unvme_msg *msg)
 	if (unvmed_cmd_prep_delete_ns(cmd, arg_dblv(nsid)) < 0) {
 		unvme_pr_err("failed to prepare Delete Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -4553,7 +4621,8 @@ int unvme_delete_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to delete namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 out:
@@ -4641,6 +4710,8 @@ int unvme_attach_ns(int argc, char *argv[], struct unvme_msg *msg)
 				__ctrlids, &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Attach Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -4668,7 +4739,8 @@ int unvme_attach_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to attach namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
@@ -4758,6 +4830,8 @@ int unvme_detach_ns(int argc, char *argv[], struct unvme_msg *msg)
 				__ctrlids, &iov, 1) < 0) {
 		unvme_pr_err("failed to prepare Deattach Namespace command\n");
 
+		unvmed_cmd_put(cmd);
+		cmd = NULL;
 		unvmed_sq_exit(usq);
 		ret = errno;
 		goto cmd;
@@ -4785,7 +4859,8 @@ int unvme_detach_ns(int argc, char *argv[], struct unvme_msg *msg)
 		unvme_pr_err("failed to deattach namespace\n");
 
 cmd:
-	unvmed_cmd_put(cmd);
+	if (cmd)
+		unvmed_cmd_put(cmd);
 usq:
 	unvmed_sq_put(u, usq);
 buf:
