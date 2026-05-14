@@ -9,6 +9,47 @@
 #include "libunvmed.h"
 #include "libunvmed-logs.h"
 #include "libunvmed-private.h"
+#include "libunvmed-trace.h"
+
+struct unvmed_trace_ring __unvmed_trace;
+
+static const char * const __trace_event_str[] = {
+	[UNVMED_TRACE_CMD_ALLOC] = "ALLOC",
+	[UNVMED_TRACE_CMD_FREE]  = "FREE",
+	[UNVMED_TRACE_CMD_GET]   = "GET",
+	[UNVMED_TRACE_CMD_PUT]   = "PUT",
+};
+
+static const char * const __trace_state_str[] = {
+	[UNVME_CMD_S_INIT]             = "INIT",
+	[UNVME_CMD_S_CID_ALLOCATED]    = "CID_ALLOCATED",
+	[UNVME_CMD_S_SUBMITTED]        = "SUBMITTED",
+	[UNVME_CMD_S_COMPLETED]        = "COMPLETED",
+	[UNVME_CMD_S_TO_BE_COMPLETED]  = "TO_BE_COMPLETED",
+};
+
+void unvmed_trace_dump(int fd)
+{
+	uint64_t head = atomic_load_explicit(&__unvmed_trace.head,
+					     memory_order_acquire);
+	uint64_t count = head < UNVMED_TRACE_RING_SIZE ? head
+						       : UNVMED_TRACE_RING_SIZE;
+	uint64_t start = head - count;
+
+	dprintf(fd, "%-20s  %-5s  %-4s  %-4s  %-6s  %-14s  %s\n",
+		"TSC", "EVENT", "SQID", "CID", "REFCNT", "STATE", "CALLER");
+
+	for (uint64_t i = 0; i < count; i++) {
+		uint64_t idx = (start + i) & (UNVMED_TRACE_RING_SIZE - 1);
+		struct unvmed_trace_entry *e = &__unvmed_trace.entries[idx];
+		const char *ev = e->event < 4 ? __trace_event_str[e->event] : "?";
+		const char *st = e->state < 5 ? __trace_state_str[e->state] : "?";
+
+		dprintf(fd, "%-20llu  %-5s  %-4u  %-4u  %-6d  %-14s  %p\n",
+			(unsigned long long)e->tsc, ev,
+			e->sqid, e->cid, e->refcnt, st, e->caller);
+	}
+}
 
 __thread char __buf[256];
 #define LOG_MAX_LEN sizeof(__buf)

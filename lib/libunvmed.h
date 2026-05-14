@@ -284,6 +284,7 @@ enum unvme_sq_flags {
 
 enum unvme_cmd_state {
 	UNVME_CMD_S_INIT		= 0,
+	UNVME_CMD_S_CID_ALLOCATED,
 	UNVME_CMD_S_SUBMITTED,
 	UNVME_CMD_S_COMPLETED,
 	UNVME_CMD_S_TO_BE_COMPLETED,
@@ -1606,6 +1607,16 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq);
  * via unvmed_quiesce_sq_all() to prevent concurrent SQE issues.
  */
 void unvmed_cancel_init_state_cmds(struct unvme *u);
+
+/**
+ * unvmed_trace_dump - Dump the in-memory command trace ring buffer
+ * @fd: file descriptor to write the dump to (e.g. fileno(stderr))
+ *
+ * Prints all recorded trace entries in chronological order.  Entries are
+ * written lock-free with rdtsc timestamps so this is safe to call at any
+ * time, including from a signal handler or crash path.
+ */
+void unvmed_trace_dump(int fd);
 
 /**
  * __unvmed_cq_run_n - Reap CQ entries from a completion queue
