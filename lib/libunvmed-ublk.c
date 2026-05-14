@@ -313,6 +313,7 @@ static int ublk_add_dev(int ctrl_fd, int dev_id,
 		.queue_depth    = (uint16_t)queue_depth,
 		.max_io_buf_bytes = max_io_buf_bytes,
 		.dev_id         = (uint32_t)dev_id,
+		.flags          = UBLK_F_CMD_IOCTL_ENCODE,
 		/* pid will be filled by the kernel */
 	};
 	struct ublksrv_ctrl_cmd cmd = {
