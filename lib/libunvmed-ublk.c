@@ -322,7 +322,7 @@ static int ublk_add_dev(int ctrl_fd, int dev_id,
 		.addr    = (uintptr_t)&info,
 	};
 
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_CMD_ADD_DEV, &cmd);
+	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_ADD_DEV, &cmd);
 }
 
 /* Configure block-device geometry (sector count, block size). */
@@ -347,7 +347,7 @@ static int ublk_set_params(int ctrl_fd, int dev_id,
 		.addr    = (uintptr_t)&params,
 	};
 
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_CMD_SET_PARAMS, &cmd);
+	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_SET_PARAMS, &cmd);
 }
 
 /* Start the ublk device — /dev/ublkb{dev_id} appears after this. */
@@ -358,7 +358,7 @@ static int ublk_start_dev(int ctrl_fd, int dev_id)
 		.queue_id = (__u16)-1,
 		.data[0]  = getpid(),  /* kernel stores the server pid */
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_CMD_START_DEV, &cmd);
+	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_START_DEV, &cmd);
 }
 
 /* Stop the ublk device (before deleting it). */
@@ -368,7 +368,7 @@ static int ublk_stop_dev(int ctrl_fd, int dev_id)
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (__u16)-1,
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_CMD_STOP_DEV, &cmd);
+	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_STOP_DEV, &cmd);
 }
 
 /* Delete the ublk device — /dev/ublkb{dev_id} and /dev/ublkc{dev_id} vanish. */
@@ -378,7 +378,7 @@ static int ublk_del_dev(int ctrl_fd, int dev_id)
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (__u16)-1,
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_CMD_DEL_DEV, &cmd);
+	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_DEL_DEV, &cmd);
 }
 
 /* =========================================================================
@@ -503,7 +503,7 @@ static void ublk_queue_fetch_req(struct unvme_ublk_queue *q, uint16_t tag)
 
 	sqe->opcode   = IORING_OP_URING_CMD;
 	sqe->fd       = q->cdev_fd;
-	sqe->cmd_op   = UBLK_IO_FETCH_REQ;
+	sqe->cmd_op   = UBLK_U_IO_FETCH_REQ;
 	sqe->user_data = tag;   /* echo'd back in the CQE so we know the tag */
 
 	io_cmd->q_id   = (__u16)q->qid;
@@ -532,7 +532,7 @@ static void ublk_queue_commit_req(struct unvme_ublk_queue *q,
 
 	sqe->opcode   = IORING_OP_URING_CMD;
 	sqe->fd       = q->cdev_fd;
-	sqe->cmd_op   = UBLK_IO_COMMIT_AND_FETCH_REQ;
+	sqe->cmd_op   = UBLK_U_IO_COMMIT_AND_FETCH_REQ;
 	sqe->user_data = tag;
 
 	io_cmd->q_id   = (__u16)q->qid;
