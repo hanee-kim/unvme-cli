@@ -9,6 +9,7 @@
 
 #include "libunvmed.h"
 #include "libunvmed-private.h"
+#include "libunvmed-trace.h"
 
 static inline int __find_first_zero(uint8_t byte)
 {
@@ -231,6 +232,7 @@ static struct unvme_cmd *__unvmed_cmd_alloc(struct unvme *u,
 
 	rq->opaque = cmd;
 
+	unvmed_trace(cmd, UNVMED_TRACE_CMD_ALLOC, 1);
 	return cmd;
 }
 
@@ -315,6 +317,7 @@ static void __unvmed_cmd_free(struct unvme_cmd *cmd)
 	struct nvme_rq *rq = cmd->rq;
 	uint16_t cid = cmd->cid;
 
+	unvmed_trace(cmd, UNVMED_TRACE_CMD_FREE, 0);
 	memset(cmd, 0, sizeof(*cmd));
 	atomic_dec(&usq->nr_cmds);
 
@@ -343,6 +346,7 @@ struct unvme_cmd *unvmed_cmd_get(struct unvme_sq *usq, uint16_t cid)
 
 	if (!refcnt)
 		return NULL;
+	unvmed_trace(cmd, UNVMED_TRACE_CMD_GET, cmd->refcnt);
 	return cmd;
 }
 
@@ -351,6 +355,7 @@ int unvmed_cmd_put(struct unvme_cmd *cmd)
 	int refcnt;
 
 	refcnt = atomic_dec_fetch(&cmd->refcnt);
+	unvmed_trace(cmd, UNVMED_TRACE_CMD_PUT, refcnt);
 	if (refcnt == 0)
 		unvmed_cmd_free(cmd);
 
