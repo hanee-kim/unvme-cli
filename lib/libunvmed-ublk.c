@@ -58,7 +58,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
-#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <linux/io_uring.h>
@@ -287,47 +286,72 @@ static int ublk_ring_peek_cqes(struct ublk_ring *r,
  * Section 2: ublk device control
  *
  * All control-plane communication with the kernel ublk driver goes through
- * /dev/ublk-control via ioctl.  The ioctl payload is ublksrv_ctrl_cmd,
- * which points to additional data (dev_info, params, …) via its addr field.
+ * /dev/ublk-control via io_uring IORING_OP_URING_CMD (NOT regular ioctl).
+ * The kernel's ublk_ctl_fops registers only a .uring_cmd handler; there is
+ * no .unlocked_ioctl.  The ctrl ring uses SQE128 (same as the IO rings).
+ * The command opcode goes in sqe->cmd_op; the ublksrv_ctrl_cmd payload
+ * (containing dev_id, queue_id, addr, len) goes in sqe->cmd[].
  * ========================================================================= */
 
 #define UBLK_CTRL_DEV  "/dev/ublk-control"
 #define UBLK_CDEV_FMT  "/dev/ublkc%d"
 
-static int ublk_ctrl_ioctl(int ctrl_fd, unsigned int cmd,
-			    struct ublksrv_ctrl_cmd *payload)
+/*
+ * Send a control command to /dev/ublk-control via io_uring URING_CMD.
+ *
+ * The kernel's /dev/ublk-control has NO ioctl() handler — all control
+ * commands must be submitted as IORING_OP_URING_CMD on the ctrl ring.
+ * The command opcode goes in sqe->cmd_op; the ublksrv_ctrl_cmd payload
+ * goes into sqe->cmd[] (the extra 64 bytes of a 128-byte SQE).
+ */
+static int ublk_ctrl_uring_cmd(struct ublk_ring *ring, int ctrl_fd,
+				unsigned int cmd_op,
+				struct ublksrv_ctrl_cmd *payload)
 {
-	int ret = ioctl(ctrl_fd, cmd, payload);
+	struct io_uring_sqe *sqe = ublk_ring_get_sqe(ring);
+	struct io_uring_cqe cqe;
+	int ret;
+
+	sqe->opcode    = IORING_OP_URING_CMD;
+	sqe->fd        = ctrl_fd;
+	sqe->cmd_op    = cmd_op;
+	sqe->user_data = 0;
+	/* payload goes into the extra 64 bytes of the 128-byte SQE */
+	memcpy((void *)sqe->cmd, payload, sizeof(*payload));
+
+	ret = ublk_ring_submit_and_wait(ring, 1);
 	if (ret < 0)
-		return -errno;
-	return ret;
+		return ret;
+
+	if (ublk_ring_peek_cqes(ring, &cqe, 1) < 1)
+		return -EIO;
+
+	return cqe.res;
 }
 
 /* Tell the kernel to create /dev/ublkc{dev_id} with the given geometry. */
-static int ublk_add_dev(int ctrl_fd, int dev_id,
-			 int nr_queues, int queue_depth,
-			 uint32_t max_io_buf_bytes)
+static int ublk_add_dev(struct unvme_ublk_dev *dev)
 {
 	struct ublksrv_ctrl_dev_info info = {
-		.nr_hw_queues   = (uint16_t)nr_queues,
-		.queue_depth    = (uint16_t)queue_depth,
-		.max_io_buf_bytes = max_io_buf_bytes,
-		.dev_id         = (uint32_t)dev_id,
-		.flags          = UBLK_F_CMD_IOCTL_ENCODE,
-		/* pid will be filled by the kernel */
+		.nr_hw_queues     = (uint16_t)dev->nr_queues,
+		.queue_depth      = (uint16_t)dev->queue_depth,
+		.max_io_buf_bytes = dev->max_io_buf_bytes,
+		.dev_id           = (uint32_t)dev->dev_id,
+		.flags            = UBLK_F_CMD_IOCTL_ENCODE,
 	};
 	struct ublksrv_ctrl_cmd cmd = {
-		.dev_id  = (uint32_t)dev_id,
-		.queue_id = (__u16)-1,  /* not queue-specific */
-		.len     = sizeof(info),
-		.addr    = (uintptr_t)&info,
+		.dev_id   = (uint32_t)dev->dev_id,
+		.queue_id = (__u16)-1,
+		.len      = sizeof(info),
+		.addr     = (uintptr_t)&info,
 	};
 
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_ADD_DEV, &cmd);
+	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+				   UBLK_U_CMD_ADD_DEV, &cmd);
 }
 
 /* Configure block-device geometry (sector count, block size). */
-static int ublk_set_params(int ctrl_fd, int dev_id,
+static int ublk_set_params(struct unvme_ublk_dev *dev,
 			    uint64_t nr_sectors, uint8_t lba_shift)
 {
 	struct ublk_params params = {
@@ -342,44 +366,51 @@ static int ublk_set_params(int ctrl_fd, int dev_id,
 		},
 	};
 	struct ublksrv_ctrl_cmd cmd = {
-		.dev_id  = (uint32_t)dev_id,
+		.dev_id   = (uint32_t)dev->dev_id,
 		.queue_id = (__u16)-1,
-		.len     = sizeof(params),
-		.addr    = (uintptr_t)&params,
+		.len      = sizeof(params),
+		.addr     = (uintptr_t)&params,
 	};
 
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_SET_PARAMS, &cmd);
+	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+				   UBLK_U_CMD_SET_PARAMS, &cmd);
 }
 
 /* Start the ublk device — /dev/ublkb{dev_id} appears after this. */
-static int ublk_start_dev(int ctrl_fd, int dev_id)
+static int ublk_start_dev(struct unvme_ublk_dev *dev)
 {
 	struct ublksrv_ctrl_cmd cmd = {
-		.dev_id   = (uint32_t)dev_id,
+		.dev_id   = (uint32_t)dev->dev_id,
 		.queue_id = (__u16)-1,
-		.data[0]  = getpid(),  /* kernel stores the server pid */
+		.data[0]  = getpid(),
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_START_DEV, &cmd);
+
+	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+				   UBLK_U_CMD_START_DEV, &cmd);
 }
 
 /* Stop the ublk device (before deleting it). */
-static int ublk_stop_dev(int ctrl_fd, int dev_id)
+static int ublk_stop_dev(struct unvme_ublk_dev *dev)
 {
 	struct ublksrv_ctrl_cmd cmd = {
-		.dev_id   = (uint32_t)dev_id,
+		.dev_id   = (uint32_t)dev->dev_id,
 		.queue_id = (__u16)-1,
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_STOP_DEV, &cmd);
+
+	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+				   UBLK_U_CMD_STOP_DEV, &cmd);
 }
 
 /* Delete the ublk device — /dev/ublkb{dev_id} and /dev/ublkc{dev_id} vanish. */
-static int ublk_del_dev(int ctrl_fd, int dev_id)
+static int ublk_del_dev(struct unvme_ublk_dev *dev)
 {
 	struct ublksrv_ctrl_cmd cmd = {
-		.dev_id   = (uint32_t)dev_id,
+		.dev_id   = (uint32_t)dev->dev_id,
 		.queue_id = (__u16)-1,
 	};
-	return ublk_ctrl_ioctl(ctrl_fd, UBLK_U_CMD_DEL_DEV, &cmd);
+
+	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+				   UBLK_U_CMD_DEL_DEV, &cmd);
 }
 
 /* =========================================================================
@@ -469,6 +500,7 @@ struct unvme_ublk_dev {
 	uint32_t               lba_size;   /* namespace logical block size in bytes */
 
 	int                    ctrl_fd;    /* /dev/ublk-control */
+	struct ublk_ring       ctrl_ring;  /* io_uring ring for control commands */
 
 	struct unvme_ublk_queue *queues;   /* [nr_queues] */
 };
@@ -1030,12 +1062,21 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 		goto err_free_dev;
 	}
 
-	/* Create the ublk device — generates /dev/ublkc{dev_id} */
-	if (ublk_add_dev(dev->ctrl_fd, dev_id, nr_queues,
-			  queue_depth, dev->max_io_buf_bytes) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_ADD_DEV failed: %s",
-			strerror(errno));
+	/*
+	 * Set up a small io_uring ring (SQE128) for control commands.
+	 * /dev/ublk-control has no ioctl() handler — all ctrl commands
+	 * must be submitted as IORING_OP_URING_CMD via this ring.
+	 */
+	if (ublk_ring_init(&dev->ctrl_ring, 4) < 0) {
+		unvmed_log_err("ublk: ctrl ring init failed");
 		goto err_close_ctrl;
+	}
+
+	/* Create the ublk device — generates /dev/ublkc{dev_id} */
+	if (ublk_add_dev(dev) < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_ADD_DEV failed (ret=%d)",
+			errno);
+		goto err_exit_ctrl_ring;
 	}
 
 	/*
@@ -1047,9 +1088,9 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 		(uint64_t)ns->nr_lbas * (ns->lba_size / 512);
 	uint8_t lba_shift = __builtin_ctz(ns->lba_size);  /* log2(lba_size) */
 
-	if (ublk_set_params(dev->ctrl_fd, dev_id, nr_sectors, lba_shift) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_SET_PARAMS failed: %s",
-			strerror(errno));
+	if (ublk_set_params(dev, nr_sectors, lba_shift) < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_SET_PARAMS failed (ret=%d)",
+			errno);
 		goto err_del_dev;
 	}
 
@@ -1074,9 +1115,9 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 	 * submitted their initial FETCH_REQs (done inside ublk_queue_init →
 	 * ublk_worker startup).
 	 */
-	if (ublk_start_dev(dev->ctrl_fd, dev_id) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed: %s",
-			strerror(errno));
+	if (ublk_start_dev(dev) < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed (ret=%d)",
+			errno);
 		for (i = 0; i < nr_queues; i++)
 			ublk_queue_teardown(&dev->queues[i]);
 		goto err_free_queues;
@@ -1090,7 +1131,9 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 err_free_queues:
 	free(dev->queues);
 err_del_dev:
-	ublk_del_dev(dev->ctrl_fd, dev_id);
+	ublk_del_dev(dev);
+err_exit_ctrl_ring:
+	ublk_ring_exit(&dev->ctrl_ring);
 err_close_ctrl:
 	close(dev->ctrl_fd);
 err_free_dev:
@@ -1102,14 +1145,15 @@ err_free_dev:
 void unvmed_ublk_stop(struct unvme_ublk_dev *dev)
 {
 	/* Ask the kernel to stop sending new I/O — drains the block queue */
-	ublk_stop_dev(dev->ctrl_fd, dev->dev_id);
+	ublk_stop_dev(dev);
 
 	/* Tear down each queue (signals worker thread + waits for it) */
 	for (int i = 0; i < dev->nr_queues; i++)
 		ublk_queue_teardown(&dev->queues[i]);
 
 	/* Remove /dev/ublkb{dev_id} and /dev/ublkc{dev_id} */
-	ublk_del_dev(dev->ctrl_fd, dev->dev_id);
+	ublk_del_dev(dev);
+	ublk_ring_exit(&dev->ctrl_ring);
 	close(dev->ctrl_fd);
 
 	free(dev->queues);
