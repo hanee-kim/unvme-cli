@@ -297,6 +297,29 @@ static int ublk_ring_peek_cqes(struct ublk_ring *r,
  * ========================================================================= */
 
 /*
+ * The io_cmd_buf for queue @qid lives in /dev/ublkc{N} at:
+ *   offset = qid * round_up(UBLK_MAX_QUEUE_DEPTH * sizeof(ublksrv_io_desc), PAGE_SIZE)
+ *   size   = round_up(queue_depth * sizeof(ublksrv_io_desc), PAGE_SIZE)
+ *
+ * The mapping must be PROT_READ only — the kernel writes into it and
+ * ublk_ch_mmap() returns EPERM if VM_WRITE is set.
+ */
+#define UBLK_PAGE_SIZE  4096UL
+
+static inline size_t ublk_cmd_buf_sz(int queue_depth)
+{
+	size_t raw = (size_t)queue_depth * sizeof(struct ublksrv_io_desc);
+	return (raw + UBLK_PAGE_SIZE - 1) & ~(UBLK_PAGE_SIZE - 1);
+}
+
+static inline off_t ublk_cmd_buf_off(int qid)
+{
+	/* Stride = UBLK_MAX_QUEUE_DEPTH * 24 bytes = 98304 (already page-aligned) */
+	size_t per_q = UBLK_MAX_QUEUE_DEPTH * sizeof(struct ublksrv_io_desc);
+	return (off_t)(UBLKSRV_CMD_BUF_OFFSET + (size_t)qid * per_q);
+}
+
+/*
  * One in-flight I/O request tracked by the worker thread.
  *
  * There are queue_depth slots per queue.  A slot is FREE when it holds no
@@ -872,14 +895,16 @@ static int ublk_queue_init(struct unvme_ublk_queue *q,
 	}
 
 	/*
-	 * Map the io_cmd_buf at offset 0 from the char device.
-	 * The kernel writes ublksrv_io_desc here for each incoming request.
-	 * Size = queue_depth descriptors.
+	 * Map the io_cmd_buf from /dev/ublkc{N}.
+	 * - PROT_READ only: ublk_ch_mmap() returns EPERM if VM_WRITE is set;
+	 *   the kernel writes descriptors here and the server only reads them.
+	 * - Size must be page-rounded (kernel validates exact match).
+	 * - Offset = qid * stride, where stride = UBLK_MAX_QUEUE_DEPTH * 24.
 	 */
-	size_t cmd_buf_sz =
-		(size_t)dev->queue_depth * sizeof(struct ublksrv_io_desc);
-	q->cmd_buf = mmap(NULL, cmd_buf_sz, PROT_READ | PROT_WRITE,
-			  MAP_SHARED | MAP_POPULATE, q->cdev_fd, 0);
+	size_t cmd_buf_sz = ublk_cmd_buf_sz(dev->queue_depth);
+	q->cmd_buf = mmap(NULL, cmd_buf_sz, PROT_READ,
+			  MAP_SHARED | MAP_POPULATE,
+			  q->cdev_fd, ublk_cmd_buf_off(qid));
 	if (q->cmd_buf == MAP_FAILED) {
 		unvmed_log_err("ublk[%d/%d]: mmap cmd_buf: %s",
 			dev->dev_id, qid, strerror(errno));
@@ -969,7 +994,7 @@ err_free_slots:
 	free(q->slots);
 	q->slots = NULL;
 err_unmap_cmdbuf:
-	munmap(q->cmd_buf, cmd_buf_sz);
+	munmap(q->cmd_buf, ublk_cmd_buf_sz(dev->queue_depth));
 err_close_cdev:
 	close(q->cdev_fd);
 err_del_sq:
@@ -982,8 +1007,7 @@ static void ublk_queue_teardown(struct unvme_ublk_queue *q)
 {
 	struct unvme_ublk_dev *dev = q->dev;
 	struct unvme          *u   = dev->u;
-	size_t cmd_buf_sz =
-		(size_t)dev->queue_depth * sizeof(struct ublksrv_io_desc);
+	size_t cmd_buf_sz = ublk_cmd_buf_sz(dev->queue_depth);
 
 	/* Signal worker to exit and wait */
 	q->stop = true;
