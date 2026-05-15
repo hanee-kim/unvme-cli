@@ -455,9 +455,18 @@ static int ublk_add_dev(struct unvme_ublk_dev *dev)
 		.len      = sizeof(info),
 		.addr     = (uintptr_t)&info,
 	};
+	int ret;
 
-	return ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
+	ret = ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
 				   UBLK_U_CMD_ADD_DEV, &cmd);
+	/*
+	 * Kernel writes back the full dev_info (including the actual assigned
+	 * dev_id) via copy_to_user after success.  Read it back so that
+	 * dev->dev_id is authoritative for all subsequent commands.
+	 */
+	if (ret == 0)
+		dev->dev_id = (int)info.dev_id;
+	return ret;
 }
 
 static int ublk_set_params(struct unvme_ublk_dev *dev,
@@ -985,7 +994,7 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 	struct unvme_ublk_dev *dev;
 	struct unvme_ns       *ns;
 	ssize_t                max_xfer;
-	int                    i;
+	int                    i, ret;
 
 	/* Validate the namespace exists */
 	ns = unvmed_ns_get(u, nsid);
@@ -1048,10 +1057,19 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 		goto err_close_ctrl;
 	}
 
+	/*
+	 * Clean up any stale device left by a previous run that was killed
+	 * before it could call DEL_DEV.  The kernel IDR slot must be free
+	 * before ADD_DEV will accept the same dev_id.  Ignore errors here —
+	 * if the device doesn't exist the command simply returns -ENOENT.
+	 */
+	ublk_del_dev(dev);
+
 	/* Create the ublk device — generates /dev/ublkc{dev_id} */
-	if (ublk_add_dev(dev) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_ADD_DEV failed (ret=%d)",
-			errno);
+	ret = ublk_add_dev(dev);
+	if (ret < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_ADD_DEV failed: %s (%d)",
+			strerror(-ret), ret);
 		goto err_exit_ctrl_ring;
 	}
 
@@ -1064,9 +1082,10 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 		(uint64_t)ns->nr_lbas * (ns->lba_size / 512);
 	uint8_t lba_shift = __builtin_ctz(ns->lba_size);  /* log2(lba_size) */
 
-	if (ublk_set_params(dev, nr_sectors, lba_shift) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_SET_PARAMS failed (ret=%d)",
-			errno);
+	ret = ublk_set_params(dev, nr_sectors, lba_shift);
+	if (ret < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_SET_PARAMS failed: %s (%d)",
+			strerror(-ret), ret);
 		goto err_del_dev;
 	}
 
@@ -1099,9 +1118,10 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 	/*
 	 * Start the ublk device — /dev/ublkb{dev_id} appears here.
 	 */
-	if (ublk_start_dev(dev) < 0) {
-		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed (ret=%d)",
-			errno);
+	ret = ublk_start_dev(dev);
+	if (ret < 0) {
+		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed: %s (%d)",
+			strerror(-ret), ret);
 		for (i = 0; i < nr_queues; i++)
 			ublk_queue_teardown(&dev->queues[i]);
 		goto err_free_queues;
