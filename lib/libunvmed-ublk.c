@@ -998,8 +998,9 @@ err_unmap_cmdbuf:
 err_close_cdev:
 	close(q->cdev_fd);
 err_del_sq:
-	/* unvmed_delete_sq would go here if it existed; leak gracefully */
+	unvmed_sq_put(u, q->usq);
 err_del_cq:
+	unvmed_cq_put(u, q->ucq);
 	return -1;
 }
 
