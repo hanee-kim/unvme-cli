@@ -55,6 +55,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -64,6 +65,10 @@
 
 #include "libunvmed.h"
 #include "libunvmed-ublk.h"
+
+/* No-op SIGUSR1 handler used to interrupt a blocked io_uring_enter syscall
+ * in the worker thread during teardown (SA_RESTART is not set). */
+static void ublk_sigusr1_noop(int sig) { (void)sig; }
 
 /* =========================================================================
  * Section 1: Raw io_uring — no liburing dependency
@@ -379,7 +384,9 @@ struct unvme_ublk_queue {
 	/* Worker thread */
 	pthread_t  thread;
 	bool       stop;       /* set to true to request clean shutdown */
-	bool       started;    /* true once thread is past init */
+	/* Set with __ATOMIC_RELEASE after FETCH_REQs are submitted; main thread
+	 * reads with __ATOMIC_ACQUIRE before calling ublk_start_dev(). */
+	bool       started;
 };
 
 /* Top-level device handle (returned by unvmed_ublk_start). */
@@ -680,15 +687,18 @@ static void *ublk_worker(void *arg)
 	int i;
 
 	unvmed_log_info("ublk[%d/%d]: worker started", dev->dev_id, q->qid);
-	q->started = true;
 
 	/*
 	 * Prime the pump: issue one FETCH_REQ for every slot so the kernel
 	 * can immediately deliver I/O requests as they arrive.
+	 * Signal 'started' only AFTER the submit so the main thread's
+	 * ublk_start_dev() call is guaranteed to happen after FETCH_REQs
+	 * are in flight (kernel requires this before START_DEV succeeds).
 	 */
 	for (int tag = 0; tag < q->nr_slots; tag++)
 		ublk_queue_fetch_req(q, (uint16_t)tag);
 	ublk_ring_submit(&q->ring);
+	__atomic_store_n(&q->started, true, __ATOMIC_RELEASE);
 
 	while (!q->stop) {
 		nr_submitted = 0;
@@ -946,8 +956,9 @@ static void ublk_queue_teardown(struct unvme_ublk_queue *q)
 	struct unvme          *u   = dev->u;
 	size_t cmd_buf_sz = ublk_cmd_buf_sz(dev->queue_depth);
 
-	/* Signal worker to exit and wait */
+	/* Signal worker to exit and interrupt any blocked io_uring_enter */
 	q->stop = true;
+	pthread_kill(q->thread, SIGUSR1);
 	pthread_join(q->thread, NULL);
 
 	ublk_ring_exit(&q->ring);
@@ -1005,6 +1016,20 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 	dev->max_io_buf_bytes = (uint32_t)((max_xfer > 0 && max_xfer < (1 << 20))
 					    ? max_xfer : (1 << 20));
 
+	/*
+	 * Install a no-op SIGUSR1 handler (without SA_RESTART) so that
+	 * ublk_queue_teardown() can use pthread_kill(SIGUSR1) to interrupt
+	 * a worker blocked in io_uring_enter().
+	 */
+	{
+		struct sigaction sa = {
+			.sa_handler = ublk_sigusr1_noop,
+			.sa_flags   = 0,   /* no SA_RESTART */
+		};
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGUSR1, &sa, NULL);
+	}
+
 	/* Open the ublk control device */
 	dev->ctrl_fd = open(UBLK_CTRL_DEV, O_RDWR);
 	if (dev->ctrl_fd < 0) {
@@ -1061,10 +1086,18 @@ struct unvme_ublk_dev *unvmed_ublk_start(struct unvme *u, uint32_t nsid,
 	}
 
 	/*
+	 * Wait for every worker to signal it has submitted its FETCH_REQs.
+	 * The kernel requires each queue to have at least one FETCH_REQ in
+	 * flight before START_DEV will succeed.  ublk_worker() sets
+	 * q->started (with RELEASE ordering) after ublk_ring_submit().
+	 */
+	for (i = 0; i < nr_queues; i++) {
+		while (!__atomic_load_n(&dev->queues[i].started, __ATOMIC_ACQUIRE))
+			sched_yield();
+	}
+
+	/*
 	 * Start the ublk device — /dev/ublkb{dev_id} appears here.
-	 * This must be called only after all per-queue io_urings have
-	 * submitted their initial FETCH_REQs (done inside ublk_queue_init →
-	 * ublk_worker startup).
 	 */
 	if (ublk_start_dev(dev) < 0) {
 		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed (ret=%d)",
