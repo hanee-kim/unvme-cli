@@ -31,19 +31,17 @@
  *
  * BUFFER MANAGEMENT
  * -----------------
- * Each slot has two buffers:
- *
- *   ublk_buf  (slot->ublk_buf[tag])
- *     Mmap'd from /dev/ublkc{dev_id}.  The kernel fills this with write data
- *     before delivering a WRITE request, and reads from it after we commit a
- *     READ request.
+ * Each slot has one buffer:
  *
  *   dma_buf  (slot->dma_buf)
  *     Allocated via unvmed_pgmap() — page-aligned, IOMMU-mapped.  This is
- *     what the NVMe device DMA's into/from.
+ *     what the NVMe device DMA's into/from.  It is also passed directly as
+ *     the ublk io_cmd addr, so the kernel copies write data into it (before
+ *     delivering a WRITE request) and copies read data out of it (after we
+ *     commit a READ request).  No intermediate copy is needed.
  *
- *   Write path:  ublk_buf →[memcpy]→ dma_buf →[NVMe DMA]→ disk
- *   Read  path:  disk →[NVMe DMA]→ dma_buf →[memcpy]→ ublk_buf
+ *   Write path:  kernel →[copy_from_user]→ dma_buf →[NVMe DMA]→ disk
+ *   Read  path:  disk →[NVMe DMA]→ dma_buf →[copy_to_user]→ kernel
  */
 
 #define _GNU_SOURCE
@@ -342,16 +340,10 @@ struct ublk_slot {
 
 	/*
 	 * dma_buf: page-aligned, IOMMU-mapped via unvmed_pgmap().
-	 * The NVMe device DMA's directly into/from this buffer.
+	 * The NVMe device DMA's directly into/from this buffer.  Also used as
+	 * the ublk io_cmd addr so the kernel copies IO data directly here.
 	 */
 	void     *dma_buf;
-
-	/*
-	 * ublk_buf: mmap from /dev/ublkc{dev_id}.
-	 * The kernel fills this with write data; we fill it with read data.
-	 * One buffer per tag, mapped at startup.
-	 */
-	void     *ublk_buf;
 };
 
 /* Forward declaration */
@@ -534,8 +526,8 @@ ublk_get_iod(struct unvme_ublk_queue *q, uint16_t tag)
 /*
  * Prepare and enqueue a FETCH_REQ SQE for the given tag.
  *
- * We tell the kernel: "please deliver the next request for this tag into
- * ublk_buf[tag]".  The CQE that comes back indicates a request is ready.
+ * We tell the kernel: "please deliver the next request for this tag using
+ * dma_buf as the IO buffer".  The CQE that comes back indicates a request is ready.
  */
 static void ublk_queue_fetch_req(struct unvme_ublk_queue *q, uint16_t tag)
 {
@@ -557,8 +549,8 @@ static void ublk_queue_fetch_req(struct unvme_ublk_queue *q, uint16_t tag)
 	io_cmd->q_id   = (__u16)q->qid;
 	io_cmd->tag    = tag;
 	io_cmd->result = 0;
-	/* Tell the kernel where to place write data (our ublk buffer) */
-	io_cmd->addr   = (uint64_t)(uintptr_t)slot->ublk_buf;
+	/* dma_buf is used directly: kernel copies write data into it */
+	io_cmd->addr   = (uint64_t)(uintptr_t)slot->dma_buf;
 }
 
 /*
@@ -586,8 +578,8 @@ static void ublk_queue_commit_req(struct unvme_ublk_queue *q,
 	io_cmd->q_id   = (__u16)q->qid;
 	io_cmd->tag    = tag;
 	io_cmd->result = result;
-	/* Also pass the buffer address for the next fetch */
-	io_cmd->addr   = (uint64_t)(uintptr_t)slot->ublk_buf;
+	/* dma_buf doubles as the buffer for the next fetch */
+	io_cmd->addr   = (uint64_t)(uintptr_t)slot->dma_buf;
 }
 
 /* =========================================================================
@@ -726,13 +718,7 @@ static void *ublk_worker(void *arg)
 				is_write = false;
 			} else if (op == UBLK_IO_OP_WRITE) {
 				is_write = true;
-				/*
-				 * For WRITE: the kernel already placed the data
-				 * in slot->ublk_buf.  Copy it into our IOMMU-
-				 * mapped DMA buffer before submitting to NVMe.
-				 */
-				memcpy(slot->dma_buf, slot->ublk_buf,
-				       (size_t)iod->nr_sectors * 512);
+				/* kernel already placed write data into dma_buf */
 			} else {
 				/*
 				 * Unsupported op (FLUSH, DISCARD, …).
@@ -781,7 +767,6 @@ static void *ublk_worker(void *arg)
 			struct ublk_slot *slot = &q->slots[cid];
 			int      status = unvmed_cqe_status(&nvme_cqes[i]);
 			int32_t  result = (status == 0) ? 0 : -EIO;
-			uint8_t  op;
 
 			if (!slot->in_flight) {
 				unvmed_log_err("ublk[%d/%d]: stale CQE cid=%u",
@@ -789,18 +774,7 @@ static void *ublk_worker(void *arg)
 				continue;
 			}
 
-			op = ublksrv_get_op(ublk_get_iod(q, cid));
-			if (op == UBLK_IO_OP_READ && result == 0) {
-				/*
-				 * For READ: copy from the NVMe DMA buffer into
-				 * the ublk buffer so the kernel can return the
-				 * data to the application.
-				 */
-				const struct ublksrv_io_desc *iod =
-					ublk_get_iod(q, cid);
-				memcpy(slot->ublk_buf, slot->dma_buf,
-				       (size_t)iod->nr_sectors * 512);
-			}
+			/* dma_buf holds the read data; kernel copies it out on commit */
 
 			/*
 			 * Release the cmd back to the pool using the pointer
@@ -921,50 +895,14 @@ static int ublk_queue_init(struct unvme_ublk_queue *q,
 	for (int tag = 0; tag < q->nr_slots; tag++) {
 		struct ublk_slot *slot = &q->slots[tag];
 
-		/* --- NVMe DMA buffer --- */
+		/* --- NVMe DMA buffer (also used as ublk IO buffer) --- */
 		ret = (int)unvmed_pgmap(u, &slot->dma_buf,
 					dev->max_io_buf_bytes);
 		if (ret < 0) {
 			unvmed_log_err("ublk[%d/%d]: unvmed_pgmap failed tag=%d",
 				dev->dev_id, qid, tag);
-			/* clean up already-allocated slots */
-			for (int j = 0; j < tag; j++) {
+			for (int j = 0; j < tag; j++)
 				unvmed_unmap_vaddr(u, q->slots[j].dma_buf);
-				munmap(q->slots[j].ublk_buf,
-				       dev->max_io_buf_bytes);
-			}
-			goto err_free_slots;
-		}
-
-		/*
-		 * --- ublk I/O buffer ---
-		 * The kernel places each tag's buffer at a well-known offset in
-		 * the char device mmap space:
-		 *
-		 *   offset = UBLKSRV_IO_BUF_OFFSET
-		 *            | ((uint64_t)qid << UBLK_QID_OFF)
-		 *            | ((uint64_t)tag << UBLK_TAG_OFF)
-		 *
-		 * The individual buf size is max_io_buf_bytes.
-		 */
-		uint64_t ublk_buf_off =
-			UBLKSRV_IO_BUF_OFFSET |
-			((uint64_t)qid << UBLK_QID_OFF) |
-			((uint64_t)tag << UBLK_TAG_OFF);
-
-		slot->ublk_buf = mmap(NULL, dev->max_io_buf_bytes,
-				      PROT_READ | PROT_WRITE,
-				      MAP_SHARED | MAP_POPULATE,
-				      q->cdev_fd, (off_t)ublk_buf_off);
-		if (slot->ublk_buf == MAP_FAILED) {
-			unvmed_log_err("ublk[%d/%d]: mmap ublk_buf tag=%d: %s",
-				dev->dev_id, qid, tag, strerror(errno));
-			unvmed_unmap_vaddr(u, slot->dma_buf);
-			for (int j = 0; j < tag; j++) {
-				unvmed_unmap_vaddr(u, q->slots[j].dma_buf);
-				munmap(q->slots[j].ublk_buf,
-				       dev->max_io_buf_bytes);
-			}
 			goto err_free_slots;
 		}
 
@@ -986,10 +924,8 @@ static int ublk_queue_init(struct unvme_ublk_queue *q,
 	return 0;
 
 err_cleanup_slots:
-	for (int j = 0; j < q->nr_slots; j++) {
+	for (int j = 0; j < q->nr_slots; j++)
 		unvmed_unmap_vaddr(u, q->slots[j].dma_buf);
-		munmap(q->slots[j].ublk_buf, dev->max_io_buf_bytes);
-	}
 err_free_slots:
 	free(q->slots);
 	q->slots = NULL;
@@ -1016,10 +952,8 @@ static void ublk_queue_teardown(struct unvme_ublk_queue *q)
 
 	ublk_ring_exit(&q->ring);
 
-	for (int tag = 0; tag < q->nr_slots; tag++) {
-		munmap(q->slots[tag].ublk_buf, dev->max_io_buf_bytes);
+	for (int tag = 0; tag < q->nr_slots; tag++)
 		unvmed_unmap_vaddr(u, q->slots[tag].dma_buf);
-	}
 	free(q->slots);
 
 	munmap(q->cmd_buf, cmd_buf_sz);
