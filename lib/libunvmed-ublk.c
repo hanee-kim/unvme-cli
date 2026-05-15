@@ -460,12 +460,18 @@ static int ublk_add_dev(struct unvme_ublk_dev *dev)
 	ret = ublk_ctrl_uring_cmd(&dev->ctrl_ring, dev->ctrl_fd,
 				   UBLK_U_CMD_ADD_DEV, &cmd);
 	/*
-	 * Kernel writes back the full dev_info (including the actual assigned
-	 * dev_id) via copy_to_user after success.  Read it back so that
-	 * dev->dev_id is authoritative for all subsequent commands.
+	 * Kernel writes back the full dev_info via copy_to_user after success.
+	 * Read back all fields that the kernel may have modified:
+	 *   - dev_id: actual assigned ID (may differ if -1 was requested)
+	 *   - nr_hw_queues: capped to nr_cpu_ids
+	 *   - max_io_buf_bytes: rounded down to PAGE_SIZE
+	 * We need the authoritative values for subsequent commands.
 	 */
-	if (ret == 0)
-		dev->dev_id = (int)info.dev_id;
+	if (ret == 0) {
+		dev->dev_id          = (int)info.dev_id;
+		dev->nr_queues       = (int)info.nr_hw_queues;
+		dev->max_io_buf_bytes = info.max_io_buf_bytes;
+	}
 	return ret;
 }
 
@@ -480,6 +486,12 @@ static int ublk_set_params(struct unvme_ublk_dev *dev,
 			.physical_bs_shift = lba_shift,
 			.io_opt_shift      = lba_shift,
 			.io_min_shift      = lba_shift,
+			/*
+			 * max_sectors is the per-I/O size limit in 512-byte
+			 * units.  The kernel requires a non-zero value; use
+			 * the maximum buffer size we can handle.
+			 */
+			.max_sectors       = dev->max_io_buf_bytes >> 9,
 			.dev_sectors       = nr_sectors,
 		},
 	};
