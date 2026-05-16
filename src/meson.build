@@ -6,6 +6,7 @@ unvme_sources = [
 ]
 
 fio_lib = []
+ublk_dep = []
 subdir('app')
 
 configure_file(
@@ -16,7 +17,7 @@ configure_file(
 executable(
   'unvme',
   unvme_sources,
-  dependencies: [vfn_lib, nvme_lib, jsonc_lib, unvmed_dep],
+  dependencies: [vfn_lib, nvme_lib, jsonc_lib, unvmed_dep, ublk_dep],
   link_with: [ccan_lib, argtable3_lib],
   link_whole: [fio_lib],
   include_directories: [inc, ccan_inc, argtable3_inc, libunvmed_inc],

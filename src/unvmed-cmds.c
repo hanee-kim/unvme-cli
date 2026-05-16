@@ -4152,6 +4152,113 @@ int unvme_fio(int argc, char *argv[], struct unvme_msg *msg)
 }
 #endif
 
+#ifdef UNVME_UBLK
+#include "unvme-ublk.h"
+
+static const char *desc_ublk_start =
+	"Start a ublk server that exposes a namespace as a kernel block device\n"
+	"(/dev/ublkb<dev-id>).  The server runs as background threads in the\n"
+	"daemon.  Multiple applications can then access /dev/ublkb<dev-id> as\n"
+	"an ordinary block device without needing libunvmed access.\n\n"
+	"Each ublk queue maps 1:1 to an existing NVMe I/O queue pair (SQ/CQ).\n"
+	"The NVMe queues must already be created with 'unvme create-iocq' and\n"
+	"'unvme create-iosq' before running this command.\n\n"
+	"Example:\n"
+	"  unvme create-iocq 0000:01:00.0 --cqid 1 --qsize 128\n"
+	"  unvme create-iosq 0000:01:00.0 --sqid 1 --cqid 1 --qsize 128\n"
+	"  unvme ublk-start  0000:01:00.0 --nsid 1 --nr-queues 1\n"
+	"  # /dev/ublkb0 is now accessible by any process";
+
+int unvme_ublk_start(int argc, char *argv[], struct unvme_msg *msg)
+{
+	struct arg_int *nsid	  = arg_int0(NULL, "nsid",      "<n>", "Namespace ID (default: 1)");
+	struct arg_int *dev_id	  = arg_int0(NULL, "dev-id",    "<n>", "ublk device ID, creates /dev/ublkb<n> (default: 0)");
+	struct arg_int *nr_queues = arg_int0(NULL, "nr-queues", "<n>", "Number of queues (default: 1)");
+	struct arg_int *qd	  = arg_int0(NULL, "queue-depth","<n>", "Queue depth per queue (default: 64)");
+	struct arg_int *start_sqid= arg_int0(NULL, "start-sqid","<n>", "First NVMe SQ ID to use (default: 1)");
+	struct arg_int *max_io	  = arg_int0(NULL, "max-io-kb", "<n>", "Maximum I/O size in KiB (default: 64)");
+	struct arg_lit *help	  = arg_lit0("h", "help",               "Show help");
+	struct arg_end *end	  = arg_end(UNVME_ARG_MAX_ERROR);
+
+	void *argtable[] = { nsid, dev_id, nr_queues, qd, start_sqid, max_io,
+			     help, end };
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end,
+				desc_ublk_start);
+
+	uint32_t _nsid       = nsid->count       ? arg_intv(nsid)       : 1;
+	int      _dev_id     = dev_id->count     ? arg_intv(dev_id)     : 0;
+	int      _nr_queues  = nr_queues->count  ? arg_intv(nr_queues)  : 1;
+	uint32_t _qd         = qd->count         ? arg_intv(qd)         : 64;
+	int      _start_sqid = start_sqid->count ? arg_intv(start_sqid) : 1;
+	uint32_t _max_io_kb  = max_io->count     ? arg_intv(max_io)     : 64;
+
+	const char *bdf = argv[2];
+	struct unvme *u = unvmed_get(bdf);
+	if (!u) {
+		unvme_pr_err("failed to find device '%s'\n", bdf);
+		unvme_free_args(argtable);
+		return ENODEV;
+	}
+
+	/* get namespace info: nr_sectors and lba_shift */
+	struct unvme_ns *ns = unvmed_ns_get(u, _nsid);
+	if (!ns) {
+		unvme_pr_err("failed to find nsid %u\n", _nsid);
+		unvme_free_args(argtable);
+		return ENOENT;
+	}
+	uint64_t nr_sectors = ns->nr_lbas;
+	uint8_t  lba_shift  = 0;
+	uint32_t lba_size   = ns->lba_size;
+
+	/* compute lba_shift = log2(lba_size) */
+	while (lba_size > 1) {
+		lba_size >>= 1;
+		lba_shift++;
+	}
+
+	/* convert from LBAs to 512-byte sectors for the block device */
+	nr_sectors <<= (lba_shift > 9 ? lba_shift - 9 : 0);
+
+	unvmed_ns_put(u, ns);
+	unvme_free_args(argtable);
+
+	int ret = unvme_ublk_server_start(u, _nsid, nr_sectors, lba_shift,
+					  _dev_id, _nr_queues, _qd,
+					  _start_sqid, _max_io_kb);
+	if (ret)
+		unvme_pr_err("ublk-start failed: %s\n", strerror(-ret));
+	return ret ? -ret : 0;
+}
+
+static const char *desc_ublk_stop =
+	"Stop the ublk server for /dev/ublkb<dev-id> and remove the block\n"
+	"device.  All in-flight I/O will be aborted before teardown.";
+
+int unvme_ublk_stop(int argc, char *argv[], struct unvme_msg *msg)
+{
+	struct arg_int *dev_id = arg_int0(NULL, "dev-id", "<n>",
+					  "ublk device ID to stop (default: 0)");
+	struct arg_lit *help   = arg_lit0("h", "help", "Show help");
+	struct arg_end *end    = arg_end(UNVME_ARG_MAX_ERROR);
+
+	void *argtable[] = { dev_id, help, end };
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end,
+				desc_ublk_stop);
+
+	int _dev_id = dev_id->count ? arg_intv(dev_id) : 0;
+
+	unvme_free_args(argtable);
+
+	int ret = unvme_ublk_server_stop(_dev_id);
+	if (ret)
+		unvme_pr_err("ublk-stop failed: %s\n", strerror(-ret));
+	return ret ? -ret : 0;
+}
+#endif
+
 int unvme_malloc(int argc, char *argv[], struct unvme_msg *msg)
 {
 	const char *desc = "Allocate a I/O buffer for the given size";
