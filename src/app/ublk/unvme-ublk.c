@@ -901,13 +901,22 @@ int unvme_ublk_server_start(struct unvme *u, uint32_t nsid,
 		srv->running = false;
 		for (i = 0; i < nr_queues; i++)
 			srv->queues[i].running = false;
+		/*
+		 * Inject UBLK_IO_RES_ABORT into all pending FETCH_REQ
+		 * io_uring_cmds so queue_threads unblock from io_uring_wait_cqe.
+		 * STOP_DEV may fail if device is still in DEAD state; DEL_DEV
+		 * calls ublk_mark_io_dead() unconditionally, which posts the
+		 * ABORT completion to every pending FETCH before returning.
+		 */
+		ublk_stop_dev(srv->ctrl_fd, dev_id);
+		ublk_del_dev(srv->ctrl_fd, dev_id);
 		for (i = 0; i < nr_queues; i++) {
 			pthread_join(srv->queue_threads[i],  NULL);
 			pthread_join(srv->poller_threads[i], NULL);
 		}
 		for (i = 0; i < nr_queues; i++)
 			queue_teardown(&srv->queues[i], srv, i);
-		goto err_del;
+		goto err_ctrl;	/* device already deleted above */
 	}
 
 	g_servers[dev_id] = srv;
