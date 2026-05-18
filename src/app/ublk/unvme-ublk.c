@@ -167,6 +167,14 @@ struct unvme_ublk_server {
 
 	volatile bool	 running;
 
+	/*
+	 * Counts queue threads that have submitted their initial FETCH_REQs.
+	 * The main thread spins on this before calling START_DEV, because the
+	 * kernel blocks START_DEV until every queue has at least one pending
+	 * FETCH_REQ in its io_uring.
+	 */
+	atomic_int	 queues_ready;
+
 	struct unvme	*u;
 	uint32_t	 nsid;
 	int		 start_sqid;
@@ -540,6 +548,15 @@ static void *queue_thread_fn(void *arg)
 	}
 	io_uring_submit(ring);
 
+	/*
+	 * Signal the main thread that this queue's FETCH_REQs are in flight.
+	 * START_DEV blocks in the kernel until every queue has at least one
+	 * pending FETCH_REQ, so the main thread must not call START_DEV before
+	 * all queue threads reach this point.
+	 */
+	atomic_fetch_add_explicit(&q->server->queues_ready, 1,
+				  memory_order_release);
+
 	while (q->running) {
 		ret = io_uring_wait_cqe(ring, &cqe);
 		if (ret < 0) {
@@ -854,21 +871,39 @@ int unvme_ublk_server_start(struct unvme *u, uint32_t nsid,
 		}
 	}
 
-	/* After all queue threads are ready, make /dev/ublkb<N> visible */
-	ret = ublk_start_dev(srv->ctrl_fd, dev_id);
-	if (ret) {
-		fprintf(stderr, "ublk: START_DEV (dev=%d): %s\n",
-			dev_id, strerror(-ret));
-		for (i = 0; i < nr_queues; i++)
-			queue_teardown(&srv->queues[i], srv, i);
-		goto err_del;
-	}
+	/*
+	 * Queue threads must submit their FETCH_REQs before we call START_DEV.
+	 * The kernel blocks START_DEV until every queue has a pending FETCH_REQ
+	 * in its io_uring ring.  Start threads first, then wait for all of them
+	 * to increment queues_ready, then call START_DEV.
+	 */
+	atomic_init(&srv->queues_ready, 0);
 
 	for (i = 0; i < nr_queues; i++) {
 		pthread_create(&srv->queue_threads[i],  NULL,
 			       queue_thread_fn,  &srv->queues[i]);
 		pthread_create(&srv->poller_threads[i], NULL,
 			       poller_thread_fn, &srv->queues[i]);
+	}
+
+	while (atomic_load_explicit(&srv->queues_ready, memory_order_acquire)
+	       < nr_queues)
+		sched_yield();
+
+	ret = ublk_start_dev(srv->ctrl_fd, dev_id);
+	if (ret) {
+		fprintf(stderr, "ublk: START_DEV (dev=%d): %s\n",
+			dev_id, strerror(-ret));
+		srv->running = false;
+		for (i = 0; i < nr_queues; i++)
+			srv->queues[i].running = false;
+		for (i = 0; i < nr_queues; i++) {
+			pthread_join(srv->queue_threads[i],  NULL);
+			pthread_join(srv->poller_threads[i], NULL);
+		}
+		for (i = 0; i < nr_queues; i++)
+			queue_teardown(&srv->queues[i], srv, i);
+		goto err_del;
 	}
 
 	g_servers[dev_id] = srv;
