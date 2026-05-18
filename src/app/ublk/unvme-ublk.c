@@ -843,6 +843,10 @@ int unvme_ublk_server_start(struct unvme *u, uint32_t nsid,
 		goto err_alloc;
 	}
 
+	/* Clean up any leftover device from a previous failed attempt. */
+	ublk_stop_dev(srv->ctrl_fd, dev_id);
+	ublk_del_dev(srv->ctrl_fd, dev_id);
+
 	ret = ublk_add_dev(srv->ctrl_fd, dev_id, nr_queues,
 			   queue_depth, max_io_buf_bytes);
 	if (ret) {
