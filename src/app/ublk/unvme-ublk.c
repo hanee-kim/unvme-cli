@@ -52,7 +52,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -182,18 +181,47 @@ static struct unvme_ublk_server *g_servers[MAX_UBLK_SERVERS];
 static pthread_mutex_t g_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* -------------------------------------------------------------------------
- * ublk control helpers  (ioctl on /dev/ublk-control)
+ * ublk control helpers  (io_uring URING_CMD on /dev/ublk-control)
  *
- * UBLK_U_CMD_* macros carry the _IOWR-encoded command number accepted by
- * both the ioctl and io_uring URING_CMD interfaces.  Using ioctl() here
- * is valid and simpler for one-shot setup/teardown.
+ * Kernel 6.2+ removed the ioctl() handler from /dev/ublk-control; all
+ * control commands (ADD_DEV, SET_PARAMS, START_DEV, …) must be issued via
+ * io_uring IORING_OP_URING_CMD.  struct ublksrv_ctrl_cmd (32 bytes) is
+ * passed as the SQE inline command, which requires IORING_SETUP_SQE128
+ * (128-byte SQEs, giving 64 bytes for sqe->cmd[]).
  * ---------------------------------------------------------------------- */
 
-static int ctrl_ioctl(int ctrl_fd, unsigned int cmd,
-		      struct ublksrv_ctrl_cmd *param)
+static int ctrl_uring_cmd(int ctrl_fd, unsigned int cmd_op,
+			   const struct ublksrv_ctrl_cmd *param)
 {
-	int ret = ioctl(ctrl_fd, cmd, param);
-	return (ret < 0) ? -errno : ret;
+	struct io_uring_params p = { .flags = IORING_SETUP_SQE128 };
+	struct io_uring ring;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
+	int ret;
+
+	ret = io_uring_queue_init_params(2, &ring, &p);
+	if (ret)
+		return ret;
+
+	sqe = io_uring_get_sqe(&ring);
+	io_uring_prep_rw(IORING_OP_URING_CMD, sqe, ctrl_fd, NULL, 0, 0);
+	sqe->cmd_op = cmd_op;
+	memcpy((void *)sqe->cmd, param, sizeof(*param));
+	sqe->user_data = 1;
+
+	ret = io_uring_submit(&ring);
+	if (ret > 0) {
+		ret = io_uring_wait_cqe(&ring, &cqe);
+		if (ret == 0) {
+			ret = cqe->res;
+			io_uring_cqe_seen(&ring, cqe);
+		}
+	} else {
+		ret = ret < 0 ? ret : -EIO;
+	}
+
+	io_uring_queue_exit(&ring);
+	return ret;
 }
 
 static int ublk_add_dev(int ctrl_fd, int dev_id, int nr_queues,
@@ -219,7 +247,7 @@ static int ublk_add_dev(int ctrl_fd, int dev_id, int nr_queues,
 		.len	  = sizeof(info),
 		.addr	  = (__u64)(uintptr_t)&info,
 	};
-	return ctrl_ioctl(ctrl_fd, UBLK_U_CMD_ADD_DEV, &param);
+	return ctrl_uring_cmd(ctrl_fd, UBLK_U_CMD_ADD_DEV, &param);
 }
 
 static int ublk_set_params(int ctrl_fd, int dev_id,
@@ -245,7 +273,7 @@ static int ublk_set_params(int ctrl_fd, int dev_id,
 		.len	  = sizeof(params),
 		.addr	  = (__u64)(uintptr_t)&params,
 	};
-	return ctrl_ioctl(ctrl_fd, UBLK_U_CMD_SET_PARAMS, &param);
+	return ctrl_uring_cmd(ctrl_fd, UBLK_U_CMD_SET_PARAMS, &param);
 }
 
 static int ublk_start_dev(int ctrl_fd, int dev_id)
@@ -255,7 +283,7 @@ static int ublk_start_dev(int ctrl_fd, int dev_id)
 		.queue_id = (uint16_t)-1,
 		.data[0]  = getpid(),	/* daemon PID required by kernel */
 	};
-	return ctrl_ioctl(ctrl_fd, UBLK_U_CMD_START_DEV, &param);
+	return ctrl_uring_cmd(ctrl_fd, UBLK_U_CMD_START_DEV, &param);
 }
 
 static int ublk_stop_dev(int ctrl_fd, int dev_id)
@@ -264,7 +292,7 @@ static int ublk_stop_dev(int ctrl_fd, int dev_id)
 		.dev_id	  = dev_id,
 		.queue_id = (uint16_t)-1,
 	};
-	return ctrl_ioctl(ctrl_fd, UBLK_U_CMD_STOP_DEV, &param);
+	return ctrl_uring_cmd(ctrl_fd, UBLK_U_CMD_STOP_DEV, &param);
 }
 
 static int ublk_del_dev(int ctrl_fd, int dev_id)
@@ -273,7 +301,7 @@ static int ublk_del_dev(int ctrl_fd, int dev_id)
 		.dev_id	  = dev_id,
 		.queue_id = (uint16_t)-1,
 	};
-	return ctrl_ioctl(ctrl_fd, UBLK_U_CMD_DEL_DEV, &param);
+	return ctrl_uring_cmd(ctrl_fd, UBLK_U_CMD_DEL_DEV, &param);
 }
 
 /* -------------------------------------------------------------------------
