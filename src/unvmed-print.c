@@ -81,7 +81,7 @@ void unvme_pr_cqe(struct nvme_cqe *cqe)
 
 	json_object_object_add(root, "cqe", cqe_obj);
 	unvme_pr_err("%s\n", json_object_to_json_string_ext(root, JSON_C_TO_STRING_SPACED));
-	
+
 	json_object_put(root);
 }
 
@@ -291,7 +291,6 @@ void unvme_pr_id_ctrl(const char *format, void *vaddr)
 		unvme_pr("%10s:\tlo: %#lx, hi: %#lx\n", "megcap",
 				le64_to_cpu(*(leint64_t *)&id_ctrl->megcap[0]),
 				le64_to_cpu(*(leint64_t *)&id_ctrl->megcap[8]));
-		unvme_pr("%10s: \t%#x\n", "tmpthha", id_ctrl->tmpthha);
 		unvme_pr("%10s: \t%#x\n", "sqes", id_ctrl->sqes);
 		unvme_pr("%10s: \t%#x\n", "cqes", id_ctrl->cqes);
 		unvme_pr("%10s: \t%#x\n", "maxcmd", le16_to_cpu(id_ctrl->maxcmd));
@@ -345,7 +344,7 @@ void unvme_pr_id_ctrl(const char *format, void *vaddr)
 			if (i == 3)
 				strcat(fguid + 8, "-");
 			else if (i == 5)
-				strcat(fguid + 13, "-"); 
+				strcat(fguid + 13, "-");
 			else if (i == 7)
 				strcat(fguid + 18, "-");
 			else if (i == 9)
@@ -409,7 +408,6 @@ void unvme_pr_id_ctrl(const char *format, void *vaddr)
 		json_object_object_add(megcap, "hi", json_object_new_int64(le64_to_cpu(*(leint64_t *)&id_ctrl->megcap[8])));
 		json_object_object_add(root, "megcap", megcap);
 
-		json_object_object_add(root, "tmpthha", json_object_new_int(id_ctrl->tmpthha));
 		json_object_object_add(root, "sqes", json_object_new_int(id_ctrl->sqes));
 		json_object_object_add(root, "cqes", json_object_new_int(id_ctrl->cqes));
 		json_object_object_add(root, "maxcmd", json_object_new_int(le16_to_cpu(id_ctrl->maxcmd)));

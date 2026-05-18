@@ -80,7 +80,7 @@ fi
 (
 set -x
 unvme start
-unvme add $bdf --nr-ioqs=$nr_ioqs
+unvme add $bdf --nr-ioqs=512
 
 unvme create-adminq $bdf --sqsize=$qsize --cqsize=$qsize $adminq_opts
 unvme enable $bdf
