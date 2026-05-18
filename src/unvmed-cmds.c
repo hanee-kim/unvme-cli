@@ -4171,6 +4171,7 @@ static const char *desc_ublk_start =
 
 int unvme_ublk_start(int argc, char *argv[], struct unvme_msg *msg)
 {
+	struct arg_rex *dev	  = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN, "<device>", 0, "[M] Device bdf");
 	struct arg_int *nsid	  = arg_int0(NULL, "nsid",      "<n>", "Namespace ID (default: 1)");
 	struct arg_int *dev_id	  = arg_int0(NULL, "dev-id",    "<n>", "ublk device ID, creates /dev/ublkb<n> (default: 0)");
 	struct arg_int *nr_queues = arg_int0(NULL, "nr-queues", "<n>", "Number of queues (default: 1)");
@@ -4180,7 +4181,7 @@ int unvme_ublk_start(int argc, char *argv[], struct unvme_msg *msg)
 	struct arg_lit *help	  = arg_lit0("h", "help",               "Show help");
 	struct arg_end *end	  = arg_end(UNVME_ARG_MAX_ERROR);
 
-	void *argtable[] = { nsid, dev_id, nr_queues, qd, start_sqid, max_io,
+	void *argtable[] = { dev, nsid, dev_id, nr_queues, qd, start_sqid, max_io,
 			     help, end };
 
 	unvme_parse_args_locked(argc, argv, argtable, help, end,
@@ -4193,10 +4194,9 @@ int unvme_ublk_start(int argc, char *argv[], struct unvme_msg *msg)
 	int      _start_sqid = start_sqid->count ? arg_intv(start_sqid) : 1;
 	uint32_t _max_io_kb  = max_io->count     ? arg_intv(max_io)     : 64;
 
-	const char *bdf = argv[2];
-	struct unvme *u = unvmed_get(bdf);
+	struct unvme *u = unvmed_get(arg_strv(dev));
 	if (!u) {
-		unvme_pr_err("failed to find device '%s'\n", bdf);
+		unvme_pr_err("failed to find device '%s'\n", arg_strv(dev));
 		unvme_free_args(argtable);
 		return ENODEV;
 	}
