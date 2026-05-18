@@ -307,9 +307,10 @@ static int ublk_del_dev(int ctrl_fd, int dev_id)
 /* -------------------------------------------------------------------------
  * io_uring SQE helpers for ublk I/O commands on /dev/ublkc<N>
  *
- * ublksrv_io_cmd (16 bytes) fits in the standard 64-byte SQE's inline
- * cmd[] field (bytes 48..63).  sqe->cmd_op (at the union with sqe->off)
- * carries the ioctl-encoded UBLK_U_IO_* command number.
+ * ublksrv_io_cmd (16 bytes) is placed in sqe->cmd[] which starts at
+ * byte 64 of the SQE layout.  This requires IORING_SETUP_SQE128 (128-byte
+ * SQEs); without it, sqe->cmd has zero space and writing there corrupts
+ * the adjacent SQE slot.  sqe->cmd_op carries UBLK_U_IO_*.
  * ---------------------------------------------------------------------- */
 
 static void prep_fetch_req(struct io_uring_sqe *sqe,
@@ -634,7 +635,12 @@ static struct ublksrv_io_desc *map_io_descs(int cdev_fd, int qid,
 	off_t  off    = UBLKSRV_CMD_BUF_OFFSET + (off_t)qid * stride;
 	size_t sz     = (size_t)depth * sizeof(struct ublksrv_io_desc);
 
-	void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+	/*
+	 * The io_desc area is written by the kernel; userspace only reads it.
+	 * Requesting PROT_WRITE causes the kernel's ublk_ch_mmap handler to
+	 * return -EPERM (it checks VM_WRITE and rejects it).
+	 */
+	void *p = mmap(NULL, sz, PROT_READ,
 		       MAP_SHARED | MAP_POPULATE, cdev_fd, off);
 	return (p == MAP_FAILED) ? NULL : (struct ublksrv_io_desc *)p;
 }
@@ -681,8 +687,16 @@ static int queue_init(struct ublk_queue *q, struct unvme_ublk_server *srv,
 		goto err_efd;
 	}
 
-	/* ring size: depth FETCH_REQs + depth COMMITs + eventfd POLL + spare */
-	ret = io_uring_queue_init(q->depth * 2 + 4, &q->ring, 0);
+	/*
+	 * IORING_SETUP_SQE128: ublk I/O commands (FETCH_REQ, COMMIT_AND_FETCH)
+	 * embed struct ublksrv_io_cmd (16 bytes) in sqe->cmd[], which lives at
+	 * offset 64 of the SQE.  Without 128-byte SQEs there is no space there,
+	 * and writing to sqe->cmd corrupts the adjacent SQE slot.
+	 */
+	{
+		struct io_uring_params p = { .flags = IORING_SETUP_SQE128 };
+		ret = io_uring_queue_init_params(q->depth * 2 + 4, &q->ring, &p);
+	}
 	if (ret) {
 		ret = -ret;
 		goto err_cdev;
