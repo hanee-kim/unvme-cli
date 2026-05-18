@@ -358,9 +358,8 @@ static int submit_nvme_io(struct ublk_queue *q, uint16_t tag)
 			return -EBUSY;
 
 		union nvme_cmd sqe = {};
-		sqe.common.opcode = nvme_cmd_flush;
-		sqe.common.nsid	  = cpu_to_le32(q->nsid);
-		sqe.common.cid	  = cmd->cid;
+		sqe.opcode = nvme_cmd_flush;
+		sqe.nsid   = cpu_to_le32(q->nsid);
 
 		if (unvmed_cmd_prep(cmd, &sqe, NULL, 0) < 0) {
 			unvmed_cmd_put(cmd);
@@ -469,7 +468,7 @@ static void *poller_thread_fn(void *arg)
 					      memory_order_release);
 
 			/* wake queue_thread */
-			write(q->efd, &one, sizeof(one));
+			(void)write(q->efd, &one, sizeof(one));
 
 			unvmed_cmd_put(cmd);
 		}
@@ -528,7 +527,7 @@ static void *queue_thread_fn(void *arg)
 			 * waiting in the SPSC ring.
 			 */
 			uint64_t val;
-			read(q->efd, &val, sizeof(val));	/* clear */
+			(void)read(q->efd, &val, sizeof(val));	/* clear */
 
 			uint32_t head = atomic_load_explicit(
 				&q->comp_head, memory_order_relaxed);
