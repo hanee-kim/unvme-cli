@@ -54,6 +54,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <linux/ublk_cmd.h>
 #include <liburing.h>
@@ -468,7 +469,8 @@ static void *poller_thread_fn(void *arg)
 					      memory_order_release);
 
 			/* wake queue_thread */
-			(void)write(q->efd, &one, sizeof(one));
+			ssize_t __w = write(q->efd, &one, sizeof(one));
+			(void)__w;
 
 			unvmed_cmd_put(cmd);
 		}
@@ -527,7 +529,8 @@ static void *queue_thread_fn(void *arg)
 			 * waiting in the SPSC ring.
 			 */
 			uint64_t val;
-			(void)read(q->efd, &val, sizeof(val));	/* clear */
+			ssize_t __r = read(q->efd, &val, sizeof(val));
+			(void)__r;
 
 			uint32_t head = atomic_load_explicit(
 				&q->comp_head, memory_order_relaxed);
