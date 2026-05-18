@@ -88,6 +88,20 @@
  */
 #define UD_EFD_COOKIE		0x10000ULL
 
+/*
+ * pread/pwrite offset encoding for UBLK_F_USER_COPY (from linux/ublk_cmd.h):
+ *   bits 63-41: q_id   (UBLK_QID_OFF  = UBLK_TAG_OFF + UBLK_TAG_BITS = 41)
+ *   bits 40-25: tag    (UBLK_TAG_OFF  = UBLK_IO_BUF_BITS = 25)
+ *   bits 24-0:  byte offset within the I/O buffer
+ * The kernel validates all three fields; using tag * buffer_size as the
+ * offset is wrong — it decodes to (q_id=0, tag=0, off=tag*size) which is
+ * out of range for tag ≥ 1 and triggers -EINVAL.
+ */
+static inline loff_t ublk_io_pos(unsigned int q_id, unsigned int tag)
+{
+	return ((loff_t)q_id << UBLK_QID_OFF) | ((loff_t)tag << UBLK_TAG_OFF);
+}
+
 /* SPSC ring: must be a power of two and ≥ UBLK_MAX_QUEUE_DEPTH (4096) */
 #define COMP_RING_SIZE		4096u
 #define COMP_RING_MASK		(COMP_RING_SIZE - 1u)
@@ -405,8 +419,7 @@ static int submit_nvme_io(struct ublk_queue *q, uint16_t tag)
 		}
 	} else if (op == UBLK_IO_OP_WRITE) {
 		/* fetch write data from kernel before NVMe submit */
-		if (pread(q->cdev_fd, buf, len,
-			  (off_t)tag * q->max_io_buf_bytes) < 0)
+		if (pread(q->cdev_fd, buf, len, ublk_io_pos(q->qid, tag)) < 0)
 			return -errno;
 
 		cmd = unvmed_alloc_cmd(q->u, q->usq, NULL, buf, len);
@@ -493,7 +506,7 @@ static void *poller_thread_fn(void *arg)
 					    (size_t)tag * q->max_io_buf_bytes;
 
 				if (pwrite(q->cdev_fd, buf, len,
-					   (off_t)tag * q->max_io_buf_bytes) < 0)
+					   ublk_io_pos(q->qid, tag)) < 0)
 					res = -errno;
 			}
 
