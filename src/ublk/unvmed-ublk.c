@@ -30,35 +30,16 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Return this process's PID as seen from the initial (host) PID namespace.
- *
- * Inside a container, getpid() returns the container-local PID, but the
- * kernel's ublk driver stores/compares task_pid_nr(current) which is the
- * PID in the initial namespace.  /proc/self/status NSpid lists PIDs from
- * outermost to innermost namespace; the first value is what the kernel sees.
- *
- * On a non-containerised host, NSpid has only one entry, so getpid() is
- * returned unchanged.
+ * The kernel's ublk_ctrl_start_dev (and ADD_DEV storage) identifies the
+ * caller via task_pid_vnr(current), which is the TID of the calling thread,
+ * not the TGID.  getpid() returns the TGID (same for every thread in the
+ * process), which mismatches when the ublk server is started from any thread
+ * other than the main thread.  gettid() returns the actual TID the kernel
+ * uses, so ADD_DEV and START_DEV agree with the kernel's view.
  */
-static pid_t get_host_pid(void)
+static inline pid_t calling_tid(void)
 {
-	FILE *f;
-	char line[256];
-	pid_t pid = 0;
-
-	f = fopen("/proc/self/status", "r");
-	if (!f)
-		return getpid();
-
-	while (fgets(line, sizeof(line), f)) {
-		if (strncmp(line, "NSpid:", 6) == 0) {
-			sscanf(line + 6, "%d", &pid);
-			break;
-		}
-	}
-
-	fclose(f);
-	return pid > 0 ? pid : getpid();
+	return gettid();
 }
 
 /*
@@ -376,13 +357,13 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 			size_t max_io_size,
 			struct ublksrv_ctrl_dev_info *info_out)
 {
-	pid_t pid = get_host_pid();
+	pid_t tid = calling_tid();
 	struct ublksrv_ctrl_dev_info dev_info = {
 		.nr_hw_queues     = (uint16_t)nr_queues,
 		.queue_depth      = (uint16_t)queue_depth,
 		.max_io_buf_bytes = (uint32_t)max_io_size,
 		.dev_id           = (uint32_t)-1,  /* let kernel assign */
-		.ublksrv_pid      = pid,
+		.ublksrv_pid      = tid,
 		.flags            = UBLK_F_CMD_IOCTL_ENCODE,
 	};
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
@@ -393,8 +374,8 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 	};
 	int ret;
 
-	unvmed_log_info("ublk: ADD_DEV pid=%d (getpid=%d, host_pid=%d)",
-			pid, getpid(), pid);
+	unvmed_log_info("ublk: ADD_DEV tgid=%d tid=%d (using tid for ublksrv_pid)",
+			getpid(), tid);
 
 	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
 	if (ret < 0)
@@ -435,16 +416,16 @@ static int ublk_set_params(struct io_uring *ring, int ctrl_fd, int dev_id,
 
 static int ublk_start_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
-	pid_t pid = get_host_pid();
+	pid_t tid = calling_tid();
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
-		.data[0]  = (uint64_t)pid,
+		.data[0]  = (uint64_t)tid,
 	};
 	int ret;
 
-	unvmed_log_info("ublk: START_DEV pid=%d (getpid=%d, host_pid=%d)",
-			pid, getpid(), pid);
+	unvmed_log_info("ublk: START_DEV tgid=%d tid=%d (using tid for data[0])",
+			getpid(), tid);
 
 	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
 
