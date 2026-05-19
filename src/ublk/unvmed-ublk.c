@@ -29,12 +29,41 @@
 /* Helpers                                                              */
 /* ------------------------------------------------------------------ */
 
-static int ublk_ctrl_cmd(int ctrl_fd, unsigned long cmd,
-			  struct ublksrv_ctrl_cmd *buf)
+/*
+ * Send a control command to /dev/ublk-control via io_uring.
+ *
+ * UBLK_U_CMD_* are cmd_op values for IORING_OP_URING_CMD, not ioctl
+ * numbers.  struct ublksrv_ctrl_cmd (32 bytes) is embedded in sqe->cmd[]
+ * which requires SQE128 (standard SQE only has 16 bytes of cmd[] space).
+ * Any data exchange (e.g. dev_info written back by ADD_DEV) happens via
+ * ctrl_cmd->addr pointing to a userspace buffer.
+ */
+static int ublk_ctrl_cmd(struct io_uring *ring, int ctrl_fd,
+			  unsigned int cmd_op,
+			  struct ublksrv_ctrl_cmd *ctrl_cmd)
 {
-	int ret = ioctl(ctrl_fd, cmd, buf);
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
+	int ret;
+
+	sqe = io_uring_get_sqe(ring);
+	if (!sqe)
+		return -ENOMEM;
+
+	io_uring_prep_rw(IORING_OP_URING_CMD, sqe, ctrl_fd, NULL, 0, 0);
+	sqe->cmd_op = cmd_op;
+	memcpy((void *)sqe->cmd, ctrl_cmd, sizeof(*ctrl_cmd));
+
+	ret = io_uring_submit(ring);
 	if (ret < 0)
-		return -errno;
+		return ret;
+
+	ret = io_uring_wait_cqe(ring, &cqe);
+	if (ret < 0)
+		return ret;
+
+	ret = cqe->res;
+	io_uring_cqe_seen(ring, cqe);
 	return ret;
 }
 
@@ -310,17 +339,18 @@ static void unvmed_ublk_queue_free(struct unvmed_ublk_queue *q)
 /* ublk device control (ioctl on /dev/ublk-control)                   */
 /* ------------------------------------------------------------------ */
 
-static int ublk_add_dev(int ctrl_fd, uint32_t nr_queues, uint32_t queue_depth,
+static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
+			uint32_t nr_queues, uint32_t queue_depth,
 			size_t max_io_size,
 			struct ublksrv_ctrl_dev_info *info_out)
 {
 	struct ublksrv_ctrl_dev_info dev_info = {
-		.nr_hw_queues   = (uint16_t)nr_queues,
-		.queue_depth    = (uint16_t)queue_depth,
+		.nr_hw_queues     = (uint16_t)nr_queues,
+		.queue_depth      = (uint16_t)queue_depth,
 		.max_io_buf_bytes = (uint32_t)max_io_size,
-		.dev_id         = (uint32_t)-1,  /* let kernel assign */
-		.ublksrv_pid    = getpid(),
-		.flags          = UBLK_F_CMD_IOCTL_ENCODE,
+		.dev_id           = (uint32_t)-1,  /* let kernel assign */
+		.ublksrv_pid      = getpid(),
+		.flags            = UBLK_F_CMD_IOCTL_ENCODE,
 	};
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)-1,
@@ -330,7 +360,7 @@ static int ublk_add_dev(int ctrl_fd, uint32_t nr_queues, uint32_t queue_depth,
 	};
 	int ret;
 
-	ret = ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
+	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
 	if (ret < 0)
 		return ret;
 
@@ -338,8 +368,9 @@ static int ublk_add_dev(int ctrl_fd, uint32_t nr_queues, uint32_t queue_depth,
 	return 0;
 }
 
-static int ublk_set_params(int ctrl_fd, int dev_id, uint64_t nr_sectors,
-			   uint32_t lba_size, uint32_t max_sectors)
+static int ublk_set_params(struct io_uring *ring, int ctrl_fd, int dev_id,
+			   uint64_t nr_sectors, uint32_t lba_size,
+			   uint32_t max_sectors)
 {
 	struct ublk_params p = {
 		.len   = sizeof(p),
@@ -360,35 +391,35 @@ static int ublk_set_params(int ctrl_fd, int dev_id, uint64_t nr_sectors,
 		.addr     = (__u64)(uintptr_t)&p,
 	};
 
-	return ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_SET_PARAMS, &ctrl_cmd);
+	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_SET_PARAMS, &ctrl_cmd);
 }
 
-static int ublk_start_dev(int ctrl_fd, int dev_id)
+static int ublk_start_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
 		.data[0]  = getpid(),
 	};
-	return ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
+	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
 }
 
-static int ublk_stop_dev(int ctrl_fd, int dev_id)
+static int ublk_stop_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
 	};
-	return ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_STOP_DEV, &ctrl_cmd);
+	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_STOP_DEV, &ctrl_cmd);
 }
 
-static int ublk_del_dev(int ctrl_fd, int dev_id)
+static int ublk_del_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
 	};
-	return ublk_ctrl_cmd(ctrl_fd, UBLK_U_CMD_DEL_DEV, &ctrl_cmd);
+	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_DEL_DEV, &ctrl_cmd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -448,20 +479,37 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 		goto err_free;
 	}
 
+	/*
+	 * Control ring: UBLK_U_CMD_* are io_uring cmd_op values, not ioctl
+	 * numbers.  SQE128 required: ublksrv_ctrl_cmd is 32 bytes but a
+	 * standard SQE only provides 16 bytes of cmd[] space.
+	 */
+	{
+		struct io_uring_params p = { .flags = IORING_SETUP_SQE128 };
+		ret = io_uring_queue_init_params(8, &server->ctrl_ring, &p);
+		if (ret) {
+			unvmed_log_err("ublk: ctrl io_uring init failed: %s",
+				       strerror(-ret));
+			goto err_ctrl;
+		}
+	}
+
 	/* ADD_DEV: kernel creates /dev/ublkc<N> and /dev/ublkb<N> */
-	ret = ublk_add_dev(server->ctrl_fd, nr_queues, queue_depth,
+	ret = ublk_add_dev(&server->ctrl_ring, server->ctrl_fd,
+			   nr_queues, queue_depth,
 			   server->max_io_size, &dev_info);
 	if (ret) {
 		unvmed_log_err("ublk: UBLK_CMD_ADD_DEV failed: %s",
 			       strerror(-ret));
-		goto err_ctrl;
+		goto err_ring;
 	}
 	server->dev_id = (int)dev_info.dev_id;
 	unvmed_log_info("ublk: created /dev/ublkb%d /dev/ublkc%d",
 			server->dev_id, server->dev_id);
 
 	/* SET_PARAMS: device size, block size, max sectors */
-	ret = ublk_set_params(server->ctrl_fd, server->dev_id,
+	ret = ublk_set_params(&server->ctrl_ring, server->ctrl_fd,
+			      server->dev_id,
 			      server->nr_sectors, server->lba_size,
 			      (uint32_t)(server->max_io_size / 512));
 	if (ret) {
@@ -511,7 +559,8 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	 * All queue handler threads must have submitted their initial
 	 * FETCH_REQs before this point (they did in queue_init).
 	 */
-	ret = ublk_start_dev(server->ctrl_fd, server->dev_id);
+	ret = ublk_start_dev(&server->ctrl_ring, server->ctrl_fd,
+			     server->dev_id);
 	if (ret) {
 		unvmed_log_err("ublk: UBLK_CMD_START_DEV failed: %s",
 			       strerror(-ret));
@@ -545,7 +594,9 @@ err_queues:
 		close(dev_fd);
 err_del:
 	if (server->dev_id >= 0)
-		ublk_del_dev(server->ctrl_fd, server->dev_id);
+		ublk_del_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
+err_ring:
+	io_uring_queue_exit(&server->ctrl_ring);
 err_ctrl:
 	close(server->ctrl_fd);
 err_free:
@@ -577,7 +628,7 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 
 	/* STOP_DEV: quiesces the block device */
 	if (server->dev_id >= 0)
-		ublk_stop_dev(server->ctrl_fd, server->dev_id);
+		ublk_stop_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
 
 	/* Free per-queue resources */
 	for (uint32_t i = 0; i < server->nr_queues; i++) {
@@ -598,10 +649,11 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 
 	/* DEL_DEV: removes /dev/ublkb<N> and /dev/ublkc<N> */
 	if (server->dev_id >= 0) {
-		ublk_del_dev(server->ctrl_fd, server->dev_id);
+		ublk_del_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
 		unvmed_log_info("ublk: /dev/ublkb%d deleted", server->dev_id);
 	}
 
+	io_uring_queue_exit(&server->ctrl_ring);
 	if (dev_fd >= 0)
 		close(dev_fd);
 	close(server->ctrl_fd);

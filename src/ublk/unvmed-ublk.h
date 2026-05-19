@@ -80,6 +80,14 @@ struct unvmed_ublk_server {
 	int                         ctrl_fd;     /* /dev/ublk-control */
 	int                         dev_id;      /* assigned by kernel (ADD_DEV) */
 
+	/*
+	 * io_uring ring for control commands (ADD_DEV, SET_PARAMS, etc.).
+	 * UBLK_U_CMD_* are cmd_op values for io_uring, not ioctl numbers.
+	 * Must use SQE128 since struct ublksrv_ctrl_cmd (32 bytes) is
+	 * embedded in sqe->cmd[] which is only 16 bytes in a standard SQE.
+	 */
+	struct io_uring             ctrl_ring;
+
 	uint32_t                    nr_queues;
 	uint32_t                    queue_depth;
 	uint32_t                    nsid;
