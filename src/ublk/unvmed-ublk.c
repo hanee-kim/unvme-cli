@@ -30,16 +30,52 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * The kernel's ublk_ctrl_start_dev (and ADD_DEV storage) identifies the
- * caller via task_pid_vnr(current), which is the TID of the calling thread,
- * not the TGID.  getpid() returns the TGID (same for every thread in the
- * process), which mismatches when the ublk server is started from any thread
- * other than the main thread.  gettid() returns the actual TID the kernel
- * uses, so ADD_DEV and START_DEV agree with the kernel's view.
+ * Newer kernels (seen in 6.18+) validate ublksrv_pid by looking up the
+ * task via find_task_by_vpid().  When the control ring command is deferred
+ * to a kernel worker thread, that thread lives in the init (host) PID
+ * namespace, so find_task_by_vpid(container_pid) finds a different process
+ * and returns -EINVAL.  Outside a container getpid() == host PID, so it
+ * works; inside Docker getpid() returns the container-local PID, causing
+ * the failure.
+ *
+ * Fix: read the last (outermost / host) PID from the NSpid field of
+ * /proc/self/status.  Outside containers NSpid has a single value equal to
+ * getpid().  Inside containers the last value is the host-namespace PID that
+ * the kernel can actually locate.
  */
-static inline pid_t calling_tid(void)
+static pid_t get_global_pid(void)
 {
-	return gettid();
+	FILE *f;
+	char line[256];
+	pid_t global_pid = getpid();
+
+	f = fopen("/proc/self/status", "r");
+	if (!f)
+		return global_pid;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) != 0)
+			continue;
+
+		char *p = line + 6;
+		pid_t last = 0, val;
+		char *endp;
+
+		for (;;) {
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p == '\n' || *p == '\r' || *p == '\0') break;
+			val = (pid_t)strtol(p, &endp, 10);
+			if (endp == p) break;
+			last = val;
+			p = endp;
+		}
+		if (last > 0)
+			global_pid = last;
+		break;
+	}
+
+	fclose(f);
+	return global_pid;
 }
 
 /*
@@ -357,13 +393,12 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 			size_t max_io_size,
 			struct ublksrv_ctrl_dev_info *info_out)
 {
-	pid_t tid = calling_tid();
 	struct ublksrv_ctrl_dev_info dev_info = {
 		.nr_hw_queues     = (uint16_t)nr_queues,
 		.queue_depth      = (uint16_t)queue_depth,
 		.max_io_buf_bytes = (uint32_t)max_io_size,
 		.dev_id           = (uint32_t)-1,  /* let kernel assign */
-		.ublksrv_pid      = tid,
+		.ublksrv_pid      = get_global_pid(),
 		.flags            = UBLK_F_CMD_IOCTL_ENCODE,
 	};
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
@@ -374,15 +409,9 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 	};
 	int ret;
 
-	unvmed_log_info("ublk: ADD_DEV tgid=%d tid=%d (using tid for ublksrv_pid)",
-			getpid(), tid);
-
 	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
 	if (ret < 0)
 		return ret;
-
-	unvmed_log_info("ublk: ADD_DEV done: dev_id=%u, kernel stored ublksrv_pid=%d",
-			dev_info.dev_id, dev_info.ublksrv_pid);
 
 	*info_out = dev_info;
 	return 0;
@@ -416,23 +445,13 @@ static int ublk_set_params(struct io_uring *ring, int ctrl_fd, int dev_id,
 
 static int ublk_start_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
-	pid_t tid = calling_tid();
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
-		.data[0]  = (uint64_t)tid,
+		.data[0]  = (uint64_t)get_global_pid(),
 	};
-	int ret;
 
-	unvmed_log_info("ublk: START_DEV tgid=%d tid=%d (using tid for data[0])",
-			getpid(), tid);
-
-	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
-
-	unvmed_log_info("ublk: START_DEV ret=%d%s", ret,
-			ret ? " (EINVAL=-22, EPERM=-1, ETIMEDOUT=-110)" : " (success)");
-
-	return ret;
+	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
 }
 
 static int ublk_stop_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
