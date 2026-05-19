@@ -344,12 +344,13 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 			size_t max_io_size,
 			struct ublksrv_ctrl_dev_info *info_out)
 {
+	pid_t pid = getpid();
 	struct ublksrv_ctrl_dev_info dev_info = {
 		.nr_hw_queues     = (uint16_t)nr_queues,
 		.queue_depth      = (uint16_t)queue_depth,
 		.max_io_buf_bytes = (uint32_t)max_io_size,
 		.dev_id           = (uint32_t)-1,  /* let kernel assign */
-		.ublksrv_pid      = getpid(),
+		.ublksrv_pid      = pid,
 		.flags            = UBLK_F_CMD_IOCTL_ENCODE,
 	};
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
@@ -360,9 +361,14 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 	};
 	int ret;
 
+	unvmed_log_info("ublk: ADD_DEV pid=%d (stored in dev_info.ublksrv_pid)", pid);
+
 	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
 	if (ret < 0)
 		return ret;
+
+	unvmed_log_info("ublk: ADD_DEV done: dev_id=%u, kernel stored ublksrv_pid=%d",
+			dev_info.dev_id, dev_info.ublksrv_pid);
 
 	*info_out = dev_info;
 	return 0;
@@ -396,12 +402,22 @@ static int ublk_set_params(struct io_uring *ring, int ctrl_fd, int dev_id,
 
 static int ublk_start_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
+	pid_t pid = getpid();
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
-		.data[0]  = getpid(),
+		.data[0]  = (uint64_t)pid,
 	};
-	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
+	int ret;
+
+	unvmed_log_info("ublk: START_DEV pid=%d (sent in ctrl_cmd.data[0])", pid);
+
+	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_START_DEV, &ctrl_cmd);
+
+	unvmed_log_info("ublk: START_DEV ret=%d%s", ret,
+			ret ? " (EINVAL=-22, EPERM=-1, ETIMEDOUT=-110)" : " (success)");
+
+	return ret;
 }
 
 static int ublk_stop_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
