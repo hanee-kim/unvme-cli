@@ -116,7 +116,6 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	 * completion back to the ublk request.
 	 */
 	cmd->opaque = (void *)(uintptr_t)tag;
-	q->inflight[tag] = cmd;
 
 	if (op == UBLK_IO_OP_READ) {
 		ret = unvmed_cmd_prep_read(cmd, s->nsid, slba, nlb,
@@ -132,13 +131,18 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 		unvmed_log_err("ublk q%d tag %u: NVMe cmd prep failed",
 			       q->qid, tag);
 		unvmed_cmd_put(cmd);
-		q->inflight[tag] = NULL;
 		submit_commit_and_fetch(q, tag, -EIO);
 		return -1;
 	}
 
-	/* NODB: batch doorbell; caller calls unvmed_sq_update_tail() later */
-	unvmed_cmd_post(cmd, &cmd->sqe, UNVMED_CMD_F_NODB);
+	/*
+	 * unvmed_cmd_post() returns the NVMe CID (SQ slot index).
+	 * Index inflight[] by CID so poll_nvme_completions() can look up the
+	 * right command from the CQE.  The ublk tag stored in opaque may
+	 * differ from the CID — never use tag as the inflight index.
+	 */
+	uint16_t cid = unvmed_cmd_post(cmd, &cmd->sqe, UNVMED_CMD_F_NODB);
+	q->inflight[cid] = cmd;
 	return 1;  /* 1 = command posted, needs doorbell flush */
 }
 
