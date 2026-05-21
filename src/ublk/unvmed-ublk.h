@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/mman.h>
 
 #include <liburing.h>
@@ -69,6 +70,14 @@ struct unvmed_ublk_queue {
 
 	pthread_t                   thread;
 	volatile bool               running;
+
+	/*
+	 * Signalled by the handler thread after the initial FETCH_REQs have
+	 * been submitted via io_uring_submit_and_wait().  The server start
+	 * path waits on this before issuing UBLK_CMD_START_DEV so the kernel's
+	 * ublk_is_ready() check sees all queues prepared.
+	 */
+	sem_t                       fetch_submitted;
 };
 
 /*
@@ -127,5 +136,12 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server);
 
 /* Internal: per-queue thread entry point (called from unvmed-ublk.c) */
 void *unvmed_ublk_queue_handler(void *arg);
+
+/*
+ * Stop all active ublk servers.  Called from the SIGTERM handler before
+ * NVMe controller teardown so that queue handler threads exit cleanly and
+ * kernel ublk state is properly released, preventing D-state processes.
+ */
+void unvmed_ublk_stop_all_servers(void);
 
 #endif /* UNVMED_UBLK_H */

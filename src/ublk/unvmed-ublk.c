@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -24,6 +25,50 @@
 #include "libunvmed-private.h"
 
 #include "unvmed-ublk.h"
+
+/* ------------------------------------------------------------------ */
+/* Global server registry (for clean shutdown from signal handler)     */
+/* ------------------------------------------------------------------ */
+
+static struct unvmed_ublk_server *__servers[UNVMED_UBLK_MAX_QUEUES];
+static int __nr_servers;
+static pthread_mutex_t __servers_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void __register_server(struct unvmed_ublk_server *server)
+{
+	pthread_mutex_lock(&__servers_mutex);
+	if (__nr_servers < UNVMED_UBLK_MAX_QUEUES)
+		__servers[__nr_servers++] = server;
+	pthread_mutex_unlock(&__servers_mutex);
+}
+
+static void __unregister_server(struct unvmed_ublk_server *server)
+{
+	pthread_mutex_lock(&__servers_mutex);
+	for (int i = 0; i < __nr_servers; i++) {
+		if (__servers[i] == server) {
+			__servers[i] = __servers[--__nr_servers];
+			__servers[__nr_servers] = NULL;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&__servers_mutex);
+}
+
+void unvmed_ublk_stop_all_servers(void)
+{
+	struct unvmed_ublk_server *snapshot[UNVMED_UBLK_MAX_QUEUES];
+	int n;
+
+	pthread_mutex_lock(&__servers_mutex);
+	n = __nr_servers;
+	for (int i = 0; i < n; i++)
+		snapshot[i] = __servers[i];
+	pthread_mutex_unlock(&__servers_mutex);
+
+	for (int i = 0; i < n; i++)
+		unvmed_ublk_server_stop(snapshot[i]);
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                              */
@@ -172,6 +217,7 @@ static struct unvmed_ublk_queue *unvmed_ublk_queue_alloc(
 	q->slot_size = server->max_io_size;
 	q->poll_spin_us = server->queue_depth;  /* placeholder; set below */
 	q->dev_fd    = -1;
+	sem_init(&q->fetch_submitted, 0, 0);
 	return q;
 }
 
@@ -359,6 +405,7 @@ static void unvmed_ublk_queue_free(struct unvmed_ublk_queue *q)
 	free(q->inflight);
 	q->inflight = NULL;
 
+	sem_destroy(&q->fetch_submitted);
 	free(q);
 }
 
@@ -430,7 +477,7 @@ static int ublk_set_params(struct io_uring *ring, int ctrl_fd, int dev_id,
 
 static int ublk_start_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 {
-	pid_t pid = getpid();
+	pid_t pid = unvmed_ublk_host_pid();
 	struct ublksrv_ctrl_cmd ctrl_cmd = {
 		.dev_id   = (uint32_t)dev_id,
 		.queue_id = (uint16_t)-1,
@@ -632,9 +679,17 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	}
 
 	/*
+	 * Wait until every queue handler thread has submitted its initial
+	 * FETCH_REQs via io_uring_submit_and_wait().  The handler posts
+	 * fetch_submitted after the first submit, so the kernel's
+	 * ublk_is_ready() check in START_DEV will see all queues prepared
+	 * and won't block indefinitely.
+	 */
+	for (uint32_t i = 0; i < nr_queues; i++)
+		sem_wait(&server->queues[i]->fetch_submitted);
+
+	/*
 	 * START_DEV: makes /dev/ublkb<N> visible to the block layer.
-	 * All queue handler threads must have submitted their initial
-	 * FETCH_REQs before this point (they did in queue_init).
 	 */
 	ret = ublk_start_dev(&server->ctrl_ring, server->ctrl_fd,
 			     server->dev_id);
@@ -652,6 +707,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	 */
 	unvmed_log_info("ublk: /dev/ublkb%d is live (%u queues, depth %u)",
 			server->dev_id, nr_queues, queue_depth);
+	__register_server(server);
 	return server;
 
 err_queues:
@@ -688,6 +744,7 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 	if (!server)
 		return 0;
 
+	__unregister_server(server);
 	server->running = false;
 
 	/* Signal all queue threads to stop and join them */

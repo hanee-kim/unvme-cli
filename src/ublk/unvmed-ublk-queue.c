@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <sys/uio.h>
 
 #include <liburing.h>
@@ -204,6 +205,7 @@ void *unvmed_ublk_queue_handler(void *arg)
 	struct io_uring_cqe        *ublk_cqes[UNVMED_UBLK_DEF_DEPTH * 2];
 	struct nvme_cqe             nvme_cqes[UNVMED_UBLK_DEF_DEPTH];
 	int                         nr_posted;
+	bool                        fetch_signalled = false;
 
 	unvmed_log_info("ublk q%d handler started (NVMe qid=%u)",
 			q->qid, s->base_qid + (uint32_t)q->qid);
@@ -257,6 +259,17 @@ void *unvmed_ublk_queue_handler(void *arg)
 		 * "submit and return immediately; don't wait for a CQE".
 		 */
 		io_uring_submit_and_wait(&q->ring, 0);
+
+		/*
+		 * Signal the server start path that this queue's initial
+		 * FETCH_REQs have been submitted.  Done once, on the first
+		 * iteration, so START_DEV is not called before the kernel
+		 * can see all queues as ready.
+		 */
+		if (!fetch_signalled) {
+			sem_post(&q->fetch_submitted);
+			fetch_signalled = true;
+		}
 
 		int nr_ublk = io_uring_peek_batch_cqe(&q->ring, ublk_cqes,
 						       s->queue_depth);
