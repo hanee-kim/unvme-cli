@@ -233,6 +233,7 @@ void *unvmed_ublk_queue_handler(void *arg)
 		free(ublk_cqes);
 		free(nvme_cqes);
 		atomic_store(&q->running, false);
+		sem_post(&q->fetch_submitted);
 		return NULL;
 	}
 
@@ -264,6 +265,7 @@ void *unvmed_ublk_queue_handler(void *arg)
 			free(ublk_cqes);
 			free(nvme_cqes);
 			atomic_store(&q->running, false);
+			sem_post(&q->fetch_submitted);
 			return NULL;
 		}
 

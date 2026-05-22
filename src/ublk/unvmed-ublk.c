@@ -719,13 +719,22 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 
 	/*
 	 * Wait until every queue handler thread has submitted its initial
-	 * FETCH_REQs via io_uring_submit_and_wait().  The handler posts
-	 * fetch_submitted after the first submit, so the kernel's
-	 * ublk_is_ready() check in START_DEV will see all queues prepared
-	 * and won't block indefinitely.
+	 * FETCH_REQs via io_uring_submit_and_get_events().  The handler always
+	 * posts fetch_submitted before returning — either after the first
+	 * submit (success) or immediately on any early-exit failure path — so
+	 * sem_wait here is guaranteed to unblock.  Check running afterwards to
+	 * detect threads that failed before entering the main loop.
 	 */
 	for (uint32_t i = 0; i < nr_queues; i++)
 		sem_wait(&server->queues[i]->fetch_submitted);
+
+	for (uint32_t i = 0; i < nr_queues; i++) {
+		if (!atomic_load(&server->queues[i]->running)) {
+			unvmed_log_err("ublk: queue %u handler failed to start", i);
+			errno = ECHILD;
+			goto err_queues;
+		}
+	}
 
 	/*
 	 * START_DEV: makes /dev/ublkb<N> visible to the block layer.
