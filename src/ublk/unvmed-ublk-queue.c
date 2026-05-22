@@ -43,13 +43,19 @@ static void submit_commit_and_fetch(struct unvmed_ublk_queue *q,
 
 	if (!sqe) {
 		/*
-		 * Ring is full — this shouldn't happen in normal operation
-		 * because the ring is sized queue_depth+1.  Log and skip;
-		 * the kernel will eventually abort the request.
+		 * Ring is full.  Flush any pending submissions to free slots,
+		 * then retry once.  If still full, stop the queue so the kernel
+		 * aborts all inflight requests via UBLK_IO_RES_ABORT rather than
+		 * hanging indefinitely waiting for a reply that never comes.
 		 */
-		unvmed_log_err("ublk q%d tag %u: no SQE for COMMIT_AND_FETCH",
-			       q->qid, tag);
-		return;
+		io_uring_submit(&q->ring);
+		sqe = io_uring_get_sqe(&q->ring);
+		if (!sqe) {
+			unvmed_log_err("ublk q%d tag %u: ring full after flush, stopping queue",
+				       q->qid, tag);
+			atomic_store(&q->running, false);
+			return;
+		}
 	}
 
 	io_uring_prep_rw(IORING_OP_URING_CMD, sqe, q->dev_fd, NULL, 0, 0);
@@ -72,12 +78,21 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 {
 	struct unvmed_ublk_server *s = q->server;
 	struct unvme *u = s->u;
-	uint8_t  op       = ublksrv_get_op(iod);
-	uint64_t slba     = iod->start_sector / (s->lba_size / 512);
-	uint32_t nr_sects = iod->nr_sectors;
-	uint16_t nlb      = (uint16_t)(nr_sects / (s->lba_size / 512)) - 1;
-	void    *buf      = (char *)q->bounce + tag * q->slot_size;
-	size_t   len      = (size_t)nr_sects * 512;
+	uint8_t  op         = ublksrv_get_op(iod);
+	uint32_t lba_ratio  = s->lba_size / 512;
+	uint64_t slba       = iod->start_sector / lba_ratio;
+	uint32_t nr_sects   = iod->nr_sectors;
+	void    *buf        = (char *)q->bounce + tag * q->slot_size;
+	size_t   len        = (size_t)nr_sects * 512;
+
+	if (nr_sects < lba_ratio) {
+		unvmed_log_err("ublk q%d tag %u: nr_sectors %u < lba_ratio %u",
+			       q->qid, tag, nr_sects, lba_ratio);
+		submit_commit_and_fetch(q, tag, -EIO);
+		return 0;
+	}
+
+	uint16_t nlb = (uint16_t)(nr_sects / lba_ratio) - 1;
 	struct unvme_cmd *cmd;
 	struct iovec iov  = { .iov_base = buf, .iov_len = len };
 	int ret = 0;

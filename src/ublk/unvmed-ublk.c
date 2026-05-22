@@ -285,8 +285,15 @@ static int unvmed_ublk_queue_init_nvme(struct unvmed_ublk_queue *q)
 	q->ucq = q->usq ? q->usq->ucq : NULL;
 
 	if (!q->usq || !q->ucq) {
+		struct unvme_cq *ucq = unvmed_cq_find(u, nvme_qid);
 		unvmed_log_err("ublk q%d: failed to look up NVMe SQ/CQ %u",
 			       q->qid, nvme_qid);
+		if (q->usq)
+			unvmed_sq_put(u, q->usq);
+		if (ucq)
+			unvmed_cq_put(u, ucq);
+		q->usq = NULL;
+		q->ucq = NULL;
 		return -1;
 	}
 
@@ -567,6 +574,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	struct ublksrv_ctrl_dev_info dev_info;
 	char dev_path[64];
 	int dev_fd = -1;
+	bool dev_started = false;
 	int ret;
 
 	unvmed_log_info("ublk: server_start: pid=%d tid=%d nr_queues=%u depth=%u nsid=%u",
@@ -746,6 +754,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 			       strerror(-ret));
 		goto err_queues;
 	}
+	dev_started = true;
 
 
 	/*
@@ -779,6 +788,8 @@ err_queues:
 	}
 	if (dev_fd >= 0)
 		close(dev_fd);
+	if (dev_started && server->dev_id >= 0)
+		ublk_stop_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
 err_del:
 	if (server->dev_id >= 0)
 		ublk_del_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
@@ -828,14 +839,17 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 	}
 
 	/*
-	 * Delete NVMe I/O queues that were created for ublk.
-	 * unvmed_create_cq/sq are symmetric — use the admin queue path.
+	 * Release userspace SQ/CQ structs created for ublk queues.
+	 * unvmed_sq_put/cq_put decrement refcnt; reaching 0 frees the struct.
 	 */
 	for (uint32_t i = 0; i < server->nr_queues; i++) {
 		uint32_t qid = server->base_qid + i;
 		struct unvme_sq *usq = unvmed_sq_find(server->u, qid);
+		struct unvme_cq *ucq = unvmed_cq_find(server->u, qid);
 		if (usq)
 			unvmed_sq_put(server->u, usq);
+		if (ucq)
+			unvmed_cq_put(server->u, ucq);
 	}
 
 	/* DEL_DEV: removes /dev/ublkb<N> and /dev/ublkc<N> */
