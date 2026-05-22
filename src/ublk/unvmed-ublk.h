@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/mman.h>
@@ -69,7 +70,7 @@ struct unvmed_ublk_queue {
 	uint32_t                    poll_spin_us;
 
 	pthread_t                   thread;
-	volatile bool               running;
+	_Atomic bool                running;
 
 	/*
 	 * Signalled by the handler thread after the initial FETCH_REQs have
@@ -106,7 +107,7 @@ struct unvmed_ublk_server {
 
 	struct unvmed_ublk_queue   *queues[UNVMED_UBLK_MAX_QUEUES];
 
-	volatile bool               running;
+	_Atomic bool                running;
 
 	/* first NVMe qid allocated for this server (ublk queues: base_qid..base_qid+nr_queues-1) */
 	uint32_t                    base_qid;

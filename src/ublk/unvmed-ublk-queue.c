@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
@@ -220,10 +221,20 @@ void *unvmed_ublk_queue_handler(void *arg)
 {
 	struct unvmed_ublk_queue   *q = arg;
 	struct unvmed_ublk_server  *s = q->server;
-	struct io_uring_cqe        *ublk_cqes[UNVMED_UBLK_DEF_DEPTH * 2];
-	struct nvme_cqe             nvme_cqes[UNVMED_UBLK_DEF_DEPTH];
+	struct io_uring_cqe       **ublk_cqes;
+	struct nvme_cqe            *nvme_cqes;
 	int                         nr_posted;
 	bool                        fetch_signalled = false;
+
+	ublk_cqes = calloc(s->queue_depth, sizeof(*ublk_cqes));
+	nvme_cqes = calloc(s->queue_depth, sizeof(*nvme_cqes));
+	if (!ublk_cqes || !nvme_cqes) {
+		unvmed_log_err("ublk q%d: failed to allocate cqe buffers", q->qid);
+		free(ublk_cqes);
+		free(nvme_cqes);
+		atomic_store(&q->running, false);
+		return NULL;
+	}
 
 	unvmed_log_info("ublk q%d handler started (NVMe qid=%u)",
 			q->qid, s->base_qid + (uint32_t)q->qid);
@@ -250,7 +261,9 @@ void *unvmed_ublk_queue_handler(void *arg)
 		if (!sqe) {
 			unvmed_log_err("ublk q%d: no SQE for initial FETCH tag %u",
 				       q->qid, tag);
-			q->running = false;
+			free(ublk_cqes);
+			free(nvme_cqes);
+			atomic_store(&q->running, false);
 			return NULL;
 		}
 
@@ -265,7 +278,7 @@ void *unvmed_ublk_queue_handler(void *arg)
 		io_cmd->result = 0;
 	}
 
-	while (q->running) {
+	while (atomic_load(&q->running)) {
 		nr_posted = 0;
 
 		/*
@@ -307,7 +320,7 @@ void *unvmed_ublk_queue_handler(void *arg)
 				unvmed_log_err("ublk q%d: fetch tag=%u failed res=%d",
 					       q->qid, tag, res);
 				if (res == UBLK_IO_RES_ABORT)
-					q->running = false;
+					atomic_store(&q->running, false);
 				continue;
 			}
 
@@ -344,6 +357,8 @@ void *unvmed_ublk_queue_handler(void *arg)
 			sched_yield();
 	}
 
+	free(ublk_cqes);
+	free(nvme_cqes);
 	unvmed_log_info("ublk q%d handler stopped", q->qid);
 	return NULL;
 }

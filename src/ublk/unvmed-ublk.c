@@ -242,7 +242,7 @@ static struct unvmed_ublk_queue *unvmed_ublk_queue_alloc(
 	q->server    = server;
 	q->qid       = qid;
 	q->slot_size = server->max_io_size;
-	q->poll_spin_us = server->queue_depth;  /* placeholder; set below */
+	q->poll_spin_us = 0;
 	q->dev_fd    = -1;
 	sem_init(&q->fetch_submitted, 0, 0);
 	return q;
@@ -267,8 +267,11 @@ static int unvmed_ublk_queue_init_nvme(struct unvmed_ublk_queue *q)
 	ret = unvmed_create_sq(u, nvme_qid, s->queue_depth, nvme_qid,
 			       /*qprio=*/0, /*pc=*/1, /*nvmsetid=*/0);
 	if (ret) {
+		struct unvme_cq *ucq = unvmed_cq_find(u, nvme_qid);
 		unvmed_log_err("ublk q%d: failed to create NVMe SQ %u: %s",
 			       q->qid, nvme_qid, strerror(errno));
+		if (ucq)
+			unvmed_cq_put(u, ucq);
 		return -1;
 	}
 
@@ -613,7 +616,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	server->nr_sectors  = ns->nr_lbas;
 	server->lba_size    = ns->lba_size;
 	server->max_io_size = unvmed_ublk_max_io_size(u);
-	server->running     = true;
+	atomic_store(&server->running, true);
 	server->dev_id      = -1;
 	server->base_qid    = unvmed_ublk_next_qid(u);
 
@@ -697,13 +700,13 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 			goto err_queues;
 		}
 
-		q->running = true;
+		atomic_store(&q->running, true);
 		ret = pthread_create(&q->thread, NULL,
 				     unvmed_ublk_queue_handler, q);
 		if (ret) {
 			unvmed_log_err("ublk: failed to start queue %u thread: %s",
 				       i, strerror(ret));
-			q->running = false;
+			atomic_store(&q->running, false);
 			goto err_queues;
 		}
 	}
@@ -742,13 +745,13 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	return server;
 
 err_queues:
-	server->running = false;
+	atomic_store(&server->running, false);
 	for (uint32_t i = 0; i < nr_queues; i++) {
 		struct unvmed_ublk_queue *q = server->queues[i];
 		if (!q)
 			continue;
-		if (q->running) {
-			q->running = false;
+		if (atomic_load(&q->running)) {
+			atomic_store(&q->running, false);
 			pthread_join(q->thread, NULL);
 		}
 		unvmed_ublk_queue_free(q);
@@ -779,7 +782,7 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 	 * both call stop concurrently. Only the first caller proceeds. */
 	if (!__unregister_server(server))
 		return 0;
-	server->running = false;
+	atomic_store(&server->running, false);
 
 	/* Signal all queue threads to stop and join them */
 	for (uint32_t i = 0; i < server->nr_queues; i++) {
@@ -790,7 +793,7 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 		if (dev_fd < 0)
 			dev_fd = q->dev_fd;
 
-		q->running = false;
+		atomic_store(&q->running, false);
 		pthread_join(q->thread, NULL);
 	}
 
