@@ -34,12 +34,18 @@ static struct unvmed_ublk_server *__servers[UNVMED_UBLK_MAX_QUEUES];
 static int __nr_servers;
 static pthread_mutex_t __servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void __register_server(struct unvmed_ublk_server *server)
+/* Returns true on success, false if the registry is full. */
+static bool __register_server(struct unvmed_ublk_server *server)
 {
+	bool ok = false;
+
 	pthread_mutex_lock(&__servers_mutex);
-	if (__nr_servers < UNVMED_UBLK_MAX_QUEUES)
+	if (__nr_servers < UNVMED_UBLK_MAX_QUEUES) {
 		__servers[__nr_servers++] = server;
+		ok = true;
+	}
 	pthread_mutex_unlock(&__servers_mutex);
+	return ok;
 }
 
 /* Returns true if server was found and removed, false if already unregistered. */
@@ -741,7 +747,12 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	 */
 	unvmed_log_info("ublk: /dev/ublkb%d is live (%u queues, depth %u)",
 			server->dev_id, nr_queues, queue_depth);
-	__register_server(server);
+	if (!__register_server(server)) {
+		unvmed_log_err("ublk: server registry full (max %d servers)",
+			       UNVMED_UBLK_MAX_QUEUES);
+		errno = ENOSPC;
+		goto err_queues;
+	}
 	return server;
 
 err_queues:
