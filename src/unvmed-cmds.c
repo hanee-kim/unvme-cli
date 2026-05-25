@@ -4812,19 +4812,16 @@ int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
 					    "<device>", 0, "[M] Device BDF");
 	struct arg_int *nsid     = arg_int0("n", "nsid", "<n>",
 					    "[O] Namespace ID (default: 1)");
-	struct arg_int *nqueues  = arg_int0("q", "nr-queues", "<n>",
-					    "[O] Number of ublk queues (default: 4)");
 	struct arg_int *qdepth   = arg_int0("d", "queue-depth", "<n>",
-					    "[O] Queue depth (default: 64)");
+					    "[O] Queue depth per ublk queue (default: 64)");
 	struct arg_int *spin_us  = arg_int0(NULL, "poll-spin-us", "<n>",
 					    "[O] NVMe CQ spin time in us before yield (default: 10)");
 	struct arg_lit *help     = arg_lit0("h", "help", "Show help message");
 	struct arg_end *end      = arg_end(UNVME_ARG_MAX_ERROR);
 
-	void *argtable[] = { dev, nsid, nqueues, qdepth, spin_us, help, end };
+	void *argtable[] = { dev, nsid, qdepth, spin_us, help, end };
 
 	arg_intv(nsid)    = 1;
-	arg_intv(nqueues) = UNVMED_UBLK_DEF_NR_QUEUES;
 	arg_intv(qdepth)  = UNVMED_UBLK_DEF_DEPTH;
 	arg_intv(spin_us) = UNVMED_UBLK_DEF_POLL_US;
 
@@ -4837,9 +4834,7 @@ int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
 		return ENODEV;
 	}
 
-	if (arg_intv(nqueues) < 1 ||
-	    arg_intv(nqueues) > UNVMED_UBLK_MAX_QUEUES ||
-	    arg_intv(qdepth) < 1 || arg_intv(nsid) < 1) {
+	if (arg_intv(qdepth) < 1 || arg_intv(nsid) < 1) {
 		unvme_pr_err("invalid ublk-server arguments\n");
 		unvme_free_args(argtable);
 		return EINVAL;
@@ -4854,7 +4849,6 @@ int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
 	struct unvmed_ublk_server *server =
 		unvmed_ublk_server_start(u,
 					 (uint32_t)arg_intv(nsid),
-					 (uint32_t)arg_intv(nqueues),
 					 (uint32_t)arg_intv(qdepth),
 					 (uint32_t)arg_intv(spin_us));
 	if (!server) {

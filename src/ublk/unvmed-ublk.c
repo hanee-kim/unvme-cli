@@ -194,26 +194,6 @@ wait:
 }
 
 /*
- * Find the highest existing I/O SQ qid allocated in @u, return next free id.
- * Admin queue (qid=0) is always present; I/O queues start at 1.
- */
-static uint32_t unvmed_ublk_next_qid(struct unvme *u)
-{
-	struct unvme_sq **sqs = NULL;
-	uint32_t max_qid = 0;
-	int nr;
-
-	nr = unvmed_get_sqs(u, &sqs);
-	for (int i = 0; i < nr; i++) {
-		if ((uint32_t)sqs[i]->id > max_qid)
-			max_qid = (uint32_t)sqs[i]->id;
-	}
-	free(sqs);
-
-	return max_qid + 1;
-}
-
-/*
  * Derive max_io_size from the controller's MDTS, capped at the compile-time
  * limit.  If the controller has no MDTS limit (mdts == 0), use the cap.
  */
@@ -230,6 +210,50 @@ static size_t unvmed_ublk_max_io_size(struct unvme *u)
 	if (mdts_bytes > UNVMED_UBLK_MAX_IO_SIZE)
 		return UNVMED_UBLK_MAX_IO_SIZE;
 	return mdts_bytes;
+}
+
+/*
+ * Collect all enabled I/O SQs (qid != 0) whose ucq matches @ucq.
+ * Returns the count; *out_sqs is a newly allocated array (caller must free).
+ * Each returned SQ has its refcnt incremented (via unvmed_sq_get).
+ */
+static int collect_sqs_for_cq(struct unvme *u, struct unvme_cq *ucq,
+			       struct unvme_sq ***out_sqs)
+{
+	struct unvme_sq **all_sqs = NULL;
+	struct unvme_sq **found = NULL;
+	int nr_all, nr_found = 0;
+
+	nr_all = unvmed_get_sqs(u, &all_sqs);
+	if (nr_all <= 0) {
+		free(all_sqs);
+		*out_sqs = NULL;
+		return 0;
+	}
+
+	found = calloc(nr_all, sizeof(*found));
+	if (!found) {
+		free(all_sqs);
+		return -1;
+	}
+
+	for (int i = 0; i < nr_all; i++) {
+		struct unvme_sq *usq = all_sqs[i];
+
+		if (usq->id == 0)
+			continue;  /* skip admin SQ */
+		if (usq->ucq != ucq)
+			continue;
+
+		/* Hold a reference so the SQ can't be freed while ublk runs. */
+		found[nr_found] = unvmed_sq_get(u, usq->id);
+		if (found[nr_found])
+			nr_found++;
+	}
+
+	free(all_sqs);
+	*out_sqs = found;
+	return nr_found;
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,52 +276,6 @@ static struct unvmed_ublk_queue *unvmed_ublk_queue_alloc(
 	q->dev_fd    = -1;
 	sem_init(&q->fetch_submitted, 0, 0);
 	return q;
-}
-
-static int unvmed_ublk_queue_init_nvme(struct unvmed_ublk_queue *q)
-{
-	struct unvmed_ublk_server *s = q->server;
-	struct unvme *u = s->u;
-	uint32_t nvme_qid = s->base_qid + (uint32_t)q->qid;
-	int ret;
-
-	/* Polling CQ (vector = -1): handler thread polls directly. */
-	ret = unvmed_create_cq(u, nvme_qid, s->queue_depth, /*vector=*/-1,
-			       /*pc=*/1);
-	if (ret) {
-		unvmed_log_err("ublk q%d: failed to create NVMe CQ %u: %s",
-			       q->qid, nvme_qid, strerror(errno));
-		return -1;
-	}
-
-	ret = unvmed_create_sq(u, nvme_qid, s->queue_depth, nvme_qid,
-			       /*qprio=*/0, /*pc=*/1, /*nvmsetid=*/0);
-	if (ret) {
-		struct unvme_cq *ucq = unvmed_cq_find(u, nvme_qid);
-		unvmed_log_err("ublk q%d: failed to create NVMe SQ %u: %s",
-			       q->qid, nvme_qid, strerror(errno));
-		if (ucq)
-			unvmed_cq_put(u, ucq);
-		return -1;
-	}
-
-	q->usq = unvmed_sq_get(u, nvme_qid);
-	q->ucq = q->usq ? q->usq->ucq : NULL;
-
-	if (!q->usq || !q->ucq) {
-		struct unvme_cq *ucq = unvmed_cq_find(u, nvme_qid);
-		unvmed_log_err("ublk q%d: failed to look up NVMe SQ/CQ %u",
-			       q->qid, nvme_qid);
-		if (q->usq)
-			unvmed_sq_put(u, q->usq);
-		if (ucq)
-			unvmed_cq_put(u, ucq);
-		q->usq = NULL;
-		q->ucq = NULL;
-		return -1;
-	}
-
-	return 0;
 }
 
 static int unvmed_ublk_queue_init_bounce(struct unvmed_ublk_queue *q)
@@ -391,39 +369,28 @@ static int unvmed_ublk_queue_init(struct unvmed_ublk_queue *q, int dev_fd,
 {
 	struct unvmed_ublk_server *s = q->server;
 
-	q->dev_fd      = dev_fd;
+	q->dev_fd       = dev_fd;
 	q->poll_spin_us = poll_spin_us;
 
-	q->inflight = calloc(s->queue_depth, sizeof(*q->inflight));
-	if (!q->inflight)
-		return -ENOMEM;
-
-	if (unvmed_ublk_queue_init_nvme(q))
-		goto err_inflight;
-
 	if (unvmed_ublk_queue_init_bounce(q))
-		goto err_nvme;
-
-	if (unvmed_ublk_queue_init_iodesc(q))
 		goto err_bounce;
 
-	if (unvmed_ublk_queue_init_ring(q))
+	if (unvmed_ublk_queue_init_iodesc(q))
 		goto err_iodesc;
+
+	if (unvmed_ublk_queue_init_ring(q))
+		goto err_ring;
 
 	return 0;
 
-err_iodesc:
+err_ring:
 	munmap(q->io_descs, q->io_descs_size);
 	q->io_descs = NULL;
-err_bounce:
+err_iodesc:
 	unvmed_unmap_vaddr(s->u, q->bounce);
 	unvmed_pgunmap(q->bounce);
 	q->bounce = NULL;
-err_nvme:
-	/* NVMe queues stay alive — they are deleted in server_stop */
-err_inflight:
-	free(q->inflight);
-	q->inflight = NULL;
+err_bounce:
 	return -1;
 }
 
@@ -445,15 +412,34 @@ static void unvmed_ublk_queue_free(struct unvmed_ublk_queue *q)
 		q->bounce = NULL;
 	}
 
-	free(q->inflight);
-	q->inflight = NULL;
+	/*
+	 * Release SQ references acquired in collect_sqs_for_cq().
+	 * The SQs themselves are NOT deleted — they belong to the user.
+	 * UNVMED_SQ_F_UBLK_OWNED is cleared by server_stop before this runs.
+	 */
+	for (int i = 0; i < q->nr_usqs; i++) {
+		if (q->usqs[i])
+			unvmed_sq_put(q->server->u, q->usqs[i]);
+	}
+	free(q->usqs);
+	q->usqs   = NULL;
+	q->nr_usqs = 0;
+
+	/*
+	 * Release the CQ reference acquired in server_start via unvmed_cq_get.
+	 * The CQ itself is NOT deleted.
+	 */
+	if (q->ucq) {
+		unvmed_cq_put(q->server->u, q->ucq);
+		q->ucq = NULL;
+	}
 
 	sem_destroy(&q->fetch_submitted);
 	free(q);
 }
 
 /* ------------------------------------------------------------------ */
-/* ublk device control (ioctl on /dev/ublk-control)                   */
+/* ublk device control (via io_uring on /dev/ublk-control)            */
 /* ------------------------------------------------------------------ */
 
 static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
@@ -479,17 +465,15 @@ static int ublk_add_dev(struct io_uring *ring, int ctrl_fd,
 	};
 	int ret;
 
-	unvmed_log_info("ublk: ADD_DEV pid=%d nr_queues=%u depth=%u flags=0x%llx (NO_AUTO_PART_SCAN=%d)",
+	unvmed_log_info("ublk: ADD_DEV pid=%d nr_queues=%u depth=%u flags=0x%llx",
 			(int)host_pid, nr_queues, queue_depth,
-			(unsigned long long)dev_info.flags,
-			!!(dev_info.flags & UBLK_F_NO_AUTO_PART_SCAN));
+			(unsigned long long)dev_info.flags);
 
 	ret = ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_ADD_DEV, &ctrl_cmd);
 	if (ret < 0)
 		return ret;
 
-	unvmed_log_info("ublk: ADD_DEV done: dev_id=%u, kernel stored ublksrv_pid=%d",
-			dev_info.dev_id, dev_info.ublksrv_pid);
+	unvmed_log_info("ublk: ADD_DEV done: dev_id=%u", dev_info.dev_id);
 
 	*info_out = dev_info;
 	return 0;
@@ -565,54 +549,76 @@ static int ublk_del_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 
 struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 						    uint32_t nsid,
-						    uint32_t nr_queues,
 						    uint32_t queue_depth,
 						    uint32_t poll_spin_us)
 {
 	struct unvmed_ublk_server *server;
+	struct unvme_cq **io_cqs = NULL;
 	struct unvme_ns *ns;
 	struct ublksrv_ctrl_dev_info dev_info;
 	char dev_path[64];
 	int dev_fd = -1;
 	bool dev_started = false;
-	int ret;
+	uint32_t nr_queues = 0;
+	int nr_cqs, ret;
 
-	unvmed_log_info("ublk: server_start: pid=%d tid=%d nr_queues=%u depth=%u nsid=%u",
-			(int)getpid(), (int)gettid(), nr_queues, queue_depth, nsid);
+	unvmed_log_info("ublk: server_start: pid=%d tid=%d depth=%u nsid=%u",
+			(int)getpid(), (int)gettid(), queue_depth, nsid);
+
+	/* Discover existing I/O CQs (skip admin CQ at qid=0). */
+	{
+		struct unvme_cq **all_cqs = NULL;
+		int nr_all = unvmed_get_cqs(u, &all_cqs);
+
+		io_cqs = calloc(nr_all > 0 ? nr_all : 1, sizeof(*io_cqs));
+		if (!io_cqs) {
+			free(all_cqs);
+			return NULL;
+		}
+
+		for (int i = 0; i < nr_all; i++) {
+			struct unvme_cq *ucq = all_cqs[i];
+
+			if (ucq->id == 0)
+				continue;  /* skip admin CQ */
+
+			if (unvmed_cq_irq_enabled(ucq)) {
+				unvmed_log_err("ublk: CQ %d uses interrupts "
+					       "(vector=%d); ublk requires "
+					       "polling CQs (vector=-1)",
+					       ucq->id, ucq->vector);
+				free(all_cqs);
+				free(io_cqs);
+				errno = EINVAL;
+				return NULL;
+			}
+
+			io_cqs[nr_queues++] = ucq;
+		}
+		free(all_cqs);
+	}
+
+	if (nr_queues == 0) {
+		unvmed_log_err("ublk: no I/O CQs found; create at least one "
+			       "CQ/SQ pair before starting the ublk server");
+		free(io_cqs);
+		errno = ENODEV;
+		return NULL;
+	}
 
 	if (nr_queues > UNVMED_UBLK_MAX_QUEUES) {
+		unvmed_log_err("ublk: %u I/O CQs exceeds max %d",
+			       nr_queues, UNVMED_UBLK_MAX_QUEUES);
+		free(io_cqs);
 		errno = EINVAL;
 		return NULL;
 	}
 
-	/*
-	 * Each ublk queue needs one dedicated NVMe I/O queue.  Check that the
-	 * controller was initialized with enough queue slots (ncqa is 0-based:
-	 * ncqa=N means qids 1..N+1 are valid).  base_qid is computed below, but
-	 * we can already verify the worst-case upper bound using the current
-	 * highest allocated qid.
-	 */
-	{
-		uint32_t next = unvmed_ublk_next_qid(u);
-		uint32_t last = next + nr_queues - 1;
-
-		if ((int)last > u->ctrl.config.ncqa + 1) {
-			unvmed_log_err("ublk: need qids %u..%u but controller "
-				       "ncqa=%d (max qid=%d); re-add the "
-				       "controller with --nr-ioqs >= %u",
-				       next, last,
-				       u->ctrl.config.ncqa,
-				       u->ctrl.config.ncqa + 1,
-				       last);
-			errno = EINVAL;
-			return NULL;
-		}
-	}
-
-	/* Validate namespace */
+	/* Validate namespace. */
 	ns = unvmed_ns_get(u, nsid);
 	if (!ns) {
 		unvmed_log_err("ublk: namespace %u not found", nsid);
+		free(io_cqs);
 		errno = ENODEV;
 		return NULL;
 	}
@@ -620,6 +626,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	server = calloc(1, sizeof(*server));
 	if (!server) {
 		unvmed_ns_put(u, ns);
+		free(io_cqs);
 		return NULL;
 	}
 
@@ -632,11 +639,10 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	server->max_io_size = unvmed_ublk_max_io_size(u);
 	atomic_store(&server->running, true);
 	server->dev_id      = -1;
-	server->base_qid    = unvmed_ublk_next_qid(u);
 
 	unvmed_ns_put(u, ns);
 
-	/* Open ublk control device */
+	/* Open ublk control device. */
 	server->ctrl_fd = open(UBLK_CTRL_DEV, O_RDWR);
 	if (server->ctrl_fd < 0) {
 		unvmed_log_err("ublk: failed to open %s: %s",
@@ -645,9 +651,8 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	}
 
 	/*
-	 * Control ring: UBLK_U_CMD_* are io_uring cmd_op values, not ioctl
-	 * numbers.  SQE128 required: ublksrv_ctrl_cmd is 32 bytes but a
-	 * standard SQE only provides 16 bytes of cmd[] space.
+	 * Control ring: SQE128 required because ublksrv_ctrl_cmd is 32 bytes
+	 * but a standard SQE only provides 16 bytes of cmd[] space.
 	 */
 	{
 		struct io_uring_params p = { .flags = IORING_SETUP_SQE128 };
@@ -657,12 +662,9 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 				       strerror(-ret));
 			goto err_ctrl;
 		}
-		unvmed_log_info("ublk: ctrl_ring flags=0x%x (SQE128=%d)",
-				server->ctrl_ring.flags,
-				!!(server->ctrl_ring.flags & IORING_SETUP_SQE128));
 	}
 
-	/* ADD_DEV: kernel creates /dev/ublkc<N> and /dev/ublkb<N> */
+	/* ADD_DEV: kernel creates /dev/ublkc<N> and /dev/ublkb<N>. */
 	ret = ublk_add_dev(&server->ctrl_ring, server->ctrl_fd,
 			   nr_queues, queue_depth,
 			   server->max_io_size, &dev_info);
@@ -675,7 +677,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	unvmed_log_info("ublk: created /dev/ublkb%d /dev/ublkc%d",
 			server->dev_id, server->dev_id);
 
-	/* SET_PARAMS: device size, block size, max sectors */
+	/* SET_PARAMS: device size, block size, max sectors. */
 	ret = ublk_set_params(&server->ctrl_ring, server->ctrl_fd,
 			      server->dev_id,
 			      server->nr_sectors, server->lba_size,
@@ -686,10 +688,8 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 		goto err_del;
 	}
 
-	/* Open the char device for all queues */
+	/* Open the ublk char device shared by all queue handler threads. */
 	snprintf(dev_path, sizeof(dev_path), "/dev/ublkc%d", server->dev_id);
-	unvmed_log_info("ublk: opening %s (kernel will store tgid=%d as ublksrv_tgid)",
-			dev_path, (int)getpid());
 	dev_fd = open(dev_path, O_RDWR);
 	if (dev_fd < 0) {
 		unvmed_log_err("ublk: failed to open %s: %s",
@@ -698,13 +698,52 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	}
 	unvmed_log_info("ublk: opened %s fd=%d", dev_path, dev_fd);
 
-	/* Initialize per-queue state and start handler threads */
+	/*
+	 * For each existing I/O CQ, build one queue handler.
+	 * Collect the SQs pointing to that CQ and mark them UBLK_OWNED so
+	 * that concurrent direct-I/O commands fail with EBUSY.
+	 */
 	for (uint32_t i = 0; i < nr_queues; i++) {
 		struct unvmed_ublk_queue *q;
+		struct unvme_cq *ucq = io_cqs[i];
+		struct unvme_sq **usqs = NULL;
+		int nr_usqs;
+
+		nr_usqs = collect_sqs_for_cq(u, ucq, &usqs);
+		if (nr_usqs < 0) {
+			unvmed_log_err("ublk: OOM collecting SQs for CQ %d",
+				       ucq->id);
+			free(usqs);
+			goto err_queues;
+		}
+		if (nr_usqs == 0) {
+			unvmed_log_err("ublk: CQ %d has no associated SQs",
+				       ucq->id);
+			free(usqs);
+			errno = ENODEV;
+			goto err_queues;
+		}
 
 		q = unvmed_ublk_queue_alloc(server, (int)i);
-		if (!q)
+		if (!q) {
+			for (int j = 0; j < nr_usqs; j++)
+				if (usqs[j])
+					unvmed_sq_put(u, usqs[j]);
+			free(usqs);
 			goto err_queues;
+		}
+
+		/*
+		 * Hold a CQ reference so it can't be freed while ublk runs.
+		 * unvmed_cq_get() bumps the refcnt; released in queue_free().
+		 */
+		q->ucq     = unvmed_cq_get(u, ucq->id);
+		q->usqs    = usqs;
+		q->nr_usqs = nr_usqs;
+
+		/* Block direct I/O on all SQs feeding this CQ. */
+		for (int j = 0; j < nr_usqs; j++)
+			usqs[j]->flags |= UNVMED_SQ_F_UBLK_OWNED;
 
 		server->queues[i] = q;
 
@@ -713,6 +752,8 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 			unvmed_log_err("ublk: queue %u init failed", i);
 			goto err_queues;
 		}
+
+		unvmed_log_info("ublk q%d: CQ %d, %d SQ(s)", i, ucq->id, nr_usqs);
 
 		atomic_store(&q->running, true);
 		ret = pthread_create(&q->thread, NULL,
@@ -725,13 +766,12 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 		}
 	}
 
+	free(io_cqs);
+	io_cqs = NULL;
+
 	/*
-	 * Wait until every queue handler thread has submitted its initial
-	 * FETCH_REQs via io_uring_submit_and_get_events().  The handler always
-	 * posts fetch_submitted before returning — either after the first
-	 * submit (success) or immediately on any early-exit failure path — so
-	 * sem_wait here is guaranteed to unblock.  Check running afterwards to
-	 * detect threads that failed before entering the main loop.
+	 * Wait until every handler thread has submitted its initial FETCH_REQs.
+	 * START_DEV must not be called before the kernel sees all queues ready.
 	 */
 	for (uint32_t i = 0; i < nr_queues; i++)
 		sem_wait(&server->queues[i]->fetch_submitted);
@@ -744,9 +784,7 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 		}
 	}
 
-	/*
-	 * START_DEV: makes /dev/ublkb<N> visible to the block layer.
-	 */
+	/* START_DEV: makes /dev/ublkb<N> visible to the block layer. */
 	ret = ublk_start_dev(&server->ctrl_ring, server->ctrl_fd,
 			     server->dev_id);
 	if (ret) {
@@ -756,15 +794,9 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 	}
 	dev_started = true;
 
-
-	/*
-	 * dev_fd ref is kept open for mmap lifetime; we dup it into each
-	 * queue so the original fd can be closed at function exit.  Here we
-	 * leave it open — the queue structs share the same fd number which
-	 * is fine since they were all init'd with dev_fd above.
-	 */
 	unvmed_log_info("ublk: /dev/ublkb%d is live (%u queues, depth %u)",
 			server->dev_id, nr_queues, queue_depth);
+
 	if (!__register_server(server)) {
 		unvmed_log_err("ublk: server registry full (max %d servers)",
 			       UNVMED_UBLK_MAX_QUEUES);
@@ -783,6 +815,10 @@ err_queues:
 			atomic_store(&q->running, false);
 			pthread_join(q->thread, NULL);
 		}
+		/* Clear UBLK_OWNED before freeing so unvmed_sq_put works. */
+		for (int j = 0; j < q->nr_usqs; j++)
+			if (q->usqs[j])
+				q->usqs[j]->flags &= ~UNVMED_SQ_F_UBLK_OWNED;
 		unvmed_ublk_queue_free(q);
 		server->queues[i] = NULL;
 	}
@@ -799,6 +835,7 @@ err_ctrl:
 	close(server->ctrl_fd);
 err_free:
 	free(server);
+	free(io_cqs);
 	return NULL;
 }
 
@@ -821,11 +858,11 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 			dev_fd = q->dev_fd;
 	}
 
-	/* STOP_DEV first: kernel completes pending FETCH_REQs with ABORT */
+	/* STOP_DEV first: kernel completes pending FETCH_REQs with ABORT. */
 	if (server->dev_id >= 0)
 		ublk_stop_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
 
-	/* Join handler threads (exit on ABORT or running=false fallback) */
+	/* Join handler threads (exit on ABORT or running=false fallback). */
 	for (uint32_t i = 0; i < server->nr_queues; i++) {
 		struct unvmed_ublk_queue *q = server->queues[i];
 		if (!q)
@@ -834,7 +871,21 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 		pthread_join(q->thread, NULL);
 	}
 
-	/* Free per-queue resources (io_uring_queue_exit drops SQE file refs) */
+	/*
+	 * Clear UNVMED_SQ_F_UBLK_OWNED on all SQs now that handler threads
+	 * have stopped.  Do this before queue_free() so the flag is gone
+	 * before we release refcounts and the SQs become usable again.
+	 */
+	for (uint32_t i = 0; i < server->nr_queues; i++) {
+		struct unvmed_ublk_queue *q = server->queues[i];
+		if (!q)
+			continue;
+		for (int j = 0; j < q->nr_usqs; j++)
+			if (q->usqs[j])
+				q->usqs[j]->flags &= ~UNVMED_SQ_F_UBLK_OWNED;
+	}
+
+	/* Free per-queue resources (io_uring_queue_exit drops SQE file refs). */
 	for (uint32_t i = 0; i < server->nr_queues; i++) {
 		unvmed_ublk_queue_free(server->queues[i]);
 		server->queues[i] = NULL;
@@ -851,15 +902,7 @@ int unvmed_ublk_server_stop(struct unvmed_ublk_server *server)
 	if (dev_fd >= 0)
 		close(dev_fd);
 
-	/* Delete NVMe I/O queues */
-	for (uint32_t i = 0; i < server->nr_queues; i++) {
-		uint32_t qid = server->base_qid + i;
-		struct unvme_sq *usq = unvmed_sq_find(server->u, qid);
-		if (usq)
-			unvmed_sq_put(server->u, usq);
-	}
-
-	/* DEL_DEV: removes /dev/ublkb<N> and /dev/ublkc<N> */
+	/* DEL_DEV: removes /dev/ublkb<N> and /dev/ublkc<N>. */
 	if (server->dev_id >= 0) {
 		ublk_del_dev(&server->ctrl_ring, server->ctrl_fd, server->dev_id);
 		unvmed_log_info("ublk: /dev/ublkb%d deleted", server->dev_id);

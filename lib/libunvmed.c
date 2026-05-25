@@ -3273,6 +3273,69 @@ int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
 	return ret + n;
 }
 
+/*
+ * unvmed_cq_run_n_multi - Reap CQ entries when multiple SQs share one CQ.
+ *
+ * Unlike unvmed_cq_run_n(), this function does NOT require a single owning
+ * SQ.  It reads raw CQEs directly from the hardware CQ, resolves the correct
+ * SQ for each entry via cqe->sqid, and marks the command as completed
+ * without going through the per-SQ VCQ pipeline.  The caller is responsible
+ * for looking up and releasing each command (unvmed_cmd_put) after processing
+ * the returned CQEs.
+ *
+ * Returns the number of CQEs reaped.
+ */
+int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
+			   struct nvme_cqe *cqes, int max)
+{
+	struct nvme_cqe *cqe;
+	int nr_cmds;
+	int nr = 0;
+
+	unvmed_cq_enter(ucq);
+	while (nr < max) {
+		cqe = nvme_cq_get_cqe(ucq->q);
+		if (!cqe)
+			break;
+
+		if (cqes)
+			memcpy(&cqes[nr], cqe, sizeof(*cqe));
+		nr++;
+
+		/*
+		 * Resolve the correct SQ by sqid and mark the command
+		 * completed so that unvmed_cmd_put() can free it correctly.
+		 * We skip the VCQ push that unvmed_cmd_cmpl() would do —
+		 * ublk manages command lifecycle through cmd->opaque / sqid
+		 * lookup rather than the VCQ pipeline.
+		 */
+		{
+			struct unvme_sq *usq = unvmed_sq_find(u, le16_to_cpu(cqe->sqid));
+			if (usq) {
+				struct unvme_cmd *cmd = unvmed_get_cmd(usq, le16_to_cpu(cqe->cid));
+				if (cmd) {
+					atomic_store_release(&cmd->state,
+							     UNVME_CMD_S_TO_BE_COMPLETED);
+					cmd->cqe = *cqe;
+					atomic_store_release(&cmd->state,
+							     UNVME_CMD_S_COMPLETED);
+				}
+			}
+		}
+
+		nvme_cq_update_head(ucq->q);
+	}
+	unvmed_cq_exit(ucq);
+
+	if (nr) {
+		do {
+			nr_cmds = u->nr_cmds;
+		} while (!atomic_cmpxchg(&u->nr_cmds, nr_cmds, nr_cmds - nr));
+	}
+
+	return nr;
+}
+
 static int unvmed_sq_nr_pending_sqes(struct unvme_sq *usq)
 {
 	struct nvme_sq *sq = usq->q;

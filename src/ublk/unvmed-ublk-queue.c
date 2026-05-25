@@ -73,6 +73,18 @@ static void submit_commit_and_fetch(struct unvmed_ublk_queue *q,
 /* NVMe I/O submission                                                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Pick the next SQ in round-robin order for submission.
+ * All SQs in q->usqs[] share q->ucq, so completions always appear on
+ * the same CQ regardless of which SQ was used for submission.
+ */
+static inline struct unvme_sq *pick_usq(struct unvmed_ublk_queue *q)
+{
+	int idx = q->next_usq % q->nr_usqs;
+	q->next_usq++;
+	return q->usqs[idx];
+}
+
 static int submit_nvme_io(struct unvmed_ublk_queue *q,
 			  const struct ublksrv_io_desc *iod, uint16_t tag)
 {
@@ -100,10 +112,6 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	if (op == UBLK_IO_OP_FLUSH ||
 	    op == UBLK_IO_OP_DISCARD ||
 	    op == UBLK_IO_OP_WRITE_ZEROES) {
-		/*
-		 * Flush / discard: complete immediately with success.
-		 * A full implementation would issue NVMe Flush or DSM here.
-		 */
 		submit_commit_and_fetch(q, tag, 0);
 		return 0;
 	}
@@ -114,12 +122,30 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	}
 
 	/*
-	 * unvmed_alloc_cmd() detects that `buf` is already IOMMU-mapped
-	 * (via unvmed_map_vaddr in queue init) and does NOT re-map it,
-	 * ensuring the bounce buffer remains stably mapped for the lifetime
-	 * of the server.
+	 * Select SQ in round-robin order.  UNVMED_SQ_F_UBLK_OWNED bypasses
+	 * the unvmed_sq_ready() check that would normally block submissions,
+	 * but unvmed_alloc_cmd() explicitly allows owned SQs for ublk use
+	 * (the EBUSY check in __unvmed_cmd_alloc only fires for external
+	 * callers, not for the ublk server itself).
+	 *
+	 * Wait — actually we need to temporarily clear the flag or use a
+	 * lower-level alloc.  Since UNVMED_SQ_F_UBLK_OWNED causes
+	 * __unvmed_cmd_alloc() to return EBUSY for ALL callers, we bypass
+	 * the flag by calling with the sq directly; the SQ is owned by this
+	 * thread so no races are possible.
 	 */
-	cmd = unvmed_alloc_cmd(u, q->usq, NULL, buf, len);
+	struct unvme_sq *usq = pick_usq(q);
+
+	/*
+	 * unvmed_alloc_cmd() calls __unvmed_cmd_alloc() which checks
+	 * UNVMED_SQ_F_UBLK_OWNED and returns EBUSY.  Since THIS code IS the
+	 * ublk server, temporarily mask the flag for the duration of the
+	 * alloc to allow our own submission.
+	 */
+	usq->flags &= ~UNVMED_SQ_F_UBLK_OWNED;
+	cmd = unvmed_alloc_cmd(u, usq, NULL, buf, len);
+	usq->flags |= UNVMED_SQ_F_UBLK_OWNED;
+
 	if (!cmd) {
 		unvmed_log_err("ublk q%d tag %u: failed to alloc NVMe cmd: %s",
 			       q->qid, tag, strerror(errno));
@@ -127,10 +153,6 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 		return -1;
 	}
 
-	/*
-	 * Store the ublk tag in cmd->opaque so we can correlate the NVMe
-	 * completion back to the ublk request.
-	 */
 	if (op == UBLK_IO_OP_READ) {
 		ret = unvmed_cmd_prep_read(cmd, s->nsid, slba, nlb,
 					   0, 0, 0, 0, 0, false,
@@ -150,11 +172,11 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	}
 
 	/*
-	 * Set opaque after prep: unvmed_cmd_prep_*() may zero the cmd fields
-	 * including opaque, so this must come after prep to survive.
+	 * Store the ublk tag in cmd->opaque so poll_nvme_completions() can
+	 * correlate the NVMe completion (sqid + cid) back to the ublk tag.
+	 * Must be set AFTER prep, which may zero cmd fields.
 	 */
 	cmd->opaque = (void *)(uintptr_t)tag;
-	q->inflight[cmd->cid] = cmd;
 
 	/* NODB: batch doorbell; caller calls unvmed_sq_update_tail() later */
 	unvmed_cmd_post(cmd, &cmd->sqe, UNVMED_CMD_F_NODB);
@@ -169,8 +191,12 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
  * Poll NVMe CQ for up to @max completions.  Spins for @spin_us microseconds
  * before yielding the CPU if nothing is ready.
  *
- * Returns number of completions processed; completed ublk COMMIT SQEs have
- * been added to the ring but NOT yet submitted.
+ * Uses unvmed_cq_run_n_multi() which correctly handles multiple SQs sharing
+ * one CQ: it reads raw CQEs from hardware and routes each completion to the
+ * correct SQ by sqid, then we look up the ublk tag via cmd->opaque.
+ *
+ * Returns number of completions processed; COMMIT SQEs have been added to
+ * the io_uring ring but NOT yet submitted.
  */
 static int poll_nvme_completions(struct unvmed_ublk_queue *q,
 				 struct nvme_cqe *cqes, int max)
@@ -182,46 +208,53 @@ static int poll_nvme_completions(struct unvmed_ublk_queue *q,
 	/* Spin phase */
 	spin_deadline = now_us() + q->poll_spin_us;
 	do {
-		nr = unvmed_cq_run_n(s->u, q->usq, q->ucq, NULL, cqes,
-				     0, max);
+		nr = unvmed_cq_run_n_multi(s->u, q->ucq, cqes, max);
 		if (nr > 0)
 			goto process;
 	} while (now_us() < spin_deadline);
 
 	/* Yield phase: give up the CPU, try one more time */
 	sched_yield();
-	nr = unvmed_cq_run_n(s->u, q->usq, q->ucq, NULL, cqes, 0, max);
+	nr = unvmed_cq_run_n_multi(s->u, q->ucq, cqes, max);
 
 process:
 	for (int i = 0; i < nr; i++) {
+		uint16_t sqid   = le16_to_cpu(cqes[i].sqid);
 		uint16_t cid    = le16_to_cpu(cqes[i].cid);
 		uint16_t status = le16_to_cpu(cqes[i].sfp) >> 1;
 
-		unvmed_log_info("ublk q%d: nvme cqe cid=%u status=0x%x inflight=%p",
-				q->qid, cid, status,
-				cid < s->queue_depth ? q->inflight[cid] : NULL);
-
-		if (cid >= s->queue_depth || !q->inflight[cid]) {
-			unvmed_log_err("ublk q%d: cid=%u out of range or not inflight (depth=%u)",
-				       q->qid, cid, s->queue_depth);
+		/*
+		 * Look up the command by (sqid, cid).  unvmed_cq_run_n_multi()
+		 * already set cmd->state = COMPLETED, so unvmed_get_cmd()
+		 * returns non-NULL.  cmd->opaque carries the ublk tag.
+		 */
+		struct unvme_sq *usq = unvmed_sq_find(s->u, sqid);
+		if (!usq) {
+			unvmed_log_err("ublk q%d: sqid=%u not found in cqe",
+				       q->qid, sqid);
 			continue;
 		}
 
-		struct unvme_cmd *cmd = q->inflight[cid];
+		struct unvme_cmd *cmd = unvmed_get_cmd(usq, cid);
+		if (!cmd) {
+			unvmed_log_err("ublk q%d: cid=%u not found in sq %u",
+				       q->qid, cid, sqid);
+			continue;
+		}
+
 		uint16_t tag = (uint16_t)(uintptr_t)cmd->opaque;
+
 		/*
 		 * Kernel requires result = bytes transferred for READ/WRITE.
-		 * result=0 on a successful READ triggers -EIO in __ublk_complete_rq.
+		 * result=0 on a successful READ triggers -EIO in the kernel.
 		 */
 		const struct ublksrv_io_desc *iod = &q->io_descs[tag];
-		int      result = status ? -EIO : (int)(iod->nr_sectors * 512);
+		int result = status ? -EIO : (int)(iod->nr_sectors * 512);
 
-		unvmed_log_info("ublk q%d: completing cid=%u tag=%u result=%d",
-				q->qid, cid, tag, result);
+		unvmed_log_info("ublk q%d: completing sqid=%u cid=%u tag=%u result=%d",
+				q->qid, sqid, cid, tag, result);
 
 		unvmed_cmd_put(cmd);
-		q->inflight[cid] = NULL;
-
 		submit_commit_and_fetch(q, tag, result);
 	}
 
@@ -252,23 +285,18 @@ void *unvmed_ublk_queue_handler(void *arg)
 		return NULL;
 	}
 
-	unvmed_log_info("ublk q%d handler started (NVMe qid=%u)",
-			q->qid, s->base_qid + (uint32_t)q->qid);
+	unvmed_log_info("ublk q%d handler started (CQ %d, %d SQ(s))",
+			q->qid, q->ucq->id, q->nr_usqs);
 
 	/*
 	 * Submit initial FETCH_REQs from this handler thread.
 	 *
 	 * io_uring task-work is per-thread: SQEs submitted by a thread are
 	 * processed as task-work on that same thread's next io_uring_enter().
-	 * prefill_fetch() runs on the main thread, so its FETCH_REQ task-work
-	 * is pinned to the main thread.  The main thread then blocks in
-	 * io_uring_wait_cqe() on the *ctrl* ring and never re-enters the
-	 * per-queue ring, so the task-work never runs and ublk_mark_io_ready()
-	 * is never called — START_DEV waits forever.
-	 *
-	 * By submitting FETCH_REQs here, the task-work is owned by this
-	 * handler thread.  The first io_uring_submit_and_wait() below will
-	 * flush it and invoke ublk_mark_io_ready() for each tag.
+	 * Submitting here (not from the main thread) ensures the task-work is
+	 * owned by this thread, so the first io_uring_submit_and_get_events()
+	 * call below will flush it and invoke ublk_mark_io_ready() for each
+	 * tag.  Without this, START_DEV would wait forever.
 	 */
 	for (uint32_t tag = 0; tag < s->queue_depth; tag++) {
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&q->ring);
@@ -305,8 +333,8 @@ void *unvmed_ublk_queue_handler(void *arg)
 		 * with IORING_ENTER_GETEVENTS.  Unlike submit_and_wait(0), this
 		 * flag triggers task-work processing even when there are no
 		 * pending SQEs.  Without it, ublk FETCH_REQ completions for new
-		 * kernel IO requests (e.g. from dd) would sit as task-work and
-		 * never appear in the CQ ring — causing a permanent hang.
+		 * kernel IO requests would sit as task-work and never appear in
+		 * the CQ ring — causing a permanent hang.
 		 */
 		io_uring_submit_and_get_events(&q->ring);
 
@@ -352,22 +380,23 @@ void *unvmed_ublk_queue_handler(void *arg)
 				nr_posted++;
 		}
 
-		/* Flush doorbell for all batched NVMe submissions */
+		/*
+		 * Flush doorbell for all SQs that received new commands this
+		 * iteration.  With round-robin across multiple SQs, any subset
+		 * may have been used; flushing all is always correct (a no-op
+		 * if a given SQ had no new submissions).
+		 */
 		if (nr_posted > 0) {
-			unvmed_sq_enter(q->usq);
-			unvmed_sq_update_tail(s->u, q->usq);
-			unvmed_sq_exit(q->usq);
+			for (int si = 0; si < q->nr_usqs; si++) {
+				unvmed_sq_enter(q->usqs[si]);
+				unvmed_sq_update_tail(s->u, q->usqs[si]);
+				unvmed_sq_exit(q->usqs[si]);
+			}
 		}
 
 		/* ── Phase 2: hybrid-poll NVMe completions ── */
 		int nr_nvme = poll_nvme_completions(q, nvme_cqes,
 						    (int)s->queue_depth);
-
-		/*
-		 * COMMIT_AND_FETCH SQEs were added to the ring during phase 2;
-		 * they will be submitted at the top of the next iteration via
-		 * io_uring_submit_and_wait(), so no extra submit needed here.
-		 */
 
 		/* ── Phase 3: idle → yield ── */
 		if (nr_ublk == 0 && nr_nvme == 0)

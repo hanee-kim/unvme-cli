@@ -18,7 +18,6 @@ struct unvme_cq;
 struct unvme_msg;
 
 #define UNVMED_UBLK_MAX_QUEUES       32
-#define UNVMED_UBLK_DEF_NR_QUEUES   4
 #define UNVMED_UBLK_DEF_DEPTH       64
 #define UNVMED_UBLK_DEF_POLL_US     10   /* hybrid: spin 10 μs then yield */
 #define UNVMED_UBLK_MAX_IO_SIZE     (512 * 1024)  /* bounce buf slot cap */
@@ -26,8 +25,14 @@ struct unvme_msg;
 #define UBLK_CTRL_DEV               "/dev/ublk-control"
 
 /*
- * Per-queue state.  One handler thread owns each queue exclusively;
- * no locking needed on the hot I/O path.
+ * Per-queue state.  One handler thread owns each ublk queue, which maps 1:1
+ * to an existing NVMe CQ.  Multiple NVMe SQs may share that CQ; submissions
+ * are round-robined across usqs[0..nr_usqs-1].
+ *
+ * The server does NOT create new NVMe queues — it reuses the I/O CQs (and
+ * their associated SQs) that the user created before starting the server.
+ * All those SQs are marked UNVMED_SQ_F_UBLK_OWNED while the server runs,
+ * preventing direct I/O commands from racing with ublk submissions.
  */
 struct unvmed_ublk_queue {
 	struct unvmed_ublk_server  *server;
@@ -39,9 +44,15 @@ struct unvmed_ublk_queue {
 	/* per-queue ublk char device fd (/dev/ublkc<dev_id>) */
 	int                         dev_fd;
 
-	/* NVMe queue pair: 1:1 dedicated, lock-free hot path */
-	struct unvme_sq            *usq;
+	/*
+	 * NVMe CQ polled by this thread (reuses an existing user-created CQ).
+	 * Submissions round-robin across usqs[0..nr_usqs-1], all of which
+	 * share this CQ.
+	 */
 	struct unvme_cq            *ucq;
+	struct unvme_sq           **usqs;     /* SQs whose ucq == this->ucq */
+	int                         nr_usqs;
+	int                         next_usq; /* round-robin cursor */
 
 	/*
 	 * Bounce buffer: one contiguous IOMMU-mapped region split into
@@ -64,9 +75,6 @@ struct unvmed_ublk_queue {
 	struct ublksrv_io_desc     *io_descs;     /* mmap base for this queue */
 	size_t                      io_descs_size;/* bytes mmap'd */
 
-	/* inflight NVMe command indexed by ublk tag */
-	struct unvme_cmd          **inflight;     /* [queue_depth] */
-
 	uint32_t                    poll_spin_us;
 
 	pthread_t                   thread;
@@ -84,6 +92,9 @@ struct unvmed_ublk_queue {
 /*
  * Top-level ublk server: manages the ublk device lifecycle and
  * coordinates all per-queue handler threads.
+ *
+ * Queues reuse existing user-created NVMe I/O CQs (and their associated SQs).
+ * One handler thread is started per existing I/O CQ.
  */
 struct unvmed_ublk_server {
 	struct unvme               *u;
@@ -108,30 +119,27 @@ struct unvmed_ublk_server {
 	struct unvmed_ublk_queue   *queues[UNVMED_UBLK_MAX_QUEUES];
 
 	_Atomic bool                running;
-
-	/* first NVMe qid allocated for this server (ublk queues: base_qid..base_qid+nr_queues-1) */
-	uint32_t                    base_qid;
 };
 
 /*
  * Start a ublk server on top of the given unvme controller.
  *
- * Creates /dev/ublkb<id>, allocates NVMe I/O queues, pre-maps bounce
- * buffers, starts per-queue handler threads, and makes the block device
- * live.  The server runs in the background; caller must call
- * unvmed_ublk_server_stop() to tear it down.
+ * Reuses all existing user-created NVMe I/O CQs (and their SQs) — one
+ * handler thread per CQ.  All reused SQs are marked UNVMED_SQ_F_UBLK_OWNED
+ * to block direct I/O while the server runs.  The ublk block device is
+ * made live as /dev/ublkb<N>.  Call unvmed_ublk_server_stop() to tear it down.
  *
  * Returns the server handle on success, NULL on error with errno set.
  */
 struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 						    uint32_t nsid,
-						    uint32_t nr_queues,
 						    uint32_t queue_depth,
 						    uint32_t poll_spin_us);
 
 /*
  * Stop the server: signals handler threads, drains in-flight NVMe commands,
- * issues STOP_DEV / DEL_DEV, unmaps buffers, frees all resources.
+ * issues STOP_DEV / DEL_DEV, unmaps buffers, clears UNVMED_SQ_F_UBLK_OWNED
+ * on all reused SQs, frees all resources.
  */
 int unvmed_ublk_server_stop(struct unvmed_ublk_server *server);
 
