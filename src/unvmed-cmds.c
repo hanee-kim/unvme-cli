@@ -4,6 +4,7 @@
 #endif
 
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include "libunvmed-private.h"
 #include "unvme.h"
 #include "unvmed.h"
+#include "unvmed-ublk.h"
 
 #include <argtable3.h>
 
@@ -4793,4 +4795,110 @@ buf:
 out:
 	unvme_free_args(argtable);
 	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* ublk-server command                                                  */
+/* ------------------------------------------------------------------ */
+
+int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
+{
+	const char *desc =
+		"Expose a NVMe namespace as a ublk block device (/dev/ublkbN).\n"
+		"Runs in the background inside unvmed; use 'unvme ublk-stop'\n"
+		"to tear it down.";
+
+	struct arg_rex *dev      = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN,
+					    "<device>", 0, "[M] Device BDF");
+	struct arg_int *nsid     = arg_int0("n", "nsid", "<n>",
+					    "[O] Namespace ID (default: 1)");
+	struct arg_int *qdepth   = arg_int0("d", "queue-depth", "<n>",
+					    "[O] Queue depth per ublk queue (default: 64)");
+	struct arg_int *spin_us  = arg_int0(NULL, "poll-spin-us", "<n>",
+					    "[O] NVMe CQ spin time in us before yield (default: 10)");
+	struct arg_lit *help     = arg_lit0("h", "help", "Show help message");
+	struct arg_end *end      = arg_end(UNVME_ARG_MAX_ERROR);
+
+	void *argtable[] = { dev, nsid, qdepth, spin_us, help, end };
+
+	arg_intv(nsid)    = 1;
+	arg_intv(qdepth)  = UNVMED_UBLK_DEF_DEPTH;
+	arg_intv(spin_us) = UNVMED_UBLK_DEF_POLL_US;
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	struct unvme *u = unvmed_get(arg_strv(dev));
+	if (!u) {
+		unvme_pr_err("%s is not added to unvmed\n", arg_strv(dev));
+		unvme_free_args(argtable);
+		return ENODEV;
+	}
+
+	if (arg_intv(qdepth) < 1 || arg_intv(nsid) < 1) {
+		unvme_pr_err("invalid ublk-server arguments\n");
+		unvme_free_args(argtable);
+		return EINVAL;
+	}
+
+	if (unvmed_ublk_find_server(u)) {
+		unvme_pr_err("ublk server already running for %s\n", arg_strv(dev));
+		unvme_free_args(argtable);
+		return EEXIST;
+	}
+
+	struct unvmed_ublk_server *server =
+		unvmed_ublk_server_start(u,
+					 (uint32_t)arg_intv(nsid),
+					 (uint32_t)arg_intv(qdepth),
+					 (uint32_t)arg_intv(spin_us));
+	if (!server) {
+		if (errno == ENOENT)
+			unvme_pr_err("failed to start ublk server: 'ublk-drv' kernel module is not loaded.  Try 'modprobe ublk-drv'.\n");
+		else
+			unvme_pr_err("failed to start ublk server: %s\n",
+				     strerror(errno));
+		unvme_free_args(argtable);
+		return errno ? errno : EIO;
+	}
+
+	unvme_pr("ublk server running on /dev/ublkb%d\n", server->dev_id);
+	unvme_free_args(argtable);
+	return 0;
+}
+
+/* ublk-stop command                                                    */
+/* ------------------------------------------------------------------ */
+
+int unvme_ublk_stop(int argc, char *argv[], struct unvme_msg *msg)
+{
+	const char *desc = "Stop the ublk server for the given NVMe device.";
+
+	struct arg_rex *dev  = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN,
+					"<device>", 0, "[M] Device BDF");
+	struct arg_lit *help = arg_lit0("h", "help", "Show help message");
+	struct arg_end *end  = arg_end(UNVME_ARG_MAX_ERROR);
+
+	void *argtable[] = { dev, help, end };
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	struct unvme *u = unvmed_get(arg_strv(dev));
+	if (!u) {
+		unvme_pr_err("%s is not added to unvmed\n", arg_strv(dev));
+		unvme_free_args(argtable);
+		return ENODEV;
+	}
+
+	struct unvmed_ublk_server *server = unvmed_ublk_find_server(u);
+	if (!server) {
+		unvme_pr_err("no ublk server running for %s\n", arg_strv(dev));
+		unvme_free_args(argtable);
+		return ENODEV;
+	}
+
+	unvmed_ublk_server_stop(server);
+	unvme_pr("ublk server stopped\n");
+
+	unvme_free_args(argtable);
+	return 0;
 }
