@@ -23,6 +23,7 @@
 #include "libunvmed.h"
 #include "unvme.h"
 #include "unvmed.h"
+#include "ublk/unvmed-ublk.h"
 
 struct unvme_job {
 	int client_pid;
@@ -312,6 +313,15 @@ static void unvme_release(int signum)
 		free(__libfio);
 		__libfio = NULL;
 	}
+
+	/*
+	 * Stop all active ublk servers before freeing NVMe controllers.
+	 * Queue handler threads hold references to NVMe SQ/CQ structures;
+	 * without this, unvmed_free_ctrl_all() would free memory that the
+	 * handler threads are still accessing, causing use-after-free and
+	 * D-state processes that can't be killed.
+	 */
+	unvmed_ublk_stop_all_servers();
 
 	unvmed_free_ctrl_all();
 
