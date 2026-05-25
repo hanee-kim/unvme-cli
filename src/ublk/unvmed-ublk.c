@@ -582,16 +582,11 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 			if (ucq->id == 0)
 				continue;  /* skip admin CQ */
 
-			if (unvmed_cq_irq_enabled(ucq)) {
-				unvmed_log_err("ublk: CQ %d uses interrupts "
-					       "(vector=%d); ublk requires "
-					       "polling CQs (vector=-1)",
-					       ucq->id, ucq->vector);
-				free(all_cqs);
-				free(io_cqs);
-				errno = EINVAL;
-				return NULL;
-			}
+			if (unvmed_cq_irq_enabled(ucq))
+				unvmed_log_info("ublk: CQ %d is IRQ-mode "
+						"(vector=%d); ublk will poll it "
+						"directly via unvmed_cq_run_n_multi",
+						ucq->id, ucq->vector);
 
 			io_cqs[nr_queues++] = ucq;
 		}
