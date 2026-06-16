@@ -806,6 +806,19 @@ static inline int unvmed_put_reaper(struct unvme *u, int vector)
 	return atomic_dec_fetch(&u->reapers[vector].refcnt);
 }
 
+/*
+ * refcnt semantics for struct unvme_cq_reaper:
+ *   0      : reaper not initialized (caller-efd mode or not yet init'd)
+ *   1      : reaper initialized, no CQ attached
+ *   n >= 2 : reaper initialized, (n - 1) CQs attached
+ */
+static inline bool unvmed_reaper_alive(struct unvme *u, int vector)
+{
+	if (vector < 0 || vector >= u->nr_efds)
+		return false;
+	return atomic_load_acquire(&u->reapers[vector].refcnt);
+}
+
 static int unvmed_init_efd(struct unvme *u, int vector)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
@@ -855,6 +868,7 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 
 	r->u = u;
 	r->vector = vector;
+	r->refcnt = 1;	/* refcnt=1: initialized, no CQ attached yet */
 
 	list_head_init(&r->cq_list);
 	pthread_mutex_init(&r->cq_list_lock, NULL);
@@ -959,12 +973,13 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 	if (!atomic_load_acquire(&r->refcnt))
 		return 0;
 
-	if (unvmed_put_reaper(u, vector) > 0)
+	/* refcnt > 1 means CQs are still attached; defer teardown. */
+	if (unvmed_put_reaper(u, vector) > 1)
 		return 0;
 
 	/*
-	 * Wake up the blocking threads waiting for the interrupt
-	 * events from the device.
+	 * refcnt reached 1 (no CQs left); wake up the reaper thread and
+	 * tear down the reaper.
 	 */
 	eventfd_write(r->efd, 1);
 	pthread_join(r->th, NULL);
@@ -979,7 +994,7 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 	return 0;
 }
 
-static int unvmed_init_irq(struct unvme *u, int vector)
+static int __unvmed_init_irq(struct unvme *u, int vector, int efd)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
 	int nr_irqs = u->nr_irqs;
@@ -990,12 +1005,26 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 		return -1;
 	}
 
-	if (unvmed_get_reaper(u, vector) > 1)
-		return 0;
+	if (u->efds[vector] >= 0) {
+		bool was_caller_efd = !atomic_load_acquire(&r->refcnt);
+		bool now_caller_efd = (efd >= 0);
 
-	if (unvmed_init_irq_reaper(u, vector)) {
-		unvmed_log_err("%s: failed to initialize IRQ reaper (vector=%d)", unvmed_bdf(u), vector);
-		return -1;
+		if (was_caller_efd != now_caller_efd) {
+			unvmed_log_err("%s: vector=%d already initialized with "
+					"different efd", unvmed_bdf(u), vector);
+			errno = EINVAL;
+			return -1;
+		}
+		return 0;
+	}
+
+	if (efd >= 0)
+		u->efds[vector] = efd;
+	else {
+		if (unvmed_init_irq_reaper(u, vector)) {
+			unvmed_log_err("%s: failed to initialize IRQ reaper (vector=%d)", unvmed_bdf(u), vector);
+			return -1;
+		}
 	}
 
 	/*
@@ -1005,19 +1034,27 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 	 */
 	if (vfio_disable_irq(&u->ctrl.pci.dev, 0, u->nr_irqs)) {
 		unvmed_log_err("%s: failed to disable all irq vectors", unvmed_bdf(u));
-
-		unvmed_free_irq_reaper(r);
+		if (unvmed_reaper_alive(u, vector))
+			unvmed_free_irq_reaper(r);
+		else
+			u->efds[vector] = -1;
 		return -1;
 	}
 
 	if (vfio_set_irq(&u->ctrl.pci.dev, &u->efds[0], 0, nr_irqs)) {
 		unvmed_log_err("%s: failed to set IRQ for vector %d", unvmed_bdf(u), vector);
-
-		unvmed_free_irq_reaper(r);
+		if (unvmed_reaper_alive(u, vector))
+			unvmed_free_irq_reaper(r);
+		else
+			u->efds[vector] = -1;
 		return -1;
 	}
 
-	pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
+	if (efd < 0)
+		pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
+	else
+		unvmed_log_info("%s: disabled reaper thread %d", unvmed_bdf(u), vector);
+
 	return 0;
 }
 
@@ -2790,7 +2827,7 @@ static void unvmed_cq_drain(struct unvme *u, struct unvme_cq *ucq)
 	uint32_t head;
 	uint8_t phase;
 
-	if (unvmed_cq_irq_enabled(ucq)) {
+	if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq))) {
 		struct unvme_cq_reaper *r = &u->reapers[unvmed_cq_iv(ucq)];
 
 		eventfd_write(r->efd, 1);  /* Wake up reaper thread */
@@ -3079,7 +3116,8 @@ static void *unvmed_reaper_run(void *opaque)
 		if (unvmed_cq_wait_irq(u, vector))
 			goto out;
 
-		if (!atomic_load_acquire(&r->refcnt))
+		/* refcnt == 1 means no CQs attached; reaper is being torn down. */
+		if (atomic_load_acquire(&r->refcnt) <= 1)
 			goto out;
 
 		if (__unvmed_ctrl_get_state(u) == UNVME_TEARDOWN)
@@ -3367,9 +3405,10 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 	uint16_t qflags = 0;
 	uint16_t iv = 0;
 
-	if (vector >= 0 && unvmed_init_irq(u, vector)) {
-		unvmed_log_err("%s: failed to initialize irq (nr_irqs=%d, vector=%d, errno=%d \"%s\")",
-				unvmed_bdf(u), u->nr_irqs, vector, errno, strerror(errno));
+	if (vector >= 0 && u->efds[vector] < 0) {
+		unvmed_log_err("%s: vector=%d not initialized; call unvmed_init_irq() first",
+				unvmed_bdf(u), vector);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -3457,13 +3496,18 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 	if (vector < 0) {
 		ucq->q->vector = -1;
 		unvmed_cq_iv(ucq) = -1;
-	} else if (vector >= 0 && unvmed_reaper_add_cq(u, ucq)) {
-		unvmed_log_err("%s: failed to register ucq to reaper (qid=%d)",
-				unvmed_bdf(u), qid);
-		unvmed_cmd_put(cmd);
-		nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
-		unvmed_sq_put(u, asq);
-		return -1;
+	} else {
+		struct unvme_cq_reaper *r = unvmed_get_reaper(u, vector);
+
+		if (r && unvmed_reaper_add_cq(u, ucq)) {
+			unvmed_log_err("%s: failed to register ucq to reaper (qid=%d)",
+					unvmed_bdf(u), qid);
+			unvmed_put_reaper(r);
+			unvmed_cmd_put(cmd);
+			nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
+			unvmed_sq_put(u, asq);
+			return -1;
+		}
 	}
 
 	unvmed_enable_cq(ucq);
@@ -3479,7 +3523,7 @@ static void __unvmed_delete_cq(struct unvme *u, struct unvme_cq *ucq)
 	int vector = unvmed_cq_iv(ucq);
 	bool irq = unvmed_cq_irq_enabled(ucq);
 
-	if (irq)
+	if (irq && unvmed_reaper_alive(u, vector))
 		unvmed_reaper_del_cq(u, ucq);
 
 	unvmed_discard_cq(u, qid);
@@ -3503,7 +3547,8 @@ static void __unvmed_delete_cq_all(struct unvme *u)
 		if (!ucq)
 			continue;
 
-		unvmed_reaper_del_cq(u, ucq);
+		if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq)))
+			unvmed_reaper_del_cq(u, ucq);
 
 		unvmed_log_info("%s: Deleting ucq (qid=%d)", unvmed_bdf(u), unvmed_cq_id(ucq));
 
@@ -4800,6 +4845,7 @@ int unvmed_ctx_init(struct unvme *u)
 		ctx->cq.qsize = unvmed_cq_size(ucq);
 		ctx->cq.vector = unvmed_cq_iv(ucq);
 		ctx->cq.pc = ucq->pc;
+		ctx->cq.efd = unvmed_reaper_alive(u, unvmed_cq_iv(ucq)) ? -1 : u->efds[unvmed_cq_iv(ucq)];
 
 		list_add_tail(&u->ctx_list, &ctx->list);
 		unvmed_cq_put(u, ucq);
@@ -4831,6 +4877,8 @@ static int __unvmed_ctx_restore(struct unvme *u, struct unvme_ctx *ctx)
 {
 	switch (ctx->type) {
 		case UNVME_CTX_T_CTRL:
+			if (ctx->ctrl.admin_irq && unvmed_init_irq(u, 0, -1))
+				return -1;
 			if (unvmed_create_adminq(u, ctx->ctrl.sq_size,
 						ctx->ctrl.cq_size,
 						ctx->ctrl.admin_irq))
@@ -4845,6 +4893,8 @@ static int __unvmed_ctx_restore(struct unvme *u, struct unvme_ctx *ctx)
 				return ret;
 			return unvmed_init_meta_ns(u, ctx->ns.nsid, NULL);
 		case UNVME_CTX_T_CQ:
+			if (ctx->cq.vector >= 0 && unvmed_init_irq(u, ctx->cq.vector, ctx->cq.efd))
+				return -1;
 			return unvmed_create_cq(u, ctx->cq.qid, ctx->cq.qsize,
 					ctx->cq.vector, ctx->cq.pc);
 		case UNVME_CTX_T_SQ:
@@ -5187,9 +5237,10 @@ static struct unvme_cq *__unvmed_init_cq(struct unvme *u, uint32_t qid, uint32_t
 {
 	struct unvme_cq *ucq;
 
-	if (vector >= 0 && unvmed_init_irq(u, vector)) {
-		unvmed_log_err("%s: failed to initialize irq (nr_irqs=%d, vector=%d, errno=%d \"%s\")",
-				unvmed_bdf(u), u->nr_irqs, vector, errno, strerror(errno));
+	if (vector >= 0 && u->efds[vector] < 0) {
+		unvmed_log_err("%s: vector=%d not initialized; call unvmed_init_irq() first",
+				unvmed_bdf(u), vector);
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -5216,9 +5267,14 @@ static struct unvme_cq *__unvmed_init_cq(struct unvme *u, uint32_t qid, uint32_t
 	if (vector < 0)
 		unvmed_cq_iv(ucq) = -1;
 
-	if (vector >= 0 && unvmed_reaper_add_cq(u, ucq)) {
-		unvmed_log_err("%s: failed to register ucq to reaper", unvmed_bdf(u));
-		return NULL;
+	if (vector >= 0) {
+		struct unvme_cq_reaper *r = unvmed_get_reaper(u, vector);
+
+		if (r && unvmed_reaper_add_cq(u, ucq)) {
+			unvmed_log_err("%s: failed to register ucq to reaper", unvmed_bdf(u));
+			unvmed_put_reaper(r);
+			return NULL;
+		}
 	}
 
 	return ucq;
@@ -5582,4 +5638,15 @@ struct json_object *unvmed_to_json(struct unvme *u)
 	free(usqs);
 
 	return status;
+}
+
+int unvmed_init_irq(struct unvme *u, int vector, int efd)
+{
+	if (vector < 0 || vector >= u->nr_efds) {
+		unvmed_log_err("%s: invalid vector %d", unvmed_bdf(u), vector);
+		errno = EINVAL;
+		return -1;
+	}
+
+	return __unvmed_init_irq(u, vector, efd);
 }

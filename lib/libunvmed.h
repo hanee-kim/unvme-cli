@@ -3116,4 +3116,23 @@ void unvmed_del_thread(struct unvme *u);
  */
 struct json_object *unvmed_to_json(struct unvme *u);
 
+/**
+ * unvmed_init_irq - Initialize interrupt routing for a vector
+ * @u: &struct unvme
+ * @vector: interrupt vector (0 <= vector < nr_irqs)
+ * @efd: caller-supplied eventfd, or -1
+ *
+ * When @efd is -1, libunvmed creates its own eventfd and starts a reaper
+ * thread per a vector.
+ *
+ * When @efd >= 0, VFIO is wired to the caller's eventfd and no reaper thread
+ * is started.  The caller owns the fd and libunvmed will never close it.
+ *
+ * Must be called before unvmed_create_cq() / unvmed_init_cq() for the same
+ * vector.
+ *
+ * Return: 0 on success, ``-1`` with ``errno`` set on failure.
+ */
+int unvmed_init_irq(struct unvme *u, int vector, int efd);
+
 #endif

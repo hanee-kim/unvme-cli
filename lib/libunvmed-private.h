@@ -201,6 +201,7 @@ struct unvme_ctx {
 			uint32_t qsize;
 			int vector;
 			uint32_t pc;
+			int efd;
 		} cq;
 
 		struct {
