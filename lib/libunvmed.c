@@ -921,7 +921,6 @@ static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
 
 	unvmed_free_efd(r->efd, r->epoll_fd);
 
-	r->u->efds[r->vector] = -1;
 	memset(r, 0, sizeof(*r));
 }
 
@@ -1004,6 +1003,7 @@ static int __unvmed_free_irq(struct unvme *u, int vector)
 	}
 
 	unvmed_free_irq_reaper(r);
+	u->efds[vector] = -1;
 	return 0;
 }
 
@@ -1066,12 +1066,14 @@ static int __unvmed_init_irq(struct unvme *u, int vector)
 	if (vfio_disable_irq(&u->ctrl.pci.dev, 0, u->nr_irqs)) {
 		unvmed_log_err("%s: failed to disable all irq vectors", unvmed_bdf(u));
 		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
 		return -1;
 	}
 
 	if (vfio_set_irq(&u->ctrl.pci.dev, &u->efds[0], 0, nr_irqs)) {
 		unvmed_log_err("%s: failed to set IRQ for vector %d", unvmed_bdf(u), vector);
 		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
 		return -1;
 	}
 
@@ -1081,6 +1083,7 @@ static int __unvmed_init_irq(struct unvme *u, int vector)
 				unvmed_bdf(u), vector, ret, strerror(ret));
 		vfio_disable_irq(&u->ctrl.pci.dev, vector, 1);
 		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
 		errno = ret;
 		return -1;
 	}
