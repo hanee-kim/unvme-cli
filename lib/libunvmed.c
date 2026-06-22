@@ -796,6 +796,16 @@ ssize_t unvmed_get_max_xfer_size(struct unvme *u)
 	return (1ULL << u->id_ctrl->mdts) * unvmed_pagesize(u);
 }
 
+static inline int unvmed_get_reaper(struct unvme *u, int vector)
+{
+	return atomic_inc_fetch(&u->reapers[vector].refcnt);
+}
+
+static inline int unvmed_put_reaper(struct unvme *u, int vector)
+{
+	return atomic_dec_fetch(&u->reapers[vector].refcnt);
+}
+
 static int unvmed_init_efd(struct unvme *u, int vector)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
@@ -949,7 +959,7 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 	if (!atomic_load_acquire(&r->refcnt))
 		return 0;
 
-	if (atomic_dec_fetch(&r->refcnt) > 0)
+	if (unvmed_put_reaper(u, vector) > 0)
 		return 0;
 
 	/*
@@ -980,7 +990,7 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 		return -1;
 	}
 
-	if (atomic_inc_fetch(&r->refcnt) > 1)
+	if (unvmed_get_reaper(u, vector) > 1)
 		return 0;
 
 	if (unvmed_init_irq_reaper(u, vector)) {
@@ -1093,7 +1103,7 @@ static void unvmed_free_irq_all(struct unvme *u)
 		 * teardown would leave its thread running on freed memory.
 		 */
 		while (atomic_load_acquire(&r->refcnt) > 1)
-			atomic_dec_fetch(&r->refcnt);
+			unvmed_put_reaper(u, vector);
 
 		unvmed_free_irq(u, vector);
 	}
