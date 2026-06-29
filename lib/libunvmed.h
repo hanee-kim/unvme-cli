@@ -2370,6 +2370,54 @@ int unvmed_hot_reset(struct unvme *u);
 int unvmed_link_disable(struct unvme *u);
 
 /**
+ * unvmed_pci_remove - Remove a PCIe device from the PCI bus via sysfs
+ * @bdf: BDF string of the device (e.g., "0000:01:00.0")
+ *
+ * Writes "1" to /sys/bus/pci/devices/@bdf/remove to hot-remove the device.
+ * Used as the first sysfs step of the SPOR recovery sequence.
+ *
+ * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
+ */
+int unvmed_pci_remove(const char *bdf);
+
+/**
+ * unvmed_pci_rescan - Trigger PCI bus rescan via sysfs
+ *
+ * Writes "1" to /sys/bus/pci/rescan to re-enumerate all PCIe devices.
+ * After SPOR with MPF, this causes the original PF and any newly created
+ * PFs to reappear in sysfs.
+ *
+ * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
+ */
+int unvmed_pci_rescan(void);
+
+/**
+ * unvmed_spor - Re-initialize VFIO device and IRQ state after SPOR
+ * @u: &struct unvme instance that was open before SPOR
+ * @nr_ioqs: number of I/O queues to configure on reopen (0 = reuse saved value)
+ * @timeout_ms: milliseconds to wait for device to reappear in sysfs after rescan
+ *
+ * SPOR (Surprise Power Off Reset) invalidates the existing VFIO fd and
+ * resets vfio-pci's internal IRQ state back to INTx (count=1).  Attempting
+ * disable(N) on the stale fd therefore fails with -EINVAL.
+ *
+ * This function performs the correct recovery sequence:
+ *   1. Free IRQs and close the stale VFIO fd
+ *   2. Remove the device from the PCI bus via sysfs
+ *   3. Rescan the PCI bus (re-enumerates device + any new MPF PFs)
+ *   4. Rebind to vfio-pci
+ *   5. Reopen a fresh VFIO fd
+ *   6. Re-allocate IRQs (vfio-pci now reports the correct MSI-X count)
+ *
+ * On success @u is updated in-place with the refreshed VFIO state.
+ * Any new PFs created by MPF will appear in sysfs after step 3 but must
+ * be added separately with unvmed_init_ctrl().
+ *
+ * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
+ */
+int unvmed_spor(struct unvme *u, uint32_t nr_ioqs, unsigned int timeout_ms);
+
+/**
  * unvmed_ctx_init - Snapshot current driver context
  * @u: &struct unvme
  *

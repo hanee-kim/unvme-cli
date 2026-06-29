@@ -67,6 +67,7 @@ static struct command cmds[] = {
 	{"flr",			"PCI Function Level Reset",				UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_flr},
 	{"hot-reset",		"PCI Hot reset to downstream port",			UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_hot_reset},
 	{"link-disable",	"PCI Link disable to downstream port",			UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_link_disable},
+	{"spor",		"Re-init VFIO IRQ state after Surprise Power Off Reset",	UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_spor},
 	{"malloc",		"Allocate I/O memory buffer",				UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_malloc},
 	{"mfree",		"Free I/O memory buffer",				UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_mfree},
 	{"mread",		"Read from I/O memory buffer",				UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_mread},

@@ -3814,6 +3814,61 @@ out:
 	return ret;
 }
 
+int unvme_spor(int argc, char *argv[], struct unvme_msg *msg)
+{
+	const char *desc =
+		"Re-initialize VFIO device and IRQ state after Surprise Power Off\n"
+		"Reset (SPOR).  SPOR invalidates the existing VFIO fd and resets\n"
+		"vfio-pci IRQ state back to INTx (count=1), causing subsequent\n"
+		"disable(N) calls to fail with EINVAL.\n"
+		"\n"
+		"Performs the correct recovery sequence:\n"
+		"  1. Close existing VFIO fd\n"
+		"  2. Remove device from PCI bus via sysfs\n"
+		"  3. Rescan PCI bus (re-enumerates device + any new MPF PFs)\n"
+		"  4. Rebind to vfio-pci\n"
+		"  5. Open new VFIO fd\n"
+		"  6. Verify IRQ count and re-set MSI-X vectors";
+
+	struct arg_rex *dev = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN, "<device>", 0,
+			"[M] Device bdf");
+	struct arg_int *timeout = arg_int0("t", "timeout", "<ms>",
+			"[O] Timeout (ms) to wait for device to reappear after rescan "
+			"(default: 5000)");
+	struct arg_lit *help = arg_lit0("h", "help", "Show help message");
+	struct arg_end *end = arg_end(UNVME_ARG_MAX_ERROR);
+	void *argtable[] = {dev, timeout, help, end};
+
+	struct unvme *u;
+	int ret = 0;
+
+	arg_intv(timeout) = 5000;
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	u = unvmed_get(arg_strv(dev));
+	if (!u) {
+		unvme_pr_err("%s is not added to unvmed\n", arg_strv(dev));
+		ret = ENODEV;
+		goto out;
+	}
+
+	ret = unvmed_spor(u, 0, (unsigned int)arg_intv(timeout));
+	if (ret) {
+		unvme_pr_err("failed to re-initialize %s after SPOR: %s\n",
+				arg_strv(dev), strerror(errno));
+		ret = errno;
+		goto out;
+	}
+
+	unvme_pr("%s: SPOR re-init complete: nr_irqs=%d (vfio-pci count=%d)\n",
+			arg_strv(dev), unvmed_nr_irqs(u), u->irq_info.count);
+
+out:
+	unvme_free_args(argtable);
+	return ret;
+}
+
 int unvme_virt_mgmt(int argc, char *argv[], struct unvme_msg *msg)
 {
 	const char *desc = "Submit a Virtualization management command, which is"

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <vfn/nvme.h>
+#include <vfn/pci.h>
 #include <vfn/support/atomic.h>
 #include <vfn/vfio/pci.h>
 #include <vfn/pci/util.h>
@@ -3839,6 +3840,198 @@ close:
 free:
 	free(path);
 	return ret;
+}
+
+static int unvmed_pci_sysfs_write(const char *path, const char *value)
+{
+	int fd;
+	ssize_t ret;
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+
+	ret = write(fd, value, strlen(value));
+	close(fd);
+	return ret < 0 ? -1 : 0;
+}
+
+/*
+ * Poll sysfs until the device config space file appears or timeout expires.
+ * Used after PCI rescan to confirm device has been re-enumerated.
+ */
+static int unvmed_pci_wait_accessible(const char *bdf, unsigned int timeout_ms)
+{
+	char *path = NULL;
+	struct timespec start, now;
+	unsigned long elapsed_ms;
+	int fd;
+	int ret = -1;
+
+	if (asprintf(&path, "/sys/bus/pci/devices/%s/config", bdf) < 0)
+		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	while (true) {
+		fd = open(path, O_RDONLY);
+		if (fd >= 0) {
+			close(fd);
+			ret = 0;
+			break;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		elapsed_ms = (unsigned long)(now.tv_sec - start.tv_sec) * 1000 +
+			     (unsigned long)(now.tv_nsec - start.tv_nsec) / 1000000;
+
+		if (elapsed_ms >= timeout_ms) {
+			errno = ETIMEDOUT;
+			break;
+		}
+
+		usleep(10 * 1000);
+	}
+
+	free(path);
+	return ret;
+}
+
+int unvmed_pci_remove(const char *bdf)
+{
+	char *path = NULL;
+	int ret;
+
+	if (asprintf(&path, "/sys/bus/pci/devices/%s/remove", bdf) < 0)
+		return -1;
+
+	ret = unvmed_pci_sysfs_write(path, "1");
+	free(path);
+	return ret;
+}
+
+int unvmed_pci_rescan(void)
+{
+	return unvmed_pci_sysfs_write("/sys/bus/pci/rescan", "1");
+}
+
+int unvmed_spor(struct unvme *u, uint32_t nr_ioqs, unsigned int timeout_ms)
+{
+	/*
+	 * BDF string must be copied before nvme_close() because
+	 * unvmed_bdf(u) points into u->ctrl.pci which is freed/zeroed below.
+	 */
+	char bdf[16];
+	struct nvme_ctrl_opts opts;
+
+	/*
+	 * SPOR causes vfio-pci to reset its internal IRQ state to INTx
+	 * (count=1).  Trying to disable the previously configured MSI-X
+	 * vectors on the same stale fd fails with -EINVAL.
+	 *
+	 * Recovery requires tearing down the existing VFIO fd completely,
+	 * removing the device from the PCI bus, rescanning (which also
+	 * re-enumerates any new PFs created by MPF), rebinding to vfio-pci,
+	 * and reopening a fresh fd.  Only then can IRQs be set correctly.
+	 */
+
+	if (!unvmed_ctrl_set_state(u, UNVME_RESETTING)) {
+		errno = EBUSY;
+		return -1;
+	}
+
+	/* Copy BDF and save opts before any teardown. */
+	snprintf(bdf, sizeof(bdf), "%s", unvmed_bdf(u));
+	opts = u->ctrl.opts;
+	if (!nr_ioqs)
+		nr_ioqs = opts.nsqr + 1;
+
+	/* Step 1: free IRQs and close the stale VFIO fd. */
+	unvmed_log_info("%s: freeing IRQs and closing VFIO fd", bdf);
+	unvmed_free_irqs(u);
+	nvme_close(&u->ctrl);
+
+	/* Step 2: remove from PCI bus. */
+	unvmed_log_info("%s: removing from PCI bus via sysfs", bdf);
+	if (unvmed_pci_remove(bdf)) {
+		unvmed_log_err("%s: failed to remove from PCI bus", bdf);
+		return -1;
+	}
+
+	/* Step 3: rescan (re-enumerates device and any new MPF PFs). */
+	unvmed_log_info("%s: triggering PCI rescan", bdf);
+	if (unvmed_pci_rescan()) {
+		unvmed_log_err("%s: failed to trigger PCI rescan", bdf);
+		return -1;
+	}
+
+	/*
+	 * Wait for the original BDF to reappear in sysfs.  New MPF PFs will
+	 * also appear but the caller is responsible for adding those.
+	 */
+	unvmed_log_info("%s: waiting for device to reappear (timeout=%ums)", bdf, timeout_ms);
+	if (unvmed_pci_wait_accessible(bdf, timeout_ms)) {
+		unvmed_log_err("%s: device did not reappear after rescan (timeout=%ums)",
+				bdf, timeout_ms);
+		return -1;
+	}
+
+	/*
+	 * Step 4: rebind to vfio-pci.
+	 *
+	 * Mirror the logic from unvmed_pci_bind() in unvmed-cmds.c:
+	 * register the vendor:device with new_id first (triggers auto-bind);
+	 * if that fails or is insufficient, fall back to an explicit bind.
+	 */
+	unvmed_log_info("%s: rebinding to vfio-pci", bdf);
+	{
+		unsigned long long vendor = 0, device_id = 0;
+
+		pci_unbind(bdf);
+
+		if (!pci_device_info_get_ull(bdf, "vendor", &vendor) &&
+		    !pci_device_info_get_ull(bdf, "device", &device_id)) {
+			if (pci_driver_new_id("vfio-pci", vendor, device_id)) {
+				if (pci_bind(bdf, "vfio-pci")) {
+					unvmed_log_err("%s: failed to rebind to vfio-pci", bdf);
+					return -1;
+				}
+			}
+		} else {
+			if (pci_bind(bdf, "vfio-pci")) {
+				unvmed_log_err("%s: failed to rebind to vfio-pci", bdf);
+				return -1;
+			}
+		}
+	}
+
+	/*
+	 * Steps 5–6: reopen the VFIO fd and re-allocate IRQs.
+	 *
+	 * Zero the ctrl struct so nvme_ctrl_init starts from a clean slate,
+	 * then reinitialize with the saved opts.
+	 */
+	unvmed_log_info("%s: reopening VFIO fd", bdf);
+	opts.nsqr = nr_ioqs - 1;
+	opts.ncqr = nr_ioqs - 1;
+	memset(&u->ctrl, 0, sizeof(u->ctrl));
+	if (nvme_ctrl_init(&u->ctrl, bdf, &opts)) {
+		unvmed_log_err("%s: failed to reopen VFIO fd after SPOR", bdf);
+		return -1;
+	}
+
+	unvmed_log_info("%s: re-allocating IRQs", bdf);
+	if (unvmed_alloc_irqs(u)) {
+		unvmed_log_err("%s: failed to re-allocate IRQs after SPOR", bdf);
+		nvme_close(&u->ctrl);
+		return -1;
+	}
+
+	unvmed_reset_ctx(u);
+
+	unvmed_log_info("%s: SPOR re-init complete: nr_irqs=%d (vfio-pci reported %d)",
+			bdf, u->nr_irqs, u->irq_info.count);
+	return 0;
 }
 
 int unvmed_ctx_init(struct unvme *u)
