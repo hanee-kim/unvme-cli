@@ -5,7 +5,7 @@ description: 완료 큐에서 CQE를 reap하는 API 모음 (전량/개수 지정
 resource: lib/libunvmed.h::unvmed_cq_run
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

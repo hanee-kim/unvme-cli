@@ -5,7 +5,7 @@ description: 데이터/메타데이터 버퍼 자동 매핑을 포함한 NVMe �
 resource: lib/libunvmed.h::unvmed_alloc_cmd
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

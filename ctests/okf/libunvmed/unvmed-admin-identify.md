@@ -5,7 +5,7 @@ description: Identify Controller/Namespace/Active NS List/NVM Identify NS/Primar
 resource: lib/libunvmed.h::unvmed_id_ctrl
 tags: [libunvmed, upstream, admin]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

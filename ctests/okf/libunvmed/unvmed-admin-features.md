@@ -5,7 +5,7 @@ description: Set/Get Features 커맨드 발행 및 prep API (HMB 전용 Set Feat
 resource: lib/libunvmed.h::unvmed_set_features
 tags: [libunvmed, upstream, admin]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

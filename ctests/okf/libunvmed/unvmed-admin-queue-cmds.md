@@ -5,7 +5,7 @@ description: Create/Delete I/O SQ·CQ admin 커맨드의 SQE를 준비하는 저
 resource: lib/libunvmed.h::unvmed_cmd_prep_create_sq
 tags: [libunvmed, upstream, admin, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

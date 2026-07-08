@@ -5,7 +5,7 @@ description: 컨트롤러 메모리 버퍼(CMB)의 초기화·해제·영역 조
 resource: lib/libunvmed.h::unvmed_cmb_init
 tags: [libunvmed, upstream, controller]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

@@ -5,7 +5,7 @@ description: 리셋/에러 경로에서 미완료 커맨드를 인공 CQE로 취
 resource: lib/libunvmed.h::unvmed_cancel_cmd
 tags: [libunvmed, upstream, io, error]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

@@ -5,7 +5,7 @@ description: iovec 목록을 PRP 또는 SGL 데이터 구조로 만들어 SQE의
 resource: lib/libunvmed.h::unvmed_mapv_prp
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

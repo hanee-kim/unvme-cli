@@ -5,7 +5,7 @@ description: 프로세스 컨텍스트에서 libunvmed 라이브러리를 초기
 resource: lib/libunvmed.h::unvmed_init
 tags: [libunvmed, upstream, controller]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

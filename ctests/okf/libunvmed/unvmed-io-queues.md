@@ -5,7 +5,7 @@ description: I/O SQ/CQ의 생성·초기화·enable/disable·해제·조회 API 
 resource: lib/libunvmed.h::unvmed_create_sq
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 
@@ -39,6 +39,10 @@ void unvmed_disable_cq(struct unvme_cq *ucq);
 int unvmed_free_sq(struct unvme *u, uint16_t qid);
 int unvmed_free_cq(struct unvme *u, uint16_t qid);
 
+/* 호스트 측 SQ 상태만 teardown (Delete I/O SQ 커맨드는 발행하지 않음).
+ * 리셋 등으로 컨트롤러 쪽 큐가 이미 사라진 경우에 사용 */
+void unvmed_del_sq(struct unvme *u, uint32_t qid);
+
 /* 조회 */
 int unvmed_get_sqs(struct unvme *u, struct unvme_sq ***sqs);   /* caller가 free */
 int unvmed_get_cqs(struct unvme *u, struct unvme_cq ***cqs);   /* caller가 free */
@@ -55,6 +59,7 @@ struct unvme_cq *unvmed_cq_find(struct unvme *u, uint32_t qid);
 - **원샷 경로**: `unvmed_create_cq()`/`unvmed_create_sq()`는 I/O CQ/SQ를 생성하는 상위 레벨 API다 (0 성공 / -1 실패, errno 설정). CQ의 `vector`에 -1을 주면 인터럽트 비활성화.
 - **분리 경로**: `unvmed_init_sq/cq[_iova]()`는 libvfn 큐 구성과 usq/ucq 초기화를 커맨드 준비(prep)와 분리해 수행한다. `_iova` 변형은 미리 IOMMU에 매핑된 버퍼(IOVA)를 큐 메모리로 사용한다 (CMB 상의 큐 등). Create I/O SQ/CQ 커맨드가 성공하면 `unvmed_enable_sq()/unvmed_enable_cq()`로 최종 활성화하고, 커맨드가 실패하면 `unvmed_free_sq()/unvmed_free_cq()`로 정리한다.
   - 헤더의 XXX 주석: `unvmed_enable_sq()`는 원래 라이브러리 내부에서만 호출되어야 하나 현재 애플리케이션 영역에서 호출되고 있어 수정 예정이라고 명시됨.
+- **호스트 측 teardown**: `unvmed_del_sq()`는 qid로 SQ를 찾아 컨트롤러 인스턴스에서 discard하고 참조를 내려놓는다. Delete I/O SQ admin 커맨드는 발행하지 않으므로, 리셋 후처럼 컨트롤러 쪽 큐가 이미 사라져 호스트 측 정리만 남은 경우에 사용한다 (헤더 주석 기준).
 - **조회**: `unvmed_get_sqs()/unvmed_get_cqs()`는 생성된 큐 목록을 할당해 반환하므로 호출자가 free해야 한다. `*_get()/*_put()`은 refcnt 기반 소유, `*_find()`는 refcnt 변경 없는 단순 조회.
 
 ## ctests에서의 사용 맥락

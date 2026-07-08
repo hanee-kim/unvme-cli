@@ -5,7 +5,7 @@ description: libvfn 큐를 감싸는 libunvmed의 제출 큐(SQ)/완료 큐(CQ) 
 resource: lib/libunvmed.h::unvme_declare_sq
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

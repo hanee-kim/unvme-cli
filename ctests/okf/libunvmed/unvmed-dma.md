@@ -5,7 +5,7 @@ description: 가상주소↔IOVA 변환, IOMMU 매핑/해제, DMA 버퍼 할당�
 resource: lib/libunvmed.h::unvmed_map_vaddr
 tags: [libunvmed, upstream, memory, controller]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 
@@ -40,7 +40,7 @@ static inline void unvmed_pgunmap(void *mem);
 ## 설명
 
 - **주소 변환**: `unvmed_to_iova()`/`unvmed_to_vaddr()`는 IOMMU 변환 테이블 기준으로 가상주소↔IOVA를 변환한다. `unvmed_to_vaddr()`는 접근 가능한 크기를 반환한다.
-- **매핑**: `unvmed_map_vaddr()`/`unvmed_unmap_vaddr()`는 임의의 사용자 버퍼를 IOMMU 테이블에 매핑/해제한다.
+- **매핑**: `unvmed_map_vaddr()`/`unvmed_unmap_vaddr()`는 임의의 사용자 버퍼를 IOMMU 테이블에 매핑/해제한다. 컨트롤러가 teardown 중이면(`u->ctrl.pci.bdf == NULL`) 두 함수 모두 `-1`을 반환하고 errno를 `ENODEV`로 설정한다.
 - **DMA 버퍼**: `unvmed_mem_alloc()`은 물리적으로 연속인 DMA 버퍼를 할당해 IOMMU에 매핑하고 `struct iommu_dmabuf`(libvfn)로 돌려준다. `unvmed_mem_get()`은 IOVA가 속한 버퍼를 검색, `unvmed_mem_free()`는 IOVA로 찾아 해제한다.
 - **정렬 버퍼 헬퍼**: `unvmed_pgmap[_aligned]()`는 `posix_memalign()` 기반으로 페이지 정렬 버퍼를 할당하고 0으로 채운다 (page-fault 유도 목적, 헤더 주석 기준). `unvmed_pagesize()`는 CC.MPS에 구성된 페이지 크기를 반환한다. 이 헬퍼들은 IOMMU 매핑을 수행하지 않는다.
 

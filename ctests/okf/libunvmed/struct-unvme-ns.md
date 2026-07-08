@@ -5,7 +5,7 @@ description: 드라이버 컨텍스트에 등록된 네임스페이스 인스턴
 resource: lib/libunvmed.h::unvme_declare_ns
 tags: [libunvmed, upstream, controller]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 

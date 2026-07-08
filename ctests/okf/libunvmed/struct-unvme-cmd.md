@@ -5,7 +5,7 @@ description: NVMe 커맨드 1건의 상태·버퍼·SQE/CQE를 담는 커맨드 
 resource: lib/libunvmed.h::struct unvme_cmd
 tags: [libunvmed, upstream, io]
 upstream_repo: https://github.com/SamsungDS/unvme-cli
-upstream_commit: 26f62dc5c3793497b541635d50230949ff704ce7
+upstream_commit: e555bb7e976c96584a28ccffe12c72c5ba6ba597
 timestamp: 2026-07-08
 ---
 
