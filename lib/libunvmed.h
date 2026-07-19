@@ -190,6 +190,8 @@ struct unvme_bitmap {
  * struct unvme_vcqe - Virtual CQ entry wrapping an NVMe CQE
  * @cqe: standard NVMe completion queue entry (16 bytes)
  * @bdf: BDF encoded as (domain<<16)|(bus<<8)|(device<<3)|func.
+ * @conflict: non-zero when this CQE was produced by a conflict command,
+ *            zero otherwise.
  * @rsvd: padding to reach 32 bytes
  *
  * Sized to 32 bytes (power-of-2) so that entries are always contained within
@@ -199,7 +201,10 @@ struct unvme_bitmap {
 struct unvme_vcqe {
 	struct nvme_cqe cqe;
 	uint32_t bdf;
-	uint8_t rsvd[12];
+	/* enum unvmed_cmd_inject: NONE for a normal command, CONFLICT if the
+	 * command was allocated from the shared conflict slot (CID collision). */
+	uint32_t injected;
+	uint8_t rsvd[8];
 };
 
 struct unvme_vcq {
@@ -269,6 +274,7 @@ struct name {			\
  * @lock: spinlock to protect the current unvme SQ instance
  * @enabled: ``true`` if the queue is enabled
  * @refcnt: reference count
+ * @conflict_cmds: command instance for conflicting of cmd
  */
 #define unvme_declare_sq(name)	\
 struct name {			\
@@ -289,6 +295,7 @@ struct name {			\
 	pthread_spinlock_t lock;\
 	bool enabled;		\
 	int refcnt;		\
+	struct unvme_cmd *conflict_cmds; \
 }
 
 /*
@@ -360,6 +367,27 @@ enum unvmed_cmd_status {
 	NVME_SC_UNVME_TIMED_OUT	= 1,
 };
 
+/**
+ * enum unvmed_cmd_inject - How a command's CID was obtained
+ *
+ * Recorded in &struct unvme_cmd.injected and carried through to the VCQE so
+ * the consumer can tell a normally-allocated command apart from one that
+ * collided on CID.
+ *
+ * @UNVMED_CMD_INJECT_NONE:     Normal command; the CID bit was claimed from
+ *                              the per-SQ bitmap and is owned by this command.
+ * @UNVMED_CMD_INJECT_CONFLICT: Conflict command; the requested CID was already
+ *                              in use (bitmap returned EEXIST), so the command
+ *                              was allocated from the shared conflict slot
+ *                              without claiming the bit.  See
+ *                              unvmed_alloc_cmd_cid() and
+ *                              __unvmed_conflict_cmd_alloc().
+ */
+enum unvmed_cmd_inject {
+	UNVMED_CMD_INJECT_NONE		= 0,
+	UNVMED_CMD_INJECT_CONFLICT,
+};
+
 struct unvme_buf {
 	void *va;
 	size_t len;
@@ -385,6 +413,10 @@ struct unvme_buf {
  * @rq: command request instance provided by libvfn
  * @buf: data buffer to be mapped to DPTR in submission queue entry
  * @opaque: opaque data
+ * @conflicted: true when @cmd was allocated from @usq->conflict_cmds (a single
+ *              shared slot reused for conflicting CID allocations) rather than
+ *              the per-CID @usq->cmds[] array; determines that @cid is not
+ *              released back to the CID bitmap on free.
  */
 struct unvme_cmd {
 	struct unvme *u;
@@ -439,6 +471,12 @@ struct unvme_cmd {
 	 * enabled).
 	 */
 	struct nvme_cqe cqe;
+
+	/* How this command's CID was obtained.  CONFLICT means the requested
+	 * CID collided with an outstanding command, so this command lives in
+	 * the shared conflict slot and does not own its CID bit; __unvmed_cmd_free()
+	 * then skips unvmed_cid_free() for it.  See enum unvmed_cmd_inject. */
+	enum unvmed_cmd_inject injected;
 };
 
 struct unvme_hmb {
@@ -1301,6 +1339,45 @@ struct unvme_cmd *unvmed_alloc_cmd_nodata(struct unvme *u,
 					  struct unvme_sq *usq, uint16_t *cid);
 
 /**
+ * unvmed_alloc_cmd_cid - Allocate a command instance pinned to a caller-chosen CID
+ * @u: &struct unvme
+ * @usq: submission queue instance (&struct unvme_sq)
+ * @cid: pointer to the command identifier to use.  Unlike
+ *       unvmed_alloc_cmd_nodata(), the CID is supplied by the caller and is
+ *       always respected (it is never auto-allocated).
+ * @vcq_id: virtual CQ identifier to route the resulting CQE to
+ *
+ * Allocate a NVMe command instance without data buffers, pinned to the CID
+ * given by @*@cid.  Allocation takes one of two paths depending on whether
+ * that CID is already in use:
+ *
+ *   - If @cid is free in the per-SQ CID bitmap, a normal command is allocated
+ *     from @usq->cmds[@cid] with the bit claimed (cmd->injected ==
+ *     UNVMED_CMD_INJECT_NONE).  This is the common non-colliding case.
+ *
+ *   - If @cid is already in use (CID bitmap returns EEXIST), the command is
+ *     registered as a *conflict command*: it is allocated from the single
+ *     shared slot @usq->conflict_cmds with cmd->injected set to
+ *     UNVMED_CMD_INJECT_CONFLICT.  This path exists for CID-collision
+ *     negative tests, where a second command deliberately reuses a CID that
+ *     belongs to an outstanding command.  The conflict command does NOT claim
+ *     the CID bit (the resident command at @usq->cmds[@cid] already owns it),
+ *     so both commands coexist on the same SQ and each completion routes back
+ *     to its issuing thread via @vcq_id.  At most one conflict command may be
+ *     outstanding per SQ at a time.
+ *
+ * This API is thread-safe; the shared conflict slot is guarded by a
+ * compare-and-swap on @cmd->state (UNVME_CMD_S_INIT -> UNVME_CMD_S_ALLOCATED).
+ *
+ * Return: Command instance (&struct unvme_cmd), ``NULL`` on error with errno
+ *         set to EBUSY if the conflict slot is already in use.
+ */
+struct unvme_cmd *unvmed_alloc_cmd_cid(struct unvme *u,
+				       struct unvme_sq *usq,
+				       uint16_t *cid,
+				       uint32_t vcq_id);
+
+/**
  * unvmed_alloc_cmd_meta - Allocate a NVMe command instance with metadata
  * @u: &struct unvme
  * @usq: submission queue instance (&struct unvme_sq)
@@ -1851,6 +1928,17 @@ int unvmed_unmap_vaddr(struct unvme *u, void *buf);
  */
 uint16_t unvmed_cmd_post(struct unvme_cmd *cmd, union nvme_cmd *sqe,
 			 unsigned long flags);
+
+/**
+ * unvmed_get_conflict_cmd - Get the conflict command instance of @usq
+ * @usq: submission queue (&struct unvme_sq)
+ *
+ * Return the shared conflict command slot (@usq->conflict_cmds) if it is
+ * currently in use (state != UNVME_CMD_S_INIT), or NULL otherwise.
+ *
+ * Return: &struct unvme_cmd pointer, or NULL if the slot is free
+ */
+struct unvme_cmd *unvmed_get_conflict_cmd(struct unvme_sq *usq);
 
 /**
  * unvmed_get_cmd - Get &struct unvme_cmd instance

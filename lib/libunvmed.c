@@ -2071,12 +2071,14 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 		pthread_spin_init(&usq->lock, 0);
 
 		usq->cmds = calloc(qsize, sizeof(struct unvme_cmd));
+		usq->conflict_cmds = calloc(1, sizeof(struct unvme_cmd));
 
 		/*
 		 * libvfn manages @rq instances for (@qsize-1).
 		 */
 		if (unvmed_cid_init(usq, qsize - 1) < 0) {
 			free(usq->cmds);
+			free(usq->conflict_cmds);
 			free(usq);
 			return NULL;
 		}
@@ -2089,6 +2091,7 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 		if (unvmed_timer_init(&usq->timer, usq)) {
 			unvmed_cid_free(usq);
 			free(usq->cmds);
+			free(usq->conflict_cmds);
 			free(usq);
 			return NULL;
 		}
@@ -2150,6 +2153,7 @@ static void __unvmed_free_usq(struct unvme *u, struct unvme_sq *usq)
 	unvmed_cid_free(usq);
 
 	free(usq->cmds);
+	free(usq->conflict_cmds);
 	free(usq);
 
 	if (!qid)
@@ -2664,6 +2668,18 @@ static inline void unvmed_put_cqe(struct unvme *u, struct unvme_cmd *cmd)
 	unvmed_log_info("%s: canceled command (sqid=%u, cid=%u)", unvmed_bdf(u), cqe.sqid, cqe.cid);
 }
 
+static void __unvmed_put_cqe(struct unvme *u, struct unvme_cmd *cmd)
+{
+	switch (LOAD(cmd->state)) {
+	case UNVME_CMD_S_SUBMITTED:
+	case UNVME_CMD_S_ALLOCATED:
+		unvmed_put_cqe(u, cmd);
+		break;
+	default:
+		break;
+	}
+}
+
 static inline void unvmed_cancel_sq(struct unvme *u, struct unvme_sq *usq)
 {
 	struct unvme_cq *ucq = usq->ucq;
@@ -2739,17 +2755,10 @@ update:
 		 * __unvmed_cmd_free — between our check and the dereference,
 		 * a NULL-deref TOCTOU.  get() returns NULL when refcnt is 0.
 		 */
-		switch (LOAD(cmd->state)) {
-		case UNVME_CMD_S_SUBMITTED:
-		case UNVME_CMD_S_ALLOCATED:
-			unvmed_put_cqe(u, cmd);
-			break;
-		default:
-			break;
-		}
-
-		unvmed_cmd_put(cmd);
+		__unvmed_put_cqe(u, cmd);
 	}
+
+	__unvmed_put_cqe(u, usq->conflict_cmds);
 
 	unvmed_cq_exit(ucq);
 }
@@ -3928,8 +3937,24 @@ static struct unvme_cmd *unvmed_get_cmd_on_reaper(struct unvme *u,
 
 	cmd = &usq->cmds[cqe->cid];
 
-	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED)
-		return NULL;
+	/*
+	 * Resolve the command backing @cqe.  In the normal path the regular
+	 * slot cmds[cid] is in SUBMITTED and is returned directly.  When a
+	 * conflict command (allocated via the single per-SQ conflict slot
+	 * with an explicit cid that collides with an existing one) produced
+	 * this completion, cmds[cid] is not in SUBMITTED, so fall back to the
+	 * conflict slot.  Because the conflict slot is shared across all CIDs
+	 * in the SQ, the cid must be re-checked against @cqe->cid before it is
+	 * accepted; a mismatch means no matching submitted command exists.
+	 */
+	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED) {
+		cmd = usq->conflict_cmds;
+
+		if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED || cmd->cid != cqe->cid)
+			return NULL;
+
+		unvmed_log_info("%s: consumed conflict cmd. (sqid=%u, cid=%u)", unvmed_bdf(u), cqe->sqid, cqe->cid);
+	}
 
 	return cmd;
 }
@@ -3938,6 +3963,7 @@ struct unvme_cmd *unvmed_get_cmd_from_cqe(struct unvme *u,
 					  struct nvme_cqe *cqe)
 {
 	struct unvme_sq *usq;
+	struct unvme_cmd *cmd;
 
 	/*
 	 * We don't have get/put scheme here since @usq instance can only be
@@ -3949,7 +3975,26 @@ struct unvme_cmd *unvmed_get_cmd_from_cqe(struct unvme *u,
 	if (!usq)
 		return NULL;
 
-	return unvmed_get_cmd(usq, cqe->cid);
+	cmd = &usq->cmds[cqe->cid];
+
+	/*
+	 * Same conflict-slot fallback as unvmed_get_cmd_on_reaper(), but used
+	 * on the cross-thread path: this is called by unvmed_vcq_push_to_other()
+	 * to identify a command that belongs to another thread before pushing
+	 * its completion into that thread's VCQ.  Unlike the reaper variant,
+	 * duplicate-completion safety is provided by the caller's
+	 * SUBMITTED -> TO_BE_COMPLETED CAS rather than by this lookup, so no
+	 * log is emitted here.  The cid re-check against @cqe->cid is still
+	 * required because the conflict slot is shared across all CIDs.
+	 */
+	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED) {
+		cmd = usq->conflict_cmds;
+
+		if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED || cmd->cid != cqe->cid)
+			return NULL;
+	}
+
+	return cmd;
 }
 
 static struct nvme_cqe *unvmed_get_completion(struct unvme *u,

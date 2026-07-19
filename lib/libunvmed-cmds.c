@@ -195,18 +195,120 @@ static void unvmed_buf_free(struct unvme *u, struct unvme_buf *buf)
 		unvmed_pgunmap(buf->va);
 }
 
+/*
+ * Allocate a command from the per-SQ shared conflict slot
+ * (usq->conflict_cmds).  A command takes this path — i.e. is registered
+ * as a "conflict command" with cmd->injected = UNVMED_CMD_INJECT_CONFLICT
+ * — only when __unvmed_cmd_alloc() was given an explicit @cid that is
+ * already in use (CID bitmap returns EEXIST).  See __unvmed_cmd_alloc()
+ * for the full condition.
+ *
+ * Unlike a normal command, a conflict command:
+ *   - does NOT claim its CID from the bitmap (the colliding bit is
+ *     already owned by the resident command at usq->cmds[cid]);
+ *   - is marked injected=CONFLICT so __unvmed_cmd_free() later skips
+ *     unvmed_cid_free() and does not corrupt the bitmap;
+ *   - lives in a single shared slot reused across conflict allocations,
+ *     so at most ONE conflict command may be outstanding per SQ at a
+ *     time (a second concurrent allocation fails with EBUSY).
+ *
+ * @cid:    the colliding CID (caller-owned, not allocated here).
+ * @vcq_id: VCQ id to route the eventual CQE back to the issuing thread.
+ */
+static struct unvme_cmd *__unvmed_conflict_cmd_alloc(struct unvme *u,
+						     struct unvme_sq *usq, uint16_t cid,
+						     uint32_t vcq_id)
+{
+	struct unvme_cmd *cmd;
+	struct nvme_rq *rq;
+	uint32_t expected = (uint32_t)UNVME_CMD_S_INIT;
+
+	cmd = usq->conflict_cmds;
+
+	if (!atomic_cmpxchg(&cmd->state, expected, (uint32_t)UNVME_CMD_S_ALLOCATED)) {
+		errno = EBUSY;
+		return NULL;
+	}
+
+	rq = nvme_rq_acquire_atomic(usq->q);
+	if (!rq) {
+		atomic_store_release(&cmd->state, expected);
+		return NULL;
+	}
+
+	atomic_inc(&usq->nr_cmds);
+
+	/*
+	 * Initialize fields explicitly WITHOUT memset().  @cmd is a single
+	 * shared slot (usq->conflict_cmds) reused across conflict allocations,
+	 * so it carries residue from its previous use.  memset() would zero
+	 * @state too, momentarily reverting it to UNVME_CMD_S_INIT (which CAS
+	 * just raised to ALLOCATED) and opening a window in which another
+	 * thread's CAS(INIT->ALLOCATED) succeeds on the same slot.  Initialize
+	 * every field by name instead so @state stays ALLOCATED throughout.
+	 */
+	cmd->u = u;
+	cmd->refcnt = 1;
+	cmd->flags = 0;
+	cmd->usq = usq;
+	cmd->vcq = vcq_id;
+	cmd->cid = cid;
+	cmd->rq = rq;
+	memset(&cmd->buf, 0, sizeof(cmd->buf));
+	memset(&cmd->mbuf, 0, sizeof(cmd->mbuf));
+	cmd->opaque = NULL;
+	cmd->completed = false;
+	memset(&cmd->timeout, 0, sizeof(cmd->timeout));
+	memset(&cmd->sqe, 0, sizeof(cmd->sqe));
+	memset(&cmd->cqe, 0, sizeof(cmd->cqe));
+	cmd->injected = UNVMED_CMD_INJECT_CONFLICT;
+	rq->opaque = cmd;
+
+	return cmd;
+}
+
 static struct unvme_cmd *__unvmed_cmd_alloc(struct unvme *u,
-					    struct unvme_sq *usq, uint16_t *cid)
+					    struct unvme_sq *usq, uint16_t *cid,
+					    uint32_t vcq_id)
 {
 	struct unvme_cmd *cmd;
 	struct nvme_rq *rq;
 	uint16_t __cid;
 
 	if (cid) {
+		/*
+		 * Caller requests a specific CID.  A command becomes a
+		 * "conflict command" — and is routed to the shared
+		 * usq->conflict_cmds slot instead of usq->cmds[__cid] —
+		 * if and only if ALL of the following hold:
+		 *
+		 *   1. @cid is non-NULL (caller pins the CID explicitly,
+		 *      i.e. it came in through unvmed_alloc_cmd_cid()).
+		 *   2. unvmed_cid_alloc_n() fails with errno == EEXIST,
+		 *      meaning the requested CID bit is already set in the
+		 *      per-SQ CID bitmap — a command with that CID is
+		 *      already resident in usq->cmds[__cid] and SUBMITTED
+		 *      or in flight.
+		 *
+		 * This is exactly the CID-collision negative-test scenario:
+		 * the test deliberately submits a second command with a CID
+		 * that collides with an outstanding one.  The conflict slot
+		 * lets the second command coexist on the same SQ without
+		 * stealing the bit already owned by the first command, so
+		 * both completions route back to their issuing threads.
+		 *
+		 * Any other cid_alloc_n() failure (not EEXIST) is a real
+		 * allocation error; surface it as NULL rather than silently
+		 * falling back.
+		 */
 		__cid = *cid;
 
-		if (unvmed_cid_alloc_n(usq, __cid))
-			return NULL;
+		if (unvmed_cid_alloc_n(usq, __cid)) {
+			if (errno == EEXIST)
+				return __unvmed_conflict_cmd_alloc(u, usq, __cid, vcq_id);
+			else
+				return NULL;
+		}
 	} else {
 		if (unvmed_cid_alloc(usq, &__cid))
 			return NULL;
@@ -228,6 +330,7 @@ static struct unvme_cmd *__unvmed_cmd_alloc(struct unvme *u,
 	cmd->rq = rq;
 	cmd->refcnt = 1;
 	cmd->state = UNVME_CMD_S_ALLOCATED;
+	cmd->vcq = vcq_id;
 
 	rq->opaque = cmd;
 
@@ -287,11 +390,12 @@ static int unvmed_buf_init(struct unvme *u, struct unvme_buf *ubuf,
 
 static struct unvme_cmd *__unvmed_cmd_init(struct unvme *u, struct unvme_sq *usq,
 					   uint16_t *cid, void *buf,
-					   size_t len, void *mbuf, size_t mlen)
+					   size_t len, void *mbuf, size_t mlen,
+					   uint32_t vcq_id)
 {
 	struct unvme_cmd *cmd;
 
-	cmd = __unvmed_cmd_alloc(u, usq, cid);
+	cmd = __unvmed_cmd_alloc(u, usq, cid, vcq_id);
 	if (!cmd)
 		return NULL;
 
@@ -315,11 +419,27 @@ static void __unvmed_cmd_free(struct unvme_cmd *cmd)
 	struct nvme_rq *rq = cmd->rq;
 	uint16_t cid = cmd->cid;
 
+	/*
+	 * Decide whether to release the CID bitmap bit BEFORE the memset()
+	 * below zeroes the whole struct.  A conflict command (cmd->injected ==
+	 * UNVMED_CMD_INJECT_CONFLICT) never owned its @cid bit — that bit is
+	 * owned by the resident command at usq->cmds[cid] — so freeing it here
+	 * would corrupt the bitmap and stall further submission.  Reading
+	 * cmd->injected after the memset would always see NONE (0) and wrongly
+	 * free a CID owned elsewhere, hence the local @free_cmd saved up front.
+	 */
+	bool free_cmd = true;
+
+	if (cmd->injected == UNVMED_CMD_INJECT_CONFLICT)
+		free_cmd = false;
+
 	memset(cmd, 0, sizeof(*cmd));
 	atomic_dec(&usq->nr_cmds);
 
 	nvme_rq_release_atomic(rq);
-	unvmed_cid_free(usq, cid);
+
+	if (free_cmd)
+		unvmed_cid_free(usq, cid);
 }
 
 static void unvmed_cmd_free(struct unvme_cmd *cmd)
@@ -365,13 +485,30 @@ struct unvme_cmd *unvmed_alloc_cmd(struct unvme *u, struct unvme_sq *usq,
 		return NULL;
 	}
 
-	return __unvmed_cmd_init(u, usq, cid, buf, len, NULL, 0);
+	return __unvmed_cmd_init(u, usq, cid, buf, len, NULL, 0, 0);
 }
 
 struct unvme_cmd *unvmed_alloc_cmd_nodata(struct unvme *u,
 					  struct unvme_sq *usq, uint16_t *cid)
 {
-	return __unvmed_cmd_init(u, usq, cid, NULL, 0, NULL, 0);
+	return __unvmed_cmd_init(u, usq, cid, NULL, 0, NULL, 0, 0);
+}
+
+struct unvme_cmd *unvmed_alloc_cmd_cid(struct unvme *u,
+				       struct unvme_sq *usq, uint16_t *cid,
+				       uint32_t vcq_id)
+{
+	return __unvmed_cmd_init(u, usq, cid, NULL, 0, NULL, 0, vcq_id);
+}
+
+struct unvme_cmd *unvmed_get_conflict_cmd(struct unvme_sq *usq)
+{
+	struct unvme_cmd *cmd = usq->conflict_cmds;
+
+	if (LOAD(cmd->state) == UNVME_CMD_S_INIT)
+		return NULL;
+
+	return cmd;
 }
 
 struct unvme_cmd *unvmed_alloc_cmd_meta(struct unvme *u, struct unvme_sq *usq,
@@ -383,7 +520,7 @@ struct unvme_cmd *unvmed_alloc_cmd_meta(struct unvme *u, struct unvme_sq *usq,
 		return NULL;
 	}
 
-	return __unvmed_cmd_init(u, usq, cid, buf, len, mbuf, mlen);
+	return __unvmed_cmd_init(u, usq, cid, buf, len, mbuf, mlen, 0);
 }
 
 int __unvmed_mapv_prp(struct unvme_cmd *cmd, union nvme_cmd *sqe,
