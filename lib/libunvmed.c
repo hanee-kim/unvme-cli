@@ -26,7 +26,7 @@
 #include "libunvmed-private.h"
 
 int __unvmed_logfd = 0;
-int __log_level = 0;
+volatile int __log_level = 0;
 
 static void *unvmed_reaper_run(void *opaque);
 static void __unvmed_free_ns(struct __unvme_ns *ns);
@@ -295,7 +295,7 @@ void unvmed_init(const char *logfile, int log_level)
 	if (logfile)
 		__unvmed_logfd = unvmed_create_logfile(logfile);
 
-	atomic_store_release(&__log_level, log_level);
+	unvmed_log_set_level(log_level);
 
 	unvmed_vcq_pool_init();
 }

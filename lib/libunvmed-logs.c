@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
+#include <stdarg.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <vfn/nvme.h>
 #include <nvme/types.h>
@@ -9,6 +12,78 @@
 #include "libunvmed.h"
 #include "libunvmed-logs.h"
 #include "libunvmed-private.h"
+
+/* Static keys — one per log level that can be toggled at runtime.
+ * Initially disabled (all NOPs at branch sites). */
+DEFINE_STATIC_KEY_FALSE(unvmed_log_key_info);
+DEFINE_STATIC_KEY_FALSE(unvmed_log_key_debug);
+
+/*
+ * unvmed_log_set_level — single call-site for changing the log level.
+ * Updates __log_level for display and patches the branch sites for the
+ * INFO and DEBUG static keys.
+ */
+void unvmed_log_set_level(int level)
+{
+	__log_level = level;
+
+	if (level >= UNVME_LOG_INFO)
+		unvmed_static_key_enable(&unvmed_log_key_info);
+	else
+		unvmed_static_key_disable(&unvmed_log_key_info);
+
+	if (level >= UNVME_LOG_DEBUG)
+		unvmed_static_key_enable(&unvmed_log_key_debug);
+	else
+		unvmed_static_key_disable(&unvmed_log_key_debug);
+}
+
+static void unvme_datetime(char *datetime)
+{
+	struct timeval tv;
+	struct tm *tm;
+	char usec[16];
+
+	gettimeofday(&tv, NULL);
+	tm = localtime(&tv.tv_sec);
+
+	strftime(datetime, 32, "%Y-%m-%d %H:%M:%S", tm);
+
+	sprintf(usec, ".%06ld", tv.tv_usec);
+	strcat(datetime, usec);
+}
+
+/*
+ * Cold write path for all log levels.  Separated from the hot-path macro so
+ * that timestamp formatting and dprintf never appear in the instruction cache
+ * of I/O-critical callers.
+ */
+__attribute__((cold, noinline, format(printf, 4, 5)))
+void __unvmed_log_write(int lv, const char *func, int line,
+			const char *fmt, ...)
+{
+	static const char * const lvstr[] = {
+		[UNVME_LOG_ERR]   = "ERROR   ",
+		[UNVME_LOG_INFO]  = "INFO    ",
+		[UNVME_LOG_DEBUG] = "DEBUG   ",
+	};
+	char datetime[32];
+	va_list va;
+
+	if (!__unvmed_logfd)
+		return;
+
+	unvme_datetime(datetime);
+
+	dprintf(__unvmed_logfd, "%s| %s | %s: %d: ",
+		lvstr[lv], datetime, func, line);
+
+	va_start(va, fmt);
+	vdprintf(__unvmed_logfd, fmt, va);
+	va_end(va);
+
+	dprintf(__unvmed_logfd, "\n");
+}
 
 __thread char __buf[256];
 #define LOG_MAX_LEN sizeof(__buf)

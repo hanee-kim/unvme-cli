@@ -3,8 +3,10 @@
 #ifndef LIBUNVMED_LOG_H
 #define LIBUNVMED_LOG_H
 
+#include "libunvmed-jump-label.h"
+
 extern int __unvmed_logfd;
-extern int __log_level;
+extern volatile int __log_level;
 
 enum {
 	UNVME_LOG_ERR,
@@ -13,55 +15,76 @@ enum {
 	UNVME_LOG_LAST = UNVME_LOG_DEBUG,
 };
 
-static inline void unvme_datetime(char *datetime)
-{
-	struct timeval tv;
-	struct tm *tm;
-	char usec[16];
-
-	assert(datetime != NULL);
-
-	gettimeofday(&tv, NULL);
-	tm = localtime(&tv.tv_sec);
-
-	strftime(datetime, 32, "%Y-%m-%d %H:%M:%S", tm);
-
-	sprintf(usec, ".%06ld", tv.tv_usec);
-	strcat(datetime, usec);
-}
-
-static inline void __attribute__((format(printf, 2, 3)))
-____unvmed_log(const int lv, const char *fmt, ...)
-{
-	va_list va;
-
-	if (!__unvmed_logfd)
-		return;
-
-	va_start(va, fmt);
-	vdprintf(__unvmed_logfd, fmt, va);
-	va_end(va);
-}
-
 #define loglv_to_str(lv) (lv == UNVME_LOG_ERR ? "ERROR" : \
 		    lv == UNVME_LOG_INFO ? "INFO" : "DEBUG")
 
-#define __unvmed_log(lv, fmt, ...)						\
-	do {									\
-		if (lv > atomic_load_acquire(&__log_level))			\
-			break;							\
-										\
-		char datetime[32];						\
-										\
-		unvme_datetime(datetime);					\
-		____unvmed_log(lv, "%-8s| %s | %s: %d: " fmt "\n",		\
-			loglv_to_str(lv), datetime,				\
-			__func__, __LINE__, ##__VA_ARGS__);			\
-	} while(0)
+/*
+ * Per-level static keys.  Defined in libunvmed-logs.c.
+ *
+ *   unvmed_log_key_info  — controls INFO-level output
+ *   unvmed_log_key_debug — controls DEBUG-level output
+ *
+ * ERR is always written; no key is needed.
+ */
+DECLARE_STATIC_KEY_FALSE(unvmed_log_key_info);
+DECLARE_STATIC_KEY_FALSE(unvmed_log_key_debug);
 
-#define unvmed_log_err(fmt, ...)	__unvmed_log(UNVME_LOG_ERR, fmt, ##__VA_ARGS__)
-#define unvmed_log_info(fmt, ...)	__unvmed_log(UNVME_LOG_INFO, fmt, ##__VA_ARGS__)
-#define unvmed_log_debug(fmt, ...)	__unvmed_log(UNVME_LOG_DEBUG, fmt, ##__VA_ARGS__)
+/*
+ * Cold write path — noinline + cold keeps the timestamp/dprintf code out
+ * of the hot I/O path's instruction cache.
+ */
+__attribute__((cold, noinline, format(printf, 4, 5)))
+void __unvmed_log_write(int lv, const char *func, int line,
+			const char *fmt, ...);
+
+/*
+ * unvmed_log_err — always written, no branch at all.
+ */
+#define unvmed_log_err(fmt, ...)					\
+	__unvmed_log_write(UNVME_LOG_ERR, __func__, __LINE__,		\
+			   fmt, ##__VA_ARGS__)
+
+/*
+ * unvmed_log_info — Linux kernel jump-label style:
+ *   key disabled → 5-byte NOP, zero overhead
+ *   key enabled  → 5-byte JMP, always-taken, no misprediction
+ */
+#define unvmed_log_info(fmt, ...)					\
+	do {								\
+		if (unvmed_static_branch_unlikely(&unvmed_log_key_info))\
+			__unvmed_log_write(UNVME_LOG_INFO, __func__,	\
+					   __LINE__, fmt, ##__VA_ARGS__);\
+	} while (0)
+
+/*
+ * unvmed_log_debug:
+ *   Release build (UNVME_DEBUG undefined):
+ *     Expands to dead code — compiler eliminates it entirely.
+ *     Zero instructions in the binary.  The if(0) wrapper still
+ *     type-checks format arguments at compile time (Linux pr_debug style).
+ *
+ *   Debug build (UNVME_DEBUG defined):
+ *     Same jump-label approach as unvmed_log_info.
+ */
+#ifdef UNVME_DEBUG
+# define unvmed_log_debug(fmt, ...)					\
+	do {								\
+		if (unvmed_static_branch_unlikely(&unvmed_log_key_debug))\
+			__unvmed_log_write(UNVME_LOG_DEBUG, __func__,	\
+					   __LINE__, fmt, ##__VA_ARGS__);\
+	} while (0)
+#else
+# define unvmed_log_debug(fmt, ...)					\
+	do { if (0) __unvmed_log_write(UNVME_LOG_DEBUG, __func__,	\
+				       __LINE__, fmt, ##__VA_ARGS__);	\
+	} while (0)
+#endif
+
+/*
+ * unvmed_log_set_level — update both __log_level and the static keys.
+ * Call this instead of writing __log_level directly.
+ */
+void unvmed_log_set_level(int level);
 
 /*
  * libunvmed-logs.c
