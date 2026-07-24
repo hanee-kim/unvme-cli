@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #include <stdarg.h>
+#include <stdio.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -11,6 +12,7 @@
 
 #include "libunvmed.h"
 #include "libunvmed-logs.h"
+#include "libunvmed-log-ring.h"
 #include "libunvmed-private.h"
 
 /* Static keys — one per log level that can be toggled at runtime.
@@ -54,9 +56,9 @@ static void unvme_datetime(char *datetime)
 }
 
 /*
- * Cold write path for all log levels.  Separated from the hot-path macro so
- * that timestamp formatting and dprintf never appear in the instruction cache
- * of I/O-critical callers.
+ * Cold write path — formats the log line into a stack buffer and enqueues
+ * it on the ring buffer.  The logger thread handles the actual file write,
+ * so this function never issues a syscall and never blocks.
  */
 __attribute__((cold, noinline, format(printf, 4, 5)))
 void __unvmed_log_write(int lv, const char *func, int line,
@@ -67,22 +69,29 @@ void __unvmed_log_write(int lv, const char *func, int line,
 		[UNVME_LOG_INFO]  = "INFO    ",
 		[UNVME_LOG_DEBUG] = "DEBUG   ",
 	};
-	char datetime[32];
-	va_list va;
-
-	if (!__unvmed_logfd)
-		return;
+	char     datetime[32];
+	char     msg[UNVMED_LOG_MSG_SIZE];
+	va_list  va;
+	int      n;
 
 	unvme_datetime(datetime);
 
-	dprintf(__unvmed_logfd, "%s| %s | %s: %d: ",
-		lvstr[lv], datetime, func, line);
+	n = snprintf(msg, sizeof(msg), "%s| %s | %s: %d: ",
+		     lvstr[lv], datetime, func, line);
 
 	va_start(va, fmt);
-	vdprintf(__unvmed_logfd, fmt, va);
+	n += vsnprintf(msg + n, sizeof(msg) - n, fmt, va);
 	va_end(va);
 
-	dprintf(__unvmed_logfd, "\n");
+	if (n < (int)sizeof(msg) - 1) {
+		msg[n++] = '\n';
+	} else {
+		/* Message was truncated — overwrite the last byte with '\n' */
+		n = sizeof(msg) - 1;
+		msg[n - 1] = '\n';
+	}
+
+	unvmed_log_ring_push(&__log_ring, msg, (uint32_t)n);
 }
 
 __thread char __buf[256];

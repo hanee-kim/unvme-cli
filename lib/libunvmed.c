@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #define _GNU_SOURCE
 
+#include <stdlib.h>
 #include <time.h>
 #include <signal.h>
 
@@ -23,6 +24,8 @@
 #include <json-c/json.h>
 
 #include "libunvmed.h"
+#include "libunvmed-logs.h"
+#include "libunvmed-log-ring.h"
 #include "libunvmed-private.h"
 
 int __unvmed_logfd = 0;
@@ -292,12 +295,20 @@ static int unvmed_create_logfile(const char *logfile)
 
 void unvmed_init(const char *logfile, int log_level)
 {
-	if (logfile)
+	if (logfile) {
 		__unvmed_logfd = unvmed_create_logfile(logfile);
+		unvmed_log_ring_init(&__log_ring, __unvmed_logfd);
+		atexit(unvmed_fini);
+	}
 
 	unvmed_log_set_level(log_level);
 
 	unvmed_vcq_pool_init();
+}
+
+void unvmed_fini(void)
+{
+	unvmed_log_ring_stop(&__log_ring);
 }
 
 int unvmed_parse_bdf(const char *input, char *bdf)
