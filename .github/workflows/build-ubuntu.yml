@@ -43,7 +43,7 @@ jobs:
       run: |
         git clone https://github.com/axboe/fio.git /tmp/fio
         cd /tmp/fio
-        git checkout 698fa8f0682b809b3f85f50c593067e90108f92e
+        git checkoutb384f4d3472e9dae62122c631899bac86368df63
         LDFLAGS="-shared" ./configure --extra-cflags='-fPIC' \
           --disable-numa \
           --disable-rdma \
