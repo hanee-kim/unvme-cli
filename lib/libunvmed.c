@@ -1785,7 +1785,12 @@ int unvmed_init_meta_ns(struct unvme *u, uint32_t nsid, void *nvm_id_ns)
 			goto out;
 		}
 
-		__unvmed_nvm_id_ns(u, nsid, __nvm_id_ns);
+		if (__unvmed_nvm_id_ns(u, nsid, __nvm_id_ns)) {
+			unvmed_log_err("%s: failed to identify nvm namespace (nsid=%u)",
+					unvmed_bdf(u), nsid);
+			ret = -1;
+			goto out;
+		}
 	}
 
 	elbaf = le32_to_cpu(__nvm_id_ns->elbaf[ns->format_idx]);
