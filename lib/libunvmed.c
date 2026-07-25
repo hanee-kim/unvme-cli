@@ -4214,6 +4214,7 @@ static int unvmed_pci_wait_reset(struct unvme *u)
 {
 	uint16_t pcie_offset;
 	uint16_t link_status;
+	uint32_t link_cap;
 	uint64_t bar0;
 	char dsp[13];
 
@@ -4228,21 +4229,36 @@ static int unvmed_pci_wait_reset(struct unvme *u)
 		return -1;
 	}
 
-	unvmed_log_debug("%s: waiting for DSP(%s) link to be up ...", unvmed_bdf(u), dsp);
-	while (true) {
-		if (unvmed_pci_get_config(dsp, &link_status, pcie_offset + 0x12, 2)) {
-			unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
-					unvmed_bdf(u), pcie_offset + 0x12, 2);
-			return -1;
+	if (unvmed_pci_get_config(dsp, &link_cap, pcie_offset + 0xc, 4)) {
+		unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
+				unvmed_bdf(u), pcie_offset + 0xc, 4);
+		return -1;
+	}
+
+	/*
+	 * Link Status Register bit [13] (Data Link Layer Link Active) is only
+	 * meaningful when the DSP reports Link Capabilities bit [20] (Data
+	 * Link Layer Link Active Reporting Capable). Otherwise bit [13] is
+	 * reserved and may never read as 1, so skip waiting on it.
+	 */
+	if (link_cap & (1 << 20)) {
+		unvmed_log_debug("%s: waiting for DSP(%s) link to be up ...", unvmed_bdf(u), dsp);
+		while (true) {
+			if (unvmed_pci_get_config(dsp, &link_status, pcie_offset + 0x12, 2)) {
+				unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
+						unvmed_bdf(u), pcie_offset + 0x12, 2);
+				return -1;
+			}
+
+			/*
+			 * Wait for the following bitfield in Link Status Register.
+			 *   - [13] Data Link Layer Link Active
+			 */
+			if (link_status & (1 << 13))
+				break;
+
+			usleep(1000);
 		}
-
-		/*
-		 * Wait for the following bitfield in Link Status Register.
-		 *   - [13] Data Link Layer Link Active
-		 */
-		if (link_status & (1 << 13))
-			break;
-
 	}
 
 	unvmed_log_debug("%s: waiting for USP(%s) link to be reset ...",
