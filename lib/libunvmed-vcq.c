@@ -202,7 +202,12 @@ int unvmed_vcq_push_to_other(struct unvme *u, struct nvme_cqe *cqe)
 
 int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *vcqe)
 {
-	uint16_t head = atomic_load_acquire(&q->head);
+	uint16_t head;
+
+	if (!q)
+		return -ENOENT;
+
+	head = atomic_load_acquire(&q->head);
 
 	if (head == atomic_load_acquire(&q->tail))
 		return -ENOENT;

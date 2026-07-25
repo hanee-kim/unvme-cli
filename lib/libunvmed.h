@@ -700,7 +700,10 @@ static inline struct unvme_vcq *unvmed_cmd_get_vcq(struct unvme_cmd *cmd)
  * Pop a single vcqe from @q.  The caller is the sole consumer; no locking is
  * required on the head side.
  *
- * Return: ``0`` on success, ``-ENOENT`` if @q is empty.
+ * @q may be NULL (e.g. cmd->vcq unset, meaning "no application vcq"); this
+ * is treated the same as an empty queue.
+ *
+ * Return: ``0`` on success, ``-ENOENT`` if @q is empty or NULL.
  */
 int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *vcqes);
 
