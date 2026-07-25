@@ -1517,7 +1517,12 @@ int unvmed_init_ns(struct unvme *u, uint32_t nsid, void *identify)
 			return -1;
 		}
 
-		__unvmed_id_ns(u, nsid, id_ns);
+		if (__unvmed_id_ns(u, nsid, id_ns)) {
+			unvmed_log_err("%s: failed to identify namespace (nsid=%u)",
+					unvmed_bdf(u), nsid);
+			unvmed_pgunmap(id_ns);
+			return -1;
+		}
 	}
 
 	prev = unvmed_ns_get(u, nsid);
