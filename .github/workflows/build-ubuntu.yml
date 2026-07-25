@@ -32,7 +32,7 @@ jobs:
       run: |
         git clone https://github.com/SamsungDS/libvfn.git /tmp/libvfn
         cd /tmp/libvfn
-        git checkout d7f09586a782326017928cb1c14fa5282d9e3b9c
+        git checkout 8ab1994156f341ebce92fd27b2abfe822e771555
         meson build -Dbuildtype=release -Diommufd=disabled
         ninja -C build
         sudo meson install -C build
