@@ -2743,17 +2743,15 @@ update:
 	ucq->q->phase = phase;
 
 	for (int i = 0; i < usq->qsize - 1; i++) {
-		cmd = unvmed_cmd_get(usq, i);
-		if (!cmd)
-			continue;
+		cmd = &usq->cmds[i];
 
 		/*
-		 * Hold the reference across the state check and unvmed_put_cqe()
-		 * (which dereferences cmd->rq->sq->id).  Without it, a concurrent
-		 * fio thread not holding the SQ lock could drive refcnt to 0 and
-		 * free the command — clearing cmd->rq via memset in
-		 * __unvmed_cmd_free — between our check and the dereference,
-		 * a NULL-deref TOCTOU.  get() returns NULL when refcnt is 0.
+		 * For commands in ALLOCATED state (cmd allocated but not yet
+		 * pushed to SQ), use unvmed_cmd_get() to atomically acquire a
+		 * reference.  This prevents a TOCTOU race where a concurrent
+		 * thread (e.g. fio without SQ lock) could free the command
+		 * between our refcnt check and unvmed_put_cqe(), which would
+		 * result in a NULL dereference on cmd->rq.
 		 */
 		__unvmed_put_cqe(u, cmd);
 	}
@@ -2810,22 +2808,10 @@ void unvmed_cancel_allocated_state_cmds(struct unvme *u)
 			continue;
 
 		for (int i = 0; i < usq->qsize - 1; i++) {
-			/*
-			 * Acquire a reference before touching the command: even
-			 * with the SQ quiesced, a concurrent fio thread that does
-			 * not take the SQ lock could put() this command to 0 and
-			 * free it (clearing cmd->rq) between the state read and
-			 * unvmed_put_cqe()'s cmd->rq->sq->id dereference.
-			 * unvmed_cmd_get() returns NULL when refcnt is already 0.
-			 */
-			cmd = unvmed_cmd_get(usq, i);
-			if (!cmd)
-				continue;
+			cmd = &usq->cmds[i];
 
 			if (LOAD(cmd->state) == UNVME_CMD_S_ALLOCATED)
 				unvmed_put_cqe(u, cmd);
-
-			unvmed_cmd_put(cmd);
 		}
 		unvmed_sq_put(u, usq);
 	}
