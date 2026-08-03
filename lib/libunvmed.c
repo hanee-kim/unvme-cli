@@ -4764,8 +4764,7 @@ int unvmed_ctx_init(struct unvme *u)
 	ctx->ctrl.cq_size = NVME_AQA_ACQS(aqa) + 1;
 	ctx->ctrl.css = NVME_CC_CSS(cc);
 	ctx->ctrl.timeout = u->timeout;
-	if (u->asq)
-		ctx->ctrl.admin_irq = unvmed_cq_iv(u->acq) == 0;
+	ctx->ctrl.admin_irq = u->asq && unvmed_cq_iv(u->acq) == 0;
 
 	list_add_tail(&u->ctx_list, &ctx->list);
 
