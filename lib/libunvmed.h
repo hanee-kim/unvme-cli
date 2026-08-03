@@ -2442,6 +2442,42 @@ int unvmed_cmd_prep_get_features(struct unvme_cmd *cmd, uint32_t nsid,
 				 uint32_t cdw14, struct iovec *iov, int nr_iov);
 
 /**
+ * unvmed_cmd_prep_get_log_page - Prepare Get Log Page command instance
+ * @cmd: command instance (&struct unvme_cmd)
+ * @nsid: namespace identifier (NVME_NSID_ALL for controller/subsystem-scoped logs)
+ * @lid: log page identifier
+ * @len: length of the data buffer in bytes (must be a multiple of 4)
+ * @iov: user data buffer I/O vector (&struct iovec)
+ * @nr_iov: number of iovecs dangled to @iov
+ *
+ * Prepare a Get Log Page command instance with the given values.  The Log
+ * Specific Parameter (LSP), Log Specific Identifier (LSI), Log Page Offset
+ * (LPOL/LPOU) and Command Set Identifier (CSI) fields are left zero.
+ *
+ * This API is thread-safe.
+ *
+ * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
+ */
+int unvmed_cmd_prep_get_log_page(struct unvme_cmd *cmd, uint32_t nsid,
+				 uint8_t lid, uint32_t len,
+				 struct iovec *iov, int nr_iov);
+
+/**
+ * unvmed_cmd_prep_abort - Prepare Abort command instance
+ * @cmd: command instance (&struct unvme_cmd)
+ * @sqid: submission queue identifier of the command to abort
+ * @cid: command identifier of the command to abort
+ *
+ * Prepare an Abort command instance.  The Abort command carries no data
+ * buffer; Command Dword 10 is encoded as CID[31:16] | SQID[15:0].
+ *
+ * This API is thread-safe.
+ *
+ * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
+ */
+int unvmed_cmd_prep_abort(struct unvme_cmd *cmd, uint16_t sqid, uint16_t cid);
+
+/**
  * unvmed_get_features - Get Features
  * @cmd: command instance (&struct unvme_cmd)
  * @nsid: namespace identifier to identify
