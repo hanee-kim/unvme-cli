@@ -215,6 +215,7 @@ struct unvme_ctx {
 struct unvme_cq_reaper {
 	struct unvme *u;
 	int refcnt;
+	bool owns_efd;		/* true if libunvmed created efd/epoll_fd */
 
 	int vector;
 	int epoll_fd;

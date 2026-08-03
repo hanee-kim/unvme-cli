@@ -798,7 +798,10 @@ ssize_t unvmed_get_max_xfer_size(struct unvme *u)
 
 static inline void unvmed_get_reaper(struct unvme *u, int vector)
 {
-	atomic_inc_fetch(&u->reapers[vector].refcnt);
+	/* Only bump a live reaper. A dead one (refcnt == 0) must not be
+	 * resurrected: callers gate on unvmed_reaper_alive() first. */
+	if (atomic_load_acquire(&u->reapers[vector].refcnt))
+		atomic_inc_fetch(&u->reapers[vector].refcnt);
 }
 
 static inline int unvmed_put_reaper(struct unvme *u, int vector)
@@ -807,8 +810,8 @@ static inline int unvmed_put_reaper(struct unvme *u, int vector)
 }
 
 /*
- * refcnt semantics for struct unvme_cq_reaper:
- *   0      : reaper not initialized (caller-efd mode or not yet init'd)
+ * refcnt semantics for struct unvme_cq_reaper (identical for both modes):
+ *   0      : reaper not initialized (or already torn down)
  *   1      : reaper initialized, no CQ attached
  *   n >= 2 : reaper initialized, (n - 1) CQs attached
  */
@@ -816,7 +819,9 @@ static inline bool unvmed_reaper_alive(struct unvme *u, int vector)
 {
 	if (vector < 0 || vector >= u->nr_efds)
 		return false;
-	return atomic_load_acquire(&u->reapers[vector].refcnt);
+	/* r->u is the live sentinel for both modes (mode A: thread + internal
+	 * efd, mode B: caller efd, no thread).  free_irq_reaper clears it. */
+	return LOAD(u->reapers[vector].u) != NULL;
 }
 
 static int unvmed_init_efd(struct unvme *u, int vector)
@@ -877,6 +882,7 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 		pthread_mutex_destroy(&r->cq_list_lock);
 		return -1;
 	}
+	r->owns_efd = true;	/* mode A: libunvmed owns efd + epoll_fd */
 
 	unvmed_log_debug("%s: vector=%d initialized (efd=%d, epoll_fd=%d)",
 			unvmed_bdf(u), vector, r->efd, r->epoll_fd);
@@ -897,7 +903,13 @@ static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
 	pthread_mutex_unlock(&r->cq_list_lock);
 	pthread_mutex_destroy(&r->cq_list_lock);
 
-	unvmed_free_efd(r->efd, r->epoll_fd);
+	/*
+	 * Mode A (owns_efd): libunvmed created efd + epoll_fd, free them.
+	 * Mode B (caller-efd): caller owns the fd; epoll_fd is unused and the
+	 * fd must NOT be closed here.
+	 */
+	if (r->owns_efd)
+		unvmed_free_efd(r->efd, r->epoll_fd);
 
 	memset(r, 0, sizeof(*r));
 }
@@ -969,7 +981,7 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 	struct unvme_cq_reaper *r = &u->reapers[vector];
 	int ret;
 
-	if (!atomic_load_acquire(&r->refcnt))
+	if (!unvmed_reaper_alive(u, vector))
 		return 0;
 
 	/* refcnt > 1 means CQs are still attached; defer teardown. */
@@ -977,11 +989,13 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 		return 0;
 
 	/*
-	 * refcnt reached 1 (no CQs left); wake up the reaper thread and
-	 * tear down the reaper.
+	 * refcnt reached 1 (no CQs left); wake up the reaper thread (mode A
+	 * only) and tear down the reaper.  Mode B has no thread to join.
 	 */
-	eventfd_write(r->efd, 1);
-	pthread_join(r->th, NULL);
+	if (r->owns_efd) {
+		eventfd_write(r->efd, 1);
+		pthread_join(r->th, NULL);
+	}
 
 	ret = vfio_disable_irq(&u->ctrl.pci.dev, vector, 1);
 	if (ret) {
@@ -1005,8 +1019,8 @@ static int __unvmed_init_irq(struct unvme *u, int vector, int efd)
 		return -1;
 	}
 
-	if (u->efds[vector] >= 0) {
-		bool was_caller_efd = !atomic_load_acquire(&r->refcnt);
+	if (unvmed_reaper_alive(u, vector)) {
+		bool was_caller_efd = !r->owns_efd;
 		bool now_caller_efd = (efd >= 0);
 
 		if (was_caller_efd != now_caller_efd) {
@@ -1018,9 +1032,24 @@ static int __unvmed_init_irq(struct unvme *u, int vector, int efd)
 		return 0;
 	}
 
-	if (efd >= 0)
+	if (efd >= 0) {
+		/*
+		 * Caller-efd mode (B): VFIO is wired to the caller's eventfd and
+		 * libunvmed starts no reaper thread.  The caller owns the fd and
+		 * libunvmed will never close it.  refcnt follows the same rule as
+		 * mode A so that free_irq / reaper_alive work uniformly.
+		 * owns_efd stays false so free_irq_reaper won't close the caller fd.
+		 * cq_list_lock is still initialized so free_irq_reaper can drain
+		 * the (always-empty) list uniformly on both init and error paths.
+		 */
+		r->u = u;
+		r->vector = vector;
+		r->efd = efd;
+		r->refcnt = 1;		/* refcnt=1: initialized, no CQ attached yet */
+		list_head_init(&r->cq_list);
+		pthread_mutex_init(&r->cq_list_lock, NULL);
 		u->efds[vector] = efd;
-	else {
+	} else {
 		if (unvmed_init_irq_reaper(u, vector)) {
 			unvmed_log_err("%s: failed to initialize IRQ reaper (vector=%d)", unvmed_bdf(u), vector);
 			return -1;
@@ -1048,10 +1077,17 @@ static int __unvmed_init_irq(struct unvme *u, int vector, int efd)
 		return -1;
 	}
 
-	if (efd < 0)
-		pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
-	else
+	if (efd < 0) {
+		if (pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r)) {
+			unvmed_log_err("%s: failed to create reaper thread (vector=%d)",
+					unvmed_bdf(u), vector);
+			unvmed_free_irq_reaper(r);
+			u->efds[vector] = -1;
+			return -1;
+		}
+	} else {
 		unvmed_log_info("%s: disabled reaper thread %d", unvmed_bdf(u), vector);
+	}
 
 	return 0;
 }
@@ -2825,7 +2861,8 @@ static void unvmed_cq_drain(struct unvme *u, struct unvme_cq *ucq)
 	uint32_t head;
 	uint8_t phase;
 
-	if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq))) {
+	if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq)) &&
+	    u->reapers[unvmed_cq_iv(ucq)].owns_efd) {
 		struct unvme_cq_reaper *r = &u->reapers[unvmed_cq_iv(ucq)];
 
 		eventfd_write(r->efd, 1);  /* Wake up reaper thread */
@@ -3114,7 +3151,14 @@ static void *unvmed_reaper_run(void *opaque)
 		if (unvmed_cq_wait_irq(u, vector))
 			goto out;
 
-		/* refcnt == 1 means no CQs attached; reaper is being torn down. */
+		/*
+		 * refcnt == 1 means no CQs are attached: either teardown is in
+		 * progress (free_irq dropped the last ref and woke us via
+		 * eventfd_write) or no CQ has been added yet.  The latter is safe
+		 * because a reaper is woken only by completions on an attached CQ,
+		 * and init_irq -> create_cq runs in one caller context before any
+		 * I/O can produce completions.
+		 */
 		if (atomic_load_acquire(&r->refcnt) <= 1)
 			goto out;
 
@@ -3495,12 +3539,21 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 		ucq->q->vector = -1;
 		unvmed_cq_iv(ucq) = -1;
 	} else {
-		struct unvme_cq_reaper *r = unvmed_get_reaper(u, vector);
+		if (!unvmed_reaper_alive(u, vector)) {
+			unvmed_log_err("%s: vector=%d not initialized",
+					unvmed_bdf(u), vector);
+			errno = EINVAL;
+			unvmed_cmd_put(cmd);
+			nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
+			unvmed_sq_put(u, asq);
+			return -1;
+		}
+		unvmed_get_reaper(u, vector);
 
-		if (r && unvmed_reaper_add_cq(u, ucq)) {
+		if (unvmed_reaper_add_cq(u, ucq)) {
 			unvmed_log_err("%s: failed to register ucq to reaper (qid=%d)",
 					unvmed_bdf(u), qid);
-			unvmed_put_reaper(r);
+			unvmed_put_reaper(u, vector);
 			unvmed_cmd_put(cmd);
 			nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
 			unvmed_sq_put(u, asq);
@@ -3521,8 +3574,11 @@ static void __unvmed_delete_cq(struct unvme *u, struct unvme_cq *ucq)
 	int vector = unvmed_cq_iv(ucq);
 	bool irq = unvmed_cq_irq_enabled(ucq);
 
-	if (irq && unvmed_reaper_alive(u, vector))
+	if (irq && unvmed_reaper_alive(u, vector)) {
+		unvmed_get_reaper(u, vector);
 		unvmed_reaper_del_cq(u, ucq);
+		unvmed_put_reaper(u, vector);
+	}
 
 	unvmed_discard_cq(u, qid);
 	unvmed_cq_put(u, ucq);
@@ -3545,8 +3601,11 @@ static void __unvmed_delete_cq_all(struct unvme *u)
 		if (!ucq)
 			continue;
 
-		if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq)))
+		if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq))) {
+			unvmed_get_reaper(u, unvmed_cq_iv(ucq));
 			unvmed_reaper_del_cq(u, ucq);
+			unvmed_put_reaper(u, unvmed_cq_iv(ucq));
+		}
 
 		unvmed_log_info("%s: Deleting ucq (qid=%d)", unvmed_bdf(u), unvmed_cq_id(ucq));
 
@@ -4843,7 +4902,14 @@ int unvmed_ctx_init(struct unvme *u)
 		ctx->cq.qsize = unvmed_cq_size(ucq);
 		ctx->cq.vector = unvmed_cq_iv(ucq);
 		ctx->cq.pc = ucq->pc;
-		ctx->cq.efd = unvmed_reaper_alive(u, unvmed_cq_iv(ucq)) ? -1 : u->efds[unvmed_cq_iv(ucq)];
+		/*
+		 * Mode A (owns_efd): libunvmed owns the eventfd, so ctx stores -1
+		 * and recreates it on restore.  Mode B (caller-efd): preserve the
+		 * caller's efd so restore re-wires the same fd without recreating.
+		 */
+		ctx->cq.efd = (unvmed_reaper_alive(u, unvmed_cq_iv(ucq)) &&
+			       u->reapers[unvmed_cq_iv(ucq)].owns_efd)
+			      ? -1 : u->efds[unvmed_cq_iv(ucq)];
 
 		list_add_tail(&u->ctx_list, &ctx->list);
 		unvmed_cq_put(u, ucq);
@@ -5266,11 +5332,17 @@ static struct unvme_cq *__unvmed_init_cq(struct unvme *u, uint32_t qid, uint32_t
 		unvmed_cq_iv(ucq) = -1;
 
 	if (vector >= 0) {
-		struct unvme_cq_reaper *r = unvmed_get_reaper(u, vector);
+		if (!unvmed_reaper_alive(u, vector)) {
+			unvmed_log_err("%s: vector=%d not initialized",
+					unvmed_bdf(u), vector);
+			errno = EINVAL;
+			return NULL;
+		}
+		unvmed_get_reaper(u, vector);
 
-		if (r && unvmed_reaper_add_cq(u, ucq)) {
+		if (unvmed_reaper_add_cq(u, ucq)) {
 			unvmed_log_err("%s: failed to register ucq to reaper", unvmed_bdf(u));
-			unvmed_put_reaper(r);
+			unvmed_put_reaper(u, vector);
 			return NULL;
 		}
 	}
