@@ -1069,8 +1069,21 @@ static void unvmed_free_irq_all(struct unvme *u)
 {
 	int vector;
 
-	for (vector = 0; vector < u->nr_efds; vector++)
+	for (vector = 0; vector < u->nr_efds; vector++) {
+		struct unvme_cq_reaper *r = &u->reapers[vector];
+
+		/*
+		 * Every CQ attached to the vector left a reference behind and
+		 * unvmed_free_irq() only drops one per call.  Release the rest
+		 * here so that the call below really is the last put: both
+		 * callers are about to drop the reaper for good, so a deferred
+		 * teardown would leave its thread running on freed memory.
+		 */
+		while (atomic_load_acquire(&r->refcnt) > 1)
+			atomic_dec_fetch(&r->refcnt);
+
 		unvmed_free_irq(u, vector);
+	}
 }
 
 static int unvmed_free_irqs(struct unvme *u)
