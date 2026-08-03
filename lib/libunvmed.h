@@ -3153,19 +3153,63 @@ void unvmed_del_thread(struct unvme *u);
 struct json_object *unvmed_to_json(struct unvme *u);
 
 /**
+ * UNVMED_IRQ_F_NO_REAPER - Do not start a reaper thread for the vector
+ *
+ * libunvmed still creates and owns the eventfd VFIO signals, but nothing
+ * inside libunvmed consumes it.  The application observes interrupts with
+ * unvmed_irq_get_count() or unvmed_irq_efd() and is responsible for reaping
+ * the CQs attached to the vector itself.
+ *
+ * Note that unvmed_cmd_wait() sleeps until somebody reaps the CQ, so it must
+ * not be called from the same thread that is expected to do the reaping.
+ */
+#define UNVMED_IRQ_F_NO_REAPER		(1 << 0)
+
+/**
  * unvmed_init_irq - Initialize interrupt routing for a vector
  * @u: &struct unvme
  * @vector: interrupt vector (0 <= vector < nr_irqs)
+ * @flags: ``0``, or ``UNVMED_IRQ_F_NO_REAPER``
  *
- * Wire @vector up in VFIO and start a reaper thread that reaps the CQs
- * attached to it.  Calling it again for a vector that is already initialized
- * is a no-op.
+ * Wire @vector up in VFIO.  With @flags of 0 a reaper thread is started to
+ * reap the CQs attached to the vector.  Calling it again for a vector that is
+ * already initialized is a no-op, unless @flags differ, which fails.
  *
  * Must be called before unvmed_create_cq() / unvmed_init_cq() for the same
  * vector.
  *
  * Return: 0 on success, ``-1`` with ``errno`` set on failure.
  */
-int unvmed_init_irq(struct unvme *u, int vector);
+int unvmed_init_irq(struct unvme *u, int vector, unsigned int flags);
+
+/**
+ * unvmed_irq_get_count - Number of interrupts delivered since the last call
+ * @u: &struct unvme
+ * @vector: interrupt vector initialized with ``UNVMED_IRQ_F_NO_REAPER``
+ * @count: output, number of interrupts, ``0`` if none has arrived
+ *
+ * Drain the interrupt counter of @vector.  This never blocks, so it can be
+ * polled, and it never reports the same interrupt twice.
+ *
+ * Return: 0 on success, ``-1`` with ``errno`` set on failure.  ``EBUSY``
+ * means @vector has a reaper thread that owns the eventfd.
+ */
+int unvmed_irq_get_count(struct unvme *u, int vector, uint64_t *count);
+
+/**
+ * unvmed_irq_efd - eventfd VFIO signals for a vector
+ * @u: &struct unvme
+ * @vector: interrupt vector initialized with ``UNVMED_IRQ_F_NO_REAPER``
+ *
+ * Return the eventfd so that the caller can wait on it in its own event loop.
+ * Reading it directly is equivalent to unvmed_irq_get_count(): the fd is
+ * non-blocking and a read drains the whole counter.
+ *
+ * The fd belongs to libunvmed and is closed when the vector is freed.  A
+ * controller reset re-creates it, so do not cache it across one.
+ *
+ * Return: the eventfd on success, ``-1`` with ``errno`` set on failure.
+ */
+int unvmed_irq_efd(struct unvme *u, int vector);
 
 #endif
