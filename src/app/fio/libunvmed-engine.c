@@ -5,6 +5,7 @@
 #include "fio.h"
 #include "optgroup.h"
 #include "crc/crc-t10dif.h"
+#include "crc/crc32c.h"
 #include "crc/crc64.h"
 
 #undef cpu_to_le64
@@ -507,6 +508,8 @@ struct libunvmed_data {
 	void *prp_list_iomem;
 	size_t prp_list_iomem_size;
 	size_t prp_list_iomem_usize;  /* unit size for per io_u */
+	int prp_list_nr_lists;
+	uint64_t prp_list_iomem_iova;
 
 	/*
 	 * metadata buffer and size
@@ -564,6 +567,18 @@ struct nvme_16b_guard_dif {
 	__be16 guard;
 	__be16 apptag;
 	__be32 srtag;
+};
+
+struct nvme_32b_guard_dif {
+	__be32 guard;
+	__be16 apptag;
+	/*
+	 * Combined Storage Tag and Reference Tag field, 80 bits wide.
+	 * Storage Tag occupies the upper STS bits, Reference Tag the rest.
+	 * With Storage Tag unsupported and a 48-bit LBA-derived Reference Tag,
+	 * sr[0..3] are zero and sr[4..9] hold the 48-bit Reference Tag in BE.
+	 */
+	uint8_t sr[10];
 };
 
 struct nvme_64b_guard_dif {
@@ -652,6 +667,15 @@ static inline uint64_t libunvmed_to_meta_iova(struct thread_data *td, void *mbuf
 	uint64_t offset = (uint64_t)(mbuf - (void *)ld->meta_iomem);
 
 	return ld->meta_iomem_iova + (uint64_t)offset;
+}
+
+static inline uint64_t libunvmed_to_prp_list_iova(struct thread_data *td,
+						  void *prplist)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+	uint64_t offset = (uint64_t)(prplist - (void *)ld->prp_list_iomem);
+
+	return ld->prp_list_iomem_iova + (uint64_t)offset;
 }
 
 static inline int libunvmed_pi_enabled(struct unvme_ns *ns)
@@ -1032,6 +1056,168 @@ static int libunvmed_parse_prchk(struct libunvmed_options *o)
 		return -1;
 }
 
+/*
+ * Map the io_u / PRP / PRP-list buffers owned by @td into the
+ * controller's IOMMU space.  Buffers are mapped in order:
+ *
+ *   1. td->orig_buffer          (skipped when o->cmb_data — CMB uses
+ *                                unvmed_to_iova() instead of map_vaddr)
+ *   2. ld->prp_iomem
+ *   3. ld->prp_list_iomem
+ *
+ * On any failure the function unwinds only the mappings it just
+ * established in this call — the metadata / TRIM buffers and any
+ * unrelated mappings are left alone.  The backing host pages
+ * (unvmed_pgmap allocations) are *not* freed here.
+ *
+ * Return: 0 on success, -1 on failure (with td_vmsg already invoked).
+ */
+static int libunvmed_map_mems(struct thread_data *td)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
+	struct unvme *u = ld->u;
+	bool orig_mapped = false;
+	bool prp_mapped = false;
+	int ret = 0;
+
+	if (ld->orig_buffer_size) {
+		if (o->cmb_data) {
+			unvmed_to_iova(u, td->orig_buffer, &ld->orig_buffer_iova);
+		} else {
+			ret = unvmed_map_vaddr(u, td->orig_buffer,
+					ld->orig_buffer_size,
+					&ld->orig_buffer_iova, 0);
+			if (ret) {
+				libunvmed_log("failed to map io_u buffers to iommu\n");
+				td_vmsg(td, EFAULT, "buffer mapping failed",
+						"libunvmed_map_mems");
+				return -1;
+			}
+			orig_mapped = true;
+		}
+	}
+
+	if (ld->prp_iomem) {
+		uint64_t iova;
+
+		ret = unvmed_map_vaddr(u, ld->prp_iomem, ld->prp_iomem_size,
+				&iova, 0);
+		if (ret) {
+			libunvmed_log("failed to map prp iomem to iommu\n");
+			td_vmsg(td, EFAULT, "buffer mapping failed",
+					"libunvmed_map_mems");
+			goto err;
+		}
+		prp_mapped = true;
+	}
+
+	if (ld->prp_list_iomem) {
+		uint64_t iova;
+
+		ret = unvmed_map_vaddr(u, ld->prp_list_iomem,
+				ld->prp_list_iomem_size, &iova, 0);
+		if (ret) {
+			libunvmed_log("failed to map prp_list iomem to iommu\n");
+			td_vmsg(td, EFAULT, "buffer mapping failed",
+					"libunvmed_map_mems");
+			goto err;
+		}
+		ld->prp_list_iomem_iova = iova;
+	}
+
+	return 0;
+
+err:
+	if (prp_mapped && unvmed_unmap_vaddr(u, ld->prp_iomem))
+		libunvmed_log("failed to unmap prp_iomem\n");
+	if (orig_mapped && unvmed_unmap_vaddr(u, td->orig_buffer))
+		libunvmed_log("failed to unmap orig_buffer\n");
+	return -1;
+}
+
+/*
+ * reinit_ctrl callback: libunvmed invokes this on each thread that
+ * registered with unvmed_add_thread() after the controller instance
+ * has been destroyed and re-created (e.g. an SR-IOV VF freed and
+ * re-enumerated after a PF reset).  Every DMA buffer this thread
+ * owns must be re-mapped against the new controller instance:
+ *
+ *   1. io_u / PRP / PRP-list — delegated to libunvmed_map_mems()
+ *      (the same set fio_libunvmed_open_file() maps on first open).
+ *   2. metadata buffer (ld->meta_iomem), when present.
+ *   3. TRIM buffer (ld->trim_iomem), when present.
+ *
+ * Any buffer that undergoes IOMMU mapping via unvmed_map_vaddr() in
+ * either fio_libunvmed_open_file() or libunvmed_init_data() must be
+ * covered here.  If new buffers are added to those paths, mirror
+ * them in this callback or the controller will silently see stale
+ * IOVAs after a reinit.
+ *
+ * Failure handling: every IOMMU mapping established during this
+ * callback is rolled back before returning -EFAULT, so the
+ * controller is left without partial IOMMU residues.  The host-side
+ * backing pages (unvmed_pgmap allocations) are NOT freed — they
+ * stay live across the remap retry.  Freeing them here would turn
+ * a recoverable failure into a use-after-free the next time the
+ * ioengine touches ld->{prp,prp_list,meta,trim}_iomem.
+ *
+ * On success ld->epoch is refreshed via unvmed_get_epoch() so
+ * fio_libunvmed_close_file() sees the new instance and takes the
+ * normal unmap path instead of the "stale epoch — skip unmaps" path.
+ */
+static int libunvmed_remap_mems_cb(void *opaque)
+{
+	struct thread_data *td = (struct thread_data *)opaque;
+	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
+	struct unvme *u = ld->u;
+	bool meta_mapped = false;
+
+	if (libunvmed_map_mems(td))
+		return -EFAULT;
+
+	if (ld->meta_iomem) {
+		if (unvmed_map_vaddr(u, ld->meta_iomem, ld->meta_iomem_size,
+				&ld->meta_iomem_iova, 0)) {
+			libunvmed_log("failed to map vaddr for metadata\n");
+			td_vmsg(td, EFAULT, "buffer mapping failed",
+					"libunvmed_remap_mems_cb");
+			goto err;
+		}
+		meta_mapped = true;
+	}
+
+	if (ld->trim_iomem) {
+		if (unvmed_map_vaddr(u, ld->trim_iomem, ld->trim_iomem_size,
+				&ld->trim_iomem_iova, 0)) {
+			libunvmed_log("failed to map vaddr for TRIM buffer\n");
+			td_vmsg(td, EFAULT, "buffer mapping failed",
+					"libunvmed_remap_mems_cb");
+			goto err;
+		}
+	}
+
+	ld->epoch = unvmed_get_epoch(u);
+	return 0;
+
+err:
+	if (meta_mapped && unvmed_unmap_vaddr(u, ld->meta_iomem))
+		libunvmed_log("failed to unmap meta_iomem on rollback\n");
+	if (ld->prp_list_iomem && unvmed_unmap_vaddr(u, ld->prp_list_iomem))
+		libunvmed_log("failed to unmap prp_list_iomem on rollback\n");
+	if (ld->prp_iomem && unvmed_unmap_vaddr(u, ld->prp_iomem))
+		libunvmed_log("failed to unmap prp_iomem on rollback\n");
+	if (td->orig_buffer && ld->orig_buffer_size && !o->cmb_data &&
+	    unvmed_unmap_vaddr(u, td->orig_buffer))
+		libunvmed_log("failed to unmap orig_buffer on rollback\n");
+	return -EFAULT;
+}
+
+static const struct unvmed_thread_ops libunvmed_thread_ops = {
+	.reinit_ctrl = libunvmed_remap_mems_cb,
+};
+
 static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 {
 	struct libunvmed_data *ld = td->io_ops_data;
@@ -1083,60 +1269,31 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 	 * 0-sized memory allocation, we should check the orig_buffer_size
 	 * here.
 	 */
-	if (ld->orig_buffer_size) {
-		if (o->cmb_data)
-			unvmed_to_iova(u, td->orig_buffer, &ld->orig_buffer_iova);
-		else {
-			ret = unvmed_map_vaddr(u, td->orig_buffer, ld->orig_buffer_size,
-					&ld->orig_buffer_iova, 0);
-			if (ret) {
-				libunvmed_log("failed to map io_u buffers to iommu\n");
-				ret = -1;
-				td_vmsg(td, EFAULT, "buffer mapping failed",
-						"fio_libunvmed_open_file");
-				goto out;
-			}
-		}
-	}
+	ret = libunvmed_map_mems(td);
 
-	if (ld->prp_iomem) {
-		uint64_t iova;
-
-		ret = unvmed_map_vaddr(u, ld->prp_iomem, ld->prp_iomem_size,
-				&iova, 0);
-		if (ret) {
-			libunvmed_log("failed to map prp iomem to iommu\n");
-			ret = -1;
-			td_vmsg(td, EFAULT, "buffer mapping failed",
-					"fio_libunvmed_open_file");
-			goto out;
-		}
-	}
-
-	if (ld->prp_list_iomem) {
-		uint64_t iova;
-
-		ret = unvmed_map_vaddr(u, ld->prp_list_iomem, ld->prp_list_iomem_size,
-				&iova, 0);
-		if (ret) {
-			libunvmed_log("failed to map prp_list iomem to iommu\n");
-
-			if (ld->prp_iomem && unvmed_unmap_vaddr(u, ld->prp_iomem))
-				libunvmed_log("failed to unmap prp_iomem\n");
-			if (td->orig_buffer && unvmed_unmap_vaddr(u, td->orig_buffer))
-				libunvmed_log("failed to unmap orig_buffer\n");
-
-			ret = -1;
-			td_vmsg(td, EFAULT, "buffer mapping failed",
-					"fio_libunvmed_open_file");
-			goto out;
-		}
-	}
+	if (ret)
+		goto out;
 
 	if (libunvmed_parse_prchk(o)) {
 		libunvmed_log("'pi_chk=' has neither GUARD, APPTAG, or REFTAG\n");
 		ret = -1;
 		td_vmsg(td, EINVAL, "invalid pi_chk", "fio_libunvmed_open_file");
+		goto out;
+	}
+
+	/*
+	 * For extended LBA (DIF, interleaved metadata), the PI tuple occupies
+	 * the tail of every xfer_buf block.  fio's verify header covers the
+	 * whole buffer including that region, so writing PI over it corrupts
+	 * the checksum.  Reject the combination up front, same as io_uring_cmd.
+	 */
+	if (libunvmed_ns_meta_is_dif(ld->ns) && libunvmed_pi_enabled(ld->ns) &&
+	    td->o.verify != VERIFY_NONE) {
+		log_err("%s: for extended LBA, verify cannot be used when E2E "
+			"data protection is enabled\n", f->file_name);
+		ret = -1;
+		td_vmsg(td, EINVAL, "E2E + verify conflict",
+				"fio_libunvmed_open_file");
 		goto out;
 	}
 
@@ -1155,6 +1312,7 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 	}
 
 	ld->epoch = unvmed_get_epoch(u);
+	unvmed_add_thread(ld->u, &libunvmed_thread_ops, td);
 
 out:
 	if (ret) {
@@ -1185,6 +1343,8 @@ static int fio_libunvmed_close_file(struct thread_data *td,
 		libunvmed_log("failed to grab mutex lock\n");
 		return ret;
 	}
+
+	unvmed_del_thread(ld->u);
 
 	if (ld->epoch != unvmed_get_epoch(ld->u)) {
 		libunvmed_log("skipping close_file unmaps: stale ctrl epoch (%u != %u)\n",
@@ -1286,6 +1446,7 @@ static int fio_libunvmed_iomem_alloc(struct thread_data *td, size_t total_mem)
 
 		ld->prp_list_iomem = ptr;
 		ld->prp_list_iomem_size = size;
+		ld->prp_list_nr_lists = 1;
 	} else {
 		/*
 		 * Give +1 spare since the last entry of a prplist is a linked
@@ -1310,6 +1471,7 @@ static int fio_libunvmed_iomem_alloc(struct thread_data *td, size_t total_mem)
 
 		ld->prp_list_iomem_size = size;
 		ld->prp_list_iomem_usize = (size_t)nr_lists * unvmed_pagesize(u);
+		ld->prp_list_nr_lists = nr_lists;
 	}
 
 	pthread_mutex_unlock(&g_serialize);
@@ -1506,6 +1668,93 @@ static void libunvmed_fill_pi_64b_guard(struct thread_data *td, struct io_u *io_
 	}
 }
 
+/*
+ * XXX: This allocates a temporary buffer to concatenate lba data and metadata
+ * prefix before calling fio_crc32c(), which causes a performance drop per LBA.
+ * Once fio core provides a seed-based fio_crc32c(seed, buf, len) API, replace
+ * this with two chained calls and drop the allocation.
+ */
+static inline uint32_t libunvmed_crc32c_sep(const void *buf, size_t buf_len,
+					    const void *mbuf, size_t mbuf_len)
+{
+	size_t total = buf_len + mbuf_len;
+	uint8_t *tmp = malloc(total);
+	uint32_t crc;
+
+	memcpy(tmp, buf, buf_len);
+	memcpy(tmp + buf_len, mbuf, mbuf_len);
+	crc = fio_crc32c(tmp, total);
+	free(tmp);
+
+	return crc;
+}
+
+static void libunvmed_fill_pi_32b_guard(struct thread_data *td, struct io_u *io_u)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
+	struct libunvmed_meta_options *mo = io_u->engine_data;
+	struct unvme_ns *ns = ld->ns;
+	struct nvme_32b_guard_dif *pi;
+	void *buf = io_u->xfer_buf;
+	void *mbuf = mo->mbuf;
+	uint32_t lba_idx = 0;
+	uint64_t slba = libunvmed_get_slba(ns, io_u->offset);
+	uint32_t nlb = libunvmed_get_nlba(ns, io_u->xfer_buflen);
+	uint32_t guard;
+
+	if (ns->dps & NVME_NS_DPS_PI_FIRST) {
+		if (libunvmed_ns_meta_is_dif(ns))
+			mo->interval = ns->lba_size;
+		else
+			mo->interval = 0;
+	} else {
+		if (libunvmed_ns_meta_is_dif(ns))
+			mo->interval = ns->lba_size + ns->ms - sizeof(struct nvme_32b_guard_dif);
+		else
+			mo->interval = ns->ms - sizeof(struct nvme_32b_guard_dif);
+	}
+
+	if (io_u->ddir == DDIR_READ)
+		return;
+
+	while (lba_idx <= nlb) {
+		if (libunvmed_ns_meta_is_dif(ns))
+			pi = (struct nvme_32b_guard_dif *)(buf + mo->interval);
+		else
+			pi = (struct nvme_32b_guard_dif *)(mbuf + mo->interval);
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_GUARD) {
+			if (libunvmed_ns_meta_is_dif(ns))
+				guard = fio_crc32c(buf, mo->interval);
+			else
+				guard = libunvmed_crc32c_sep(buf, ns->lba_size,
+							     mbuf, mo->interval);
+			pi->guard = cpu_to_be32(guard ^ 0xffffffff);
+			if (o->meta_err_injection & UNVME_ERR_GUARD)
+				libunvmed_inject_err_to_meta((uint8_t *)&(pi->guard));
+		}
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_APP)
+			pi->apptag = cpu_to_be16(mo->apptag & mo->apptag_mask);
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_REF) {
+			memset(pi->sr, 0, 4);
+			put_unaligned_be48(slba + lba_idx, &pi->sr[4]);
+			if (o->meta_err_injection & UNVME_ERR_REFTAG)
+				libunvmed_inject_err_to_meta(&pi->sr[4]);
+		}
+
+		buf += ns->lba_size;
+		if (libunvmed_ns_meta_is_dif(ns))
+			buf += ns->ms;
+		else
+			mbuf += ns->ms;
+
+		lba_idx++;
+	}
+}
+
 static void libunvmed_fill_pi(struct thread_data *td, struct io_u *io_u,
 			      struct nvme_cmd_rw *sqe)
 {
@@ -1525,6 +1774,7 @@ static void libunvmed_fill_pi(struct thread_data *td, struct io_u *io_u,
 			libunvmed_fill_pi_16b_guard(td, io_u);
 			break;
 		case NVME_NVM_PIF_32B_GUARD:
+			libunvmed_fill_pi_32b_guard(td, io_u);
 			break;
 		case NVME_NVM_PIF_64B_GUARD:
 			libunvmed_fill_pi_64b_guard(td, io_u);
@@ -1556,7 +1806,8 @@ static void libunvmed_fill_pi(struct thread_data *td, struct io_u *io_u,
 		case NVME_NS_DPS_PI_TYPE2:
 			if (ns->pif == NVME_NVM_PIF_16B_GUARD)
 				sqe->reftag = cpu_to_le32((uint32_t)slba);
-			else if (ns->pif == NVME_NVM_PIF_64B_GUARD) {
+			else if (ns->pif == NVME_NVM_PIF_32B_GUARD ||
+				 ns->pif == NVME_NVM_PIF_64B_GUARD) {
 				sqe->reftag = cpu_to_le32(slba & 0xffffffff);
 				sqe->cdw3 = cpu_to_le32(((slba >> 32) & 0xffff));
 			}
@@ -1588,6 +1839,7 @@ static enum fio_q_status fio_libunvmed_rw(struct thread_data *td,
 
 	void *buf = io_u->xfer_buf;
 	void *list = NULL;
+	iova_t list_iova;
 	size_t len = io_u->xfer_buflen;
 	void *mbuf = mo->mbuf;
 	size_t mlen = mo->mlen;
@@ -1646,15 +1898,16 @@ static enum fio_q_status fio_libunvmed_rw(struct thread_data *td,
 	cmd->sqe = (union nvme_cmd)sqe;
 
 	list = ld->prp_list_iomem + (io_u->index * ld->prp_list_iomem_usize);
+	list_iova = libunvmed_to_prp_list_iova(td, list);
 
 	if (o->enable_sgl) {
 		sqe.flags |= NVME_CMD_FLAGS_PSDT_SGL_MPTR_CONTIG <<
 			NVME_CMD_FLAGS_PSDT_SHIFT;
 		ret = __unvmed_mapv_sgl_seg(cmd, (union nvme_cmd *)&sqe,
-				list, &cmd->buf.iov, 1);
+				list, list_iova, &cmd->buf.iov, 1);
 	} else
 		ret = __unvmed_mapv_prp_list(cmd, (union nvme_cmd *)&sqe,
-				list, &cmd->buf.iov, 1);
+				list, ld->prp_list_nr_lists, &cmd->buf.iov, 1);
 
 	if (ret) {
 		unvmed_cmd_put(cmd);
@@ -2048,6 +2301,90 @@ next:
 	return 0;
 }
 
+static int libunvmed_verify_pi_32b_guard(struct thread_data *td, struct io_u *io_u)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
+	struct libunvmed_meta_options *mo = io_u->engine_data;
+	struct unvme_ns *ns = ld->ns;
+	struct nvme_32b_guard_dif *pi;
+	void *buf = io_u->xfer_buf;
+	void *mbuf = mo->mbuf;
+	uint32_t lba_idx = 0;
+	uint64_t slba = libunvmed_get_slba(ns, io_u->offset);
+	uint32_t nlb = libunvmed_get_nlba(ns, io_u->xfer_buflen);
+
+	while (lba_idx <= nlb) {
+		if (libunvmed_ns_meta_is_dif(ns))
+			pi = (struct nvme_32b_guard_dif *)(buf + mo->interval);
+		else
+			pi = (struct nvme_32b_guard_dif *)(mbuf + mo->interval);
+
+		if (((ns->dps & NVME_NS_DPS_PI_MASK) == NVME_NS_DPS_PI_TYPE1 ||
+		    (ns->dps & NVME_NS_DPS_PI_MASK) == NVME_NS_DPS_PI_TYPE2) &&
+		    be16_to_cpu(pi->apptag) == 0xffff)
+			goto next;
+
+		if ((ns->dps & NVME_NS_DPS_PI_MASK) == NVME_NS_DPS_PI_TYPE3 &&
+		    be16_to_cpu(pi->apptag) == 0xffff &&
+		    get_unaligned_be48(&pi->sr[4]) == 0xffffffffffff)
+			goto next;
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_GUARD) {
+			uint32_t guard = be32_to_cpu(pi->guard);
+			uint32_t guard_exp;
+			if (libunvmed_ns_meta_is_dif(ns))
+				guard_exp = fio_crc32c(buf, mo->interval);
+			else
+				guard_exp = libunvmed_crc32c_sep(buf, ns->lba_size,
+								 mbuf, mo->interval);
+			guard_exp = guard_exp ^ 0xffffffff;
+			if (guard != guard_exp) {
+				libunvmed_log("Guard check error, guard=%#x, expected=%#x\n", guard, guard_exp);
+				return -EIO;
+			}
+		}
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_APP) {
+			uint16_t at = be16_to_cpu(pi->apptag & mo->apptag_mask);
+			uint16_t at_exp = mo->apptag & mo->apptag_mask;
+			if (at != at_exp) {
+				libunvmed_log("Apptag check error, apptag=%#x, expected=%#x\n", at, at_exp);
+				return -EIO;
+			}
+		}
+
+		if (o->prchk & NVME_IO_PRINFO_PRCHK_REF) {
+			switch (ns->dps & NVME_NS_DPS_PI_MASK) {
+			case NVME_NS_DPS_PI_TYPE1:
+			case NVME_NS_DPS_PI_TYPE2:
+				uint64_t rt = get_unaligned_be48(&pi->sr[4]);
+				uint64_t rt_exp = slba + lba_idx;
+				if (rt != rt_exp) {
+					libunvmed_log("Reftag check error, reftag=%#lx, expected=%#lx\n", rt, rt_exp);
+					return -EIO;
+				}
+				break;
+			case NVME_NS_DPS_PI_TYPE3:
+				break;
+			default:
+				assert(false);
+			}
+		}
+
+next:
+		buf += ns->lba_size;
+		if (libunvmed_ns_meta_is_dif(ns))
+			buf += ns->ms;
+		else
+			mbuf += ns->ms;
+
+		lba_idx++;
+	}
+
+	return 0;
+}
+
 static int libunvmed_verify_pi(struct thread_data *td, struct io_u *io_u)
 {
 	struct libunvmed_data *ld = td->io_ops_data;
@@ -2055,10 +2392,8 @@ static int libunvmed_verify_pi(struct thread_data *td, struct io_u *io_u)
 
 	if (ns->pif == NVME_NVM_PIF_16B_GUARD)
 		return libunvmed_verify_pi_16b_guard(td, io_u);
-	else if (ns->pif == NVME_NVM_PIF_32B_GUARD) {
-		libunvmed_log("Not support 32B guard PI\n");
-		return -EINVAL;
-	}
+	else if (ns->pif == NVME_NVM_PIF_32B_GUARD)
+		return libunvmed_verify_pi_32b_guard(td, io_u);
 	else if (ns->pif == NVME_NVM_PIF_64B_GUARD)
 		return libunvmed_verify_pi_64b_guard(td, io_u);
 

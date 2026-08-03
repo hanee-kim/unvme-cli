@@ -49,6 +49,14 @@ struct unvme {
 	 */
 	uint32_t epoch;
 
+	/*
+	 * Per-thread callback entries registered via unvmed_add_app().
+	 * Keyed by thread_id.  Invoked on controller enable so application
+	 * threads can respond without polling.
+	 */
+	struct list_head thread_list;
+	pthread_mutex_t thread_list_lock;
+
 	enum unvme_state state;
 	pthread_rwlock_t lock;
 
@@ -124,6 +132,13 @@ struct unvme_dmabuf {
 	struct list_node list;
 };
 
+struct unvme_thread_entry {
+	pid_t thread_id;
+	const struct unvmed_thread_ops *ops;
+	void *opaque;
+	struct list_node list;
+};
+
 static inline int unvmed_pow(int base, int exp)
 {
 	int ret = 1;
@@ -170,6 +185,7 @@ struct unvme_ctx {
 			int timeout;
 			uint8_t css;
 			bool admin_irq;
+			unsigned int admin_irq_flags;
 		} ctrl;
 
 		struct {
@@ -186,6 +202,7 @@ struct unvme_ctx {
 			uint32_t qsize;
 			int vector;
 			uint32_t pc;
+			unsigned int irq_flags;
 		} cq;
 
 		struct {
@@ -199,6 +216,7 @@ struct unvme_ctx {
 struct unvme_cq_reaper {
 	struct unvme *u;
 	int refcnt;
+	unsigned int flags;	/* UNVMED_IRQ_F_* the vector was initialized with */
 
 	int vector;
 	int epoll_fd;
@@ -236,7 +254,8 @@ static inline int __unvmed_cmd_wait(struct unvme_cmd *cmd)
 
 	while (!atomic_load_acquire(&cmd->completed)) {
 		if (!unvmed_cq_irq_enabled(cmd->usq->ucq))
-			unvmed_cq_run(cmd->u, cmd->usq, cmd->usq->ucq, NULL);
+			unvmed_cq_run(cmd->u, cmd->usq, cmd->usq->ucq,
+					unvmed_cmd_get_vcq(cmd), NULL);
 		else
 			unvmed_futex_wait(&cmd->completed, 0);
 	}

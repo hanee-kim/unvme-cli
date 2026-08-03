@@ -125,7 +125,8 @@ void unvmed_vcq_free(struct unvme_vcq *vcq)
 }
 
 static int __unvmed_vcq_push(struct unvme *u, struct unvme_vcq *q,
-			     struct nvme_cqe *cqe)
+			     struct nvme_cqe *cqe,
+			     uint32_t injected)
 {
 	uint16_t tail;
 
@@ -137,7 +138,7 @@ static int __unvmed_vcq_push(struct unvme *u, struct unvme_vcq *q,
 		return -EAGAIN;
 	}
 
-	q->vcqe[tail] = (struct unvme_vcqe){ .cqe = *cqe, .bdf = u->u_bdf };
+	q->vcqe[tail] = (struct unvme_vcqe){ .cqe = *cqe, .bdf = u->u_bdf, .injected = injected };
 	atomic_store_release(&q->tail, (tail + 1) % q->qsize);
 	unvmed_log_cmd_vcq_push(cqe);
 
@@ -164,7 +165,7 @@ int unvmed_vcq_push(struct unvme_cmd *cmd, struct nvme_cqe *cqe)
 	}
 
 	do {
-		ret = __unvmed_vcq_push(cmd->u, vcq, cqe);
+		ret = __unvmed_vcq_push(cmd->u, vcq, cqe, cmd->injected);
 	} while (ret == -EAGAIN);
 
 	return 0;
@@ -202,7 +203,12 @@ int unvmed_vcq_push_to_other(struct unvme *u, struct nvme_cqe *cqe)
 
 int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *vcqe)
 {
-	uint16_t head = atomic_load_acquire(&q->head);
+	uint16_t head;
+
+	if (!q)
+		return -ENOENT;
+
+	head = atomic_load_acquire(&q->head);
 
 	if (head == atomic_load_acquire(&q->tail))
 		return -ENOENT;
@@ -263,11 +269,4 @@ int unvmed_vcq_run_n(struct unvme *u, struct unvme_vcq *vcq,
 		return ret;
 
 	return ret + n;
-}
-
-void unvmed_vcq_drain(struct unvme_vcq *vcq)
-{
-	/* Wait for @vcq to be empty (reaped by application) */
-	while (LOAD(vcq->head) != LOAD(vcq->tail))
-		;
 }

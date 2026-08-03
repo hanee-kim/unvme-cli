@@ -69,31 +69,66 @@ struct unvme_timer {
 
 enum unvme_state {
 	/*
-	 * Controller disabled state which is the first state.
+	 * Controller disabled state which is the first state. (1)
 	 */
-	UNVME_DISABLED	= 0,
+	UNVME_DISABLED		= 1U << 0,
 	/*
-	 * Started to enable the controller, after this, UNVME_ENABELD.
+	 * Started to enable the controller, after this, UNVME_ENABELD. (2)
 	 */
-	UNVME_ENABLING,
+	UNVME_ENABLING		= 1U << 1,
 	/*
-	 * Controller enabled state which is alive.
+	 * Controller enabled state which is alive. (4)
 	 */
-	UNVME_ENABLED,
+	UNVME_ENABLED		= 1U << 2,
 	/*
-	 * Resetting the controller, after this, UNVME_DISABLED.
+	 * Resetting the controller, after this, UNVME_DISABLED. (8)
 	 */
-	UNVME_RESETTING,
+	UNVME_RESETTING		= 1U << 3,
 	/*
 	 * The final state going to release the unvme controller instance for
-	 * good.
+	 * good. (16)
+	 *
+	 * Kernel/PCI view:
+	 *   This is the only state in which the VF PCI node may disappear
+	 *   from /sys/bus/pci/devices/ and userspace access becomes invalid.
+	 *   In all other states (including VF_INVALIDATING/INVALIDATED and the
+	 *   VF_RECOVERING/RECOVERED/ENABLED chain) the VF PCI node remains
+	 *   present and accessible.
 	 */
-	UNVME_TEARDOWN,
+	UNVME_TEARDOWN		= 1U << 4,
 	/*
 	 * Controller has encountered a fatal status (CSTS.CFS=1) and is no
-	 * longer accessible.
+	 * longer accessible. (32)
 	 */
-	UNVME_FATAL,
+	UNVME_FATAL		= 1U << 5,
+	/*
+	 * Started to invalidate the controller, after this, UNVME_VF_INVALIDATED.
+	 * Entered when PF reset invalidates all VFs. State transitions from this
+	 * state are restricted to prevent races during invalidation. (64)
+	 */
+	UNVME_VF_INVALIDATING	= 1U << 6,
+	/*
+	 * Controller has been invalidated and is no longer accessible.
+	 * VF enters this state after PF reset completes. Recovery requires
+	 * explicit VF recovery flow (VF_RECOVERING -> VF_RECOVERED -> VF_ENABLED). (128)
+	 */
+	UNVME_VF_INVALIDATED	= 1U << 7,
+	/*
+	 * Recovering VF controller, after this, UNVME_VF_RECOVERED.
+	 * Transitional state entered when caller initiates VF recovery after
+	 * PF reset invalidation. (256)
+	 */
+	UNVME_VF_RECOVERING	= 1U << 8,
+	/*
+	 * VF controller has been recovered and is accessible again.
+	 * Next state is UNVME_VF_ENABLED after unvmed_enable_vf() completes. (512)
+	 */
+	UNVME_VF_RECOVERED	= 1U << 9,
+	/*
+	 * VF controller re-enabled after recovery. Functionally equivalent to
+	 * UNVME_ENABLED but reached through VF-specific recovery path. (1024)
+	 */
+	UNVME_VF_ENABLED	= 1U << 10,
 };
 
 static inline const char *unvmed_state_str(enum unvme_state state)
@@ -111,6 +146,16 @@ static inline const char *unvmed_state_str(enum unvme_state state)
 		return "TEARDOWN";
 	case UNVME_FATAL:
 		return "FATAL";
+	case UNVME_VF_INVALIDATING:
+		return "VF_INVALIDATING";
+	case UNVME_VF_INVALIDATED:
+		return "VF_INVALIDATED";
+	case UNVME_VF_RECOVERING:
+		return "VF_RECOVERING";
+	case UNVME_VF_RECOVERED:
+		return "VF_RECOVERED";
+	case UNVME_VF_ENABLED:
+		return "VF_ENABLED";
 	}
 	return "Unknown";
 }
@@ -145,6 +190,8 @@ struct unvme_bitmap {
  * struct unvme_vcqe - Virtual CQ entry wrapping an NVMe CQE
  * @cqe: standard NVMe completion queue entry (16 bytes)
  * @bdf: BDF encoded as (domain<<16)|(bus<<8)|(device<<3)|func.
+ * @conflict: non-zero when this CQE was produced by a conflict command,
+ *            zero otherwise.
  * @rsvd: padding to reach 32 bytes
  *
  * Sized to 32 bytes (power-of-2) so that entries are always contained within
@@ -154,7 +201,10 @@ struct unvme_bitmap {
 struct unvme_vcqe {
 	struct nvme_cqe cqe;
 	uint32_t bdf;
-	uint8_t rsvd[12];
+	/* enum unvmed_cmd_inject: NONE for a normal command, CONFLICT if the
+	 * command was allocated from the shared conflict slot (CID collision). */
+	uint32_t injected;
+	uint8_t rsvd[8];
 };
 
 struct unvme_vcq {
@@ -224,6 +274,7 @@ struct name {			\
  * @lock: spinlock to protect the current unvme SQ instance
  * @enabled: ``true`` if the queue is enabled
  * @refcnt: reference count
+ * @conflict_cmds: command instance for conflicting of cmd
  */
 #define unvme_declare_sq(name)	\
 struct name {			\
@@ -238,13 +289,13 @@ struct name {			\
 	struct unvme_cq *ucq;	\
 	struct unvme_cmd *cmds; \
 	struct unvme_timer timer;	\
-	struct unvme_vcq vcq;	\
 	struct unvme_bitmap cids;\
 	int nr_cmds;		\
 	uint64_t cmd_count[CMD_COUNT_RANGE];	\
 	pthread_spinlock_t lock;\
 	bool enabled;		\
 	int refcnt;		\
+	struct unvme_cmd *conflict_cmds; \
 }
 
 /*
@@ -316,6 +367,27 @@ enum unvmed_cmd_status {
 	NVME_SC_UNVME_TIMED_OUT	= 1,
 };
 
+/**
+ * enum unvmed_cmd_inject - How a command's CID was obtained
+ *
+ * Recorded in &struct unvme_cmd.injected and carried through to the VCQE so
+ * the consumer can tell a normally-allocated command apart from one that
+ * collided on CID.
+ *
+ * @UNVMED_CMD_INJECT_NONE:     Normal command; the CID bit was claimed from
+ *                              the per-SQ bitmap and is owned by this command.
+ * @UNVMED_CMD_INJECT_CONFLICT: Conflict command; the requested CID was already
+ *                              in use (bitmap returned EEXIST), so the command
+ *                              was allocated from the shared conflict slot
+ *                              without claiming the bit.  See
+ *                              unvmed_alloc_cmd_cid() and
+ *                              __unvmed_conflict_cmd_alloc().
+ */
+enum unvmed_cmd_inject {
+	UNVMED_CMD_INJECT_NONE		= 0,
+	UNVMED_CMD_INJECT_CONFLICT,
+};
+
 struct unvme_buf {
 	void *va;
 	size_t len;
@@ -341,6 +413,10 @@ struct unvme_buf {
  * @rq: command request instance provided by libvfn
  * @buf: data buffer to be mapped to DPTR in submission queue entry
  * @opaque: opaque data
+ * @conflicted: true when @cmd was allocated from @usq->conflict_cmds (a single
+ *              shared slot reused for conflicting CID allocations) rather than
+ *              the per-CID @usq->cmds[] array; determines that @cid is not
+ *              released back to the CID bitmap on free.
  */
 struct unvme_cmd {
 	struct unvme *u;
@@ -395,6 +471,12 @@ struct unvme_cmd {
 	 * enabled).
 	 */
 	struct nvme_cqe cqe;
+
+	/* How this command's CID was obtained.  CONFLICT means the requested
+	 * CID collided with an outstanding command, so this command lives in
+	 * the shared conflict slot and does not own its CID bit; __unvmed_cmd_free()
+	 * then skips unvmed_cid_free() for it.  See enum unvmed_cmd_inject. */
+	enum unvmed_cmd_inject injected;
 };
 
 struct unvme_hmb {
@@ -645,7 +727,7 @@ static inline struct unvme_vcq *unvmed_cmd_get_vcq(struct unvme_cmd *cmd)
 	if (cmd->vcq)
 		return unvmed_vcq_get(cmd->vcq);
 
-	return &cmd->usq->vcq;
+	return NULL;
 }
 
 /**
@@ -656,17 +738,12 @@ static inline struct unvme_vcq *unvmed_cmd_get_vcq(struct unvme_cmd *cmd)
  * Pop a single vcqe from @q.  The caller is the sole consumer; no locking is
  * required on the head side.
  *
- * Return: ``0`` on success, ``-ENOENT`` if @q is empty.
+ * @q may be NULL (e.g. cmd->vcq unset, meaning "no application vcq"); this
+ * is treated the same as an empty queue.
+ *
+ * Return: ``0`` on success, ``-ENOENT`` if @q is empty or NULL.
  */
 int unvmed_vcq_pop(struct unvme_vcq *q, struct unvme_vcqe *vcqes);
-
-/**
- * unvmed_vcq_drain - Wait until the virtual completion queue is empty
- * @vcq: virtual completion queue instance
- *
- * Busy-wait until all entries in @vcq have been consumed by the application.
- */
-void unvmed_vcq_drain(struct unvme_vcq *vcq);
 
 /**
  * unvmed_vcq_run_n - Run the given @vcq for [min, max]
@@ -755,10 +832,24 @@ int unvmed_parse_bdf(const char *input, char *bdf);
 struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs);
 
 /**
+ * unvmed_free_vf_ctrl - Partially tear down a VF controller for later reuse
+ * @u: &struct unvme
+ *
+ * Release hardware resources (IRQs, HMB, shared memory, nvme_close) while
+ * leaving the &struct unvme instance alive so it can be reinitialized later.
+ * Sets the state to %UNVME_TEARDOWN and waits for any in-flight DMA allocations
+ * to drain before calling nvme_close().
+ */
+void unvmed_free_vf_ctrl(struct unvme *u);
+
+/**
  * unvmed_free_ctrl - Free a given NVMe controller instance
  * @u: &struct unvme
  *
- * Free all the resources related to the given @u.
+ * Free all the resources related to the given @u.  If the controller has
+ * already been partially torn down by unvmed_free_vf_ctrl() (state is already
+ * %UNVME_TEARDOWN), the hardware teardown step is skipped and only the
+ * in-memory structures are freed.
  */
 void unvmed_free_ctrl(struct unvme *u);
 
@@ -815,11 +906,100 @@ enum unvme_state unvmed_ctrl_get_state(struct unvme *u);
  * @u: &struct unvme
  * @state: target state to transition to
  *
+ * Public wrapper around the internal locked setter.  Runs the same
+ * transition-matrix validation as any other state change; the matrix
+ * includes VF lifecycle states, so external callers (e.g. the reset
+ * framework) may drive UNVME_VF_RECOVERING / UNVME_VF_RECOVERED /
+ * UNVME_VF_ENABLED transitions through this API.
+ *
  * Return: ``true`` if state transition succeeded, otherwise ``false`` with
  * ``errno`` set to ``EALREADY`` if already in @state, or ``EINVAL`` if the
  * transition is not allowed from the current state.
  */
 bool unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state);
+
+/**
+ * unvmed_ctrl_set_state_fallback - Set controller state with fallback on failure
+ * @u: &struct unvme
+ * @state: target state to transition to
+ * @cur_states: if current state matches this on failure, apply fallback
+ * @fallback: fallback state to set when transition fails and current matches
+ *
+ * Attempt to transition @u->state to @state.  If the transition fails and
+ * the current state equals @current_state, set @u->state to @fallback instead.
+ * This is useful for handling race conditions where another thread (e.g. PF
+ * reset detection) may have changed the state concurrently.
+ *
+ * Return: ``true`` on successful transition to @state, ``false`` on fallback
+ * to @fallback (with ``errno`` set to the original failure).
+ */
+bool unvmed_ctrl_set_state_fallback(struct unvme *u, enum unvme_state state,
+				    unsigned int cur_states,
+				    enum unvme_state fallback);
+
+/**
+ * unvmed_vf_start_invalidating - Mark a VF as invalidating
+ * @u: &struct unvme (must be a VF)
+ *
+ * Spin (yielding) until UNVME_RESETTING clears, then atomically commit
+ * UNVME_VF_INVALIDATING.  All other states — including UNVME_VF_ENABLED
+ * and UNVME_ENABLED — are accepted as valid source states; only an
+ * in-flight regular reset (RESETTING) is waited out.  Called at the
+ * entry of the VF invalidation flow on PF reset.
+ *
+ * Return: on success the *previous* &enum unvme_state (a non-negative
+ * bit-flag value) — pass it verbatim to unvmed_vf_finish_invalidated()
+ * as its ``old`` argument.  On failure returns ``-1`` with ``errno``
+ * set (``ENODEV`` if @u is not a VF or the BDF is already cleared;
+ * any non-``EAGAIN`` errno from the state setter is propagated).
+ */
+int unvmed_vf_start_invalidating(struct unvme *u);
+
+/**
+ * unvmed_vf_finish_invalidated - Wait for invalidation to settle and commit
+ * @u: &struct unvme (must be a VF)
+ * @old: the previous-state value returned by
+ *       unvmed_vf_start_invalidating().  If it was already terminal
+ *       (VF_INVALIDATED / FATAL / ENABLED / DISABLED) the state-wait
+ *       loop is skipped and this function goes straight to the
+ *       CSTS.RDY/CSTS.CFS poll.
+ *
+ * Two-phase settle:
+ *  1. If @old was not already a terminal state, spin (yielding) until
+ *     the current state reaches one of VF_INVALIDATED / FATAL /
+ *     ENABLED / DISABLED.
+ *  2. Poll CSTS every 1 ms until CSTS.RDY clears or CSTS.CFS asserts.
+ * After both phases, commit UNVME_VF_INVALIDATED (an EALREADY there
+ * is treated as success — some other thread finalized concurrently).
+ *
+ * Return: ``0`` on success.  ``-1`` with ``errno`` set on failure:
+ *   - ``ENODEV`` if @u is not a VF or the BDF is already cleared.
+ *   - Any non-``EALREADY`` errno from the final state commit is
+ *     propagated verbatim.
+ */
+int unvmed_vf_finish_invalidated(struct unvme *u, enum unvme_state old);
+
+/**
+ * unvmed_vf_check_reset_allowed - Precondition check before a VF reset
+ * @u: &struct unvme (must be a VF)
+ *
+ * Verify the VF is in UNVME_ENABLED.  If it is mid-invalidation
+ * (UNVME_VF_INVALIDATING / UNVME_FATAL), best-effort advance the state
+ * to UNVME_VF_INVALIDATED so the rest of the system observes a coherent
+ * terminal state before this call reports failure.  ``EAGAIN`` and
+ * ``EALREADY`` from that finalize step are swallowed — the state may
+ * have moved between the read and the cmp-set, and the outcome is
+ * reported below regardless.
+ *
+ * Return: ``0`` if the VF is in UNVME_ENABLED and the caller may
+ * proceed with the reset.  Otherwise ``-1`` with ``errno`` set:
+ *   - ``EBUSY`` : VF is not (or is no longer) UNVME_ENABLED — reset
+ *                 must be skipped.
+ *   - ``ENODEV`` : @u is not a VF, or the BDF is already cleared.
+ *   - other      : errno propagated from the finalize cmp-set step
+ *                  (anything other than ``EAGAIN`` / ``EALREADY``).
+ */
+int unvmed_vf_check_reset_allowed(struct unvme *u);
 
 /**
  * unvmed_cmb_init - Initialize Controller Memory Buffer
@@ -1159,6 +1339,45 @@ struct unvme_cmd *unvmed_alloc_cmd_nodata(struct unvme *u,
 					  struct unvme_sq *usq, uint16_t *cid);
 
 /**
+ * unvmed_alloc_cmd_cid - Allocate a command instance pinned to a caller-chosen CID
+ * @u: &struct unvme
+ * @usq: submission queue instance (&struct unvme_sq)
+ * @cid: pointer to the command identifier to use.  Unlike
+ *       unvmed_alloc_cmd_nodata(), the CID is supplied by the caller and is
+ *       always respected (it is never auto-allocated).
+ * @vcq_id: virtual CQ identifier to route the resulting CQE to
+ *
+ * Allocate a NVMe command instance without data buffers, pinned to the CID
+ * given by @*@cid.  Allocation takes one of two paths depending on whether
+ * that CID is already in use:
+ *
+ *   - If @cid is free in the per-SQ CID bitmap, a normal command is allocated
+ *     from @usq->cmds[@cid] with the bit claimed (cmd->injected ==
+ *     UNVMED_CMD_INJECT_NONE).  This is the common non-colliding case.
+ *
+ *   - If @cid is already in use (CID bitmap returns EEXIST), the command is
+ *     registered as a *conflict command*: it is allocated from the single
+ *     shared slot @usq->conflict_cmds with cmd->injected set to
+ *     UNVMED_CMD_INJECT_CONFLICT.  This path exists for CID-collision
+ *     negative tests, where a second command deliberately reuses a CID that
+ *     belongs to an outstanding command.  The conflict command does NOT claim
+ *     the CID bit (the resident command at @usq->cmds[@cid] already owns it),
+ *     so both commands coexist on the same SQ and each completion routes back
+ *     to its issuing thread via @vcq_id.  At most one conflict command may be
+ *     outstanding per SQ at a time.
+ *
+ * This API is thread-safe; the shared conflict slot is guarded by a
+ * compare-and-swap on @cmd->state (UNVME_CMD_S_INIT -> UNVME_CMD_S_ALLOCATED).
+ *
+ * Return: Command instance (&struct unvme_cmd), ``NULL`` on error with errno
+ *         set to EBUSY if the conflict slot is already in use.
+ */
+struct unvme_cmd *unvmed_alloc_cmd_cid(struct unvme *u,
+				       struct unvme_sq *usq,
+				       uint16_t *cid,
+				       uint32_t vcq_id);
+
+/**
  * unvmed_alloc_cmd_meta - Allocate a NVMe command instance with metadata
  * @u: &struct unvme
  * @usq: submission queue instance (&struct unvme_sq)
@@ -1372,6 +1591,33 @@ int unvmed_create_adminq(struct unvme *u, uint32_t sq_size,
  */
 int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 		       uint8_t mps, uint8_t ams, uint8_t css, int timeout);
+
+/**
+ * unvmed_enable_vf - Enable NVMe controller for a Virtual Function
+ * @u: &struct unvme
+ * @iosqes: I/O Submission Queue Entry Size (specified as 2^n)
+ * @iocqes: I/O Completion Queue Entry Size (specified as 2^n)
+ * @mps: Memory Page Size (specified as (2 ^ (12 + n)))
+ * @ams: Arbitration Mechanism Selected
+ * @css: I/O Command Set Selected
+ * @timeout: timeout in seconds (0: disabled)
+ *
+ * Enable the given NVMe VF controller by asserting CC.EN to 1 and waiting
+ * for CSTS.RDY.  Unlike unvmed_enable_ctrl(), the CC.EN / CSTS.RDY step
+ * runs *without* driving the ENABLING/ENABLED/FATAL state transitions,
+ * so the caller keeps ownership of the state machine during the VF
+ * recovery sequence (e.g. UNVME_VF_RECOVERING held across the call).
+ * On successful hardware enable this function then makes a single
+ * best-effort commit to UNVME_VF_ENABLED via the normal transition
+ * matrix; the return value of that commit is not propagated, so a
+ * matrix rejection (EALREADY / EINVAL) leaves the caller's state
+ * choice intact while the function still returns ``0``.
+ *
+ * Return: ``0`` on successful hardware enable, ``-1`` with ``errno``
+ * set on CC.EN / CSTS.RDY failure (``ENODEV`` on CSTS.CFS).
+ */
+int unvmed_enable_vf(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
+		     uint8_t mps, uint8_t ams, uint8_t css, int timeout);
 
 /**
  * unvmed_create_cq - Create I/O Completion Queue
@@ -1684,6 +1930,17 @@ uint16_t unvmed_cmd_post(struct unvme_cmd *cmd, union nvme_cmd *sqe,
 			 unsigned long flags);
 
 /**
+ * unvmed_get_conflict_cmd - Get the conflict command instance of @usq
+ * @usq: submission queue (&struct unvme_sq)
+ *
+ * Return the shared conflict command slot (@usq->conflict_cmds) if it is
+ * currently in use (state != UNVME_CMD_S_INIT), or NULL otherwise.
+ *
+ * Return: &struct unvme_cmd pointer, or NULL if the slot is free
+ */
+struct unvme_cmd *unvmed_get_conflict_cmd(struct unvme_sq *usq);
+
+/**
  * unvmed_get_cmd - Get &struct unvme_cmd instance
  * @usq: submission queue (&struct unvme_sq)
  * @cid: command identifier
@@ -1755,7 +2012,7 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
  *
  * Return: Number of cq entries fetched.
  */
-int unvmed_cq_run(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq, struct nvme_cqe *cqes);
+int unvmed_cq_run(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq, struct unvme_vcq *vcq, struct nvme_cqe *cqes);
 
 /**
  * unvmed_cq_run_n - Reap ``N`` CQ entries from a completion queue
@@ -1810,21 +2067,25 @@ int __unvmed_mapv_prp(struct unvme_cmd *cmd, union nvme_cmd *sqe,
  *                          PRP list
  * @cmd: command instance (&struct unvme_cmd)
  * @sqe: submission queue entry (&union nvme_cmd)
- * @prplist: memory page address of a PRP list (address to be written to PRP2)
+ * @prplist: contiguous array of PRP list pages, each one MPS page in size,
+ *           mapped to the IOMMU by the caller
+ * @nprplists: number of pages in @prplist
  * @iov: user data buffer I/O vector (&struct iovec)
  * @nr_iov: number of iovecs dangled to @iov
  *
  * Make a PRP data structure for data pointer in @sqe with @iov for number of
  * @nr_iov vectors.  libvfn prepares PRP data structure and map it to the given
- * @sqe.
+ * @sqe.  When the buffer requires more PRP entries than fit in a single page,
+ * the list is chained across @prplist; see nvme_mapv_prp().
  *
  * Caller *should* map @prplist to the IOMMU page table before calling this
- * helper.
+ * helper; libvfn derives the iova of @prplist from its virtual address.
  *
  * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
  */
 int __unvmed_mapv_prp_list(struct unvme_cmd *cmd, union nvme_cmd *sqe,
-			   void *prplist, struct iovec *iov, int nr_iov);
+			   void *prplist, int nprplists,
+			   struct iovec *iov, int nr_iov);
 
 /**
  * __unvmed_mapv_prp - Map and configure iovecs as PRP to command
@@ -1861,6 +2122,7 @@ int __unvmed_mapv_sgl(struct unvme_cmd *cmd, union nvme_cmd *sqe,
  * @cmd: command instance (&struct unvme_cmd)
  * @sqe: submission queue entry (&union nvme_cmd)
  * @seg: SGL segment memory page address
+ * @seg_iova: I/O virtual address of @seg mapped to the IOMMU
  * @iov: user data buffer I/O vector (&struct iovec)
  * @nr_iov: number of iovecs dangled to @iov
  *
@@ -1868,12 +2130,14 @@ int __unvmed_mapv_sgl(struct unvme_cmd *cmd, union nvme_cmd *sqe,
  * @nr_iov vectors.  libvfn prepares SGL data structure and map it to the given
  * @sqe.
  *
- * Caller *should* map @seg to the IOMMU page table before calling this helper.
+ * Caller *should* map @seg to the IOMMU page table before calling this helper
+ * and provide its iova through @seg_iova.
  *
  * Return: ``0`` on success, otherwise ``-1`` with ``errno`` set.
  */
 int __unvmed_mapv_sgl_seg(struct unvme_cmd *cmd, union nvme_cmd *sqe,
-			  struct nvme_sgld *seg, struct iovec *iov, int nr_iov);
+			  struct nvme_sgld *seg, iova_t seg_iova,
+			  struct iovec *iov, int nr_iov);
 
 /**
  * __unvmed_mapv_sgl - Map and configure iovecs as SGL to command
@@ -2772,6 +3036,73 @@ int unvmed_detach_ns(struct unvme_cmd *cmd, uint32_t nsid,
 		     struct iovec *iov, int nr_iov);
 
 /**
+ * struct unvmed_thread_ops - per-thread operation callbacks for a controller
+ * @reinit_ctrl: called when the controller instance is destroyed and
+ *               re-created (e.g. SR-IOV VF freed and re-enumerated after a
+ *               PF reset).  Each registered thread must redo any per-thread
+ *               work that depended on the old instance — such as remapping
+ *               DMA buffers or restoring thread-local state — against the
+ *               new controller instance.  NOT invoked on a plain reset
+ *               (CC.EN toggle, FLR, etc.) where the instance stays alive.
+ *               Must return 0 on success, negative errno on failure.
+ *
+ *               The callback runs under the controller's internal
+ *               thread_list lock.  It MUST NOT call unvmed_add_thread() or
+ *               unvmed_del_thread() on the same controller, directly or
+ *               transitively — doing so self-deadlocks.  Calls into
+ *               unvmed_map_vaddr()/unvmed_unmap_vaddr() are safe (different
+ *               lock).
+ *
+ * Additional callbacks may be added to this struct in the future as new
+ * per-thread lifecycle events are needed.  Currently only @reinit_ctrl is
+ * supported.
+ */
+struct unvmed_thread_ops {
+	int (*reinit_ctrl)(void *opaque);
+};
+
+/**
+ * unvmed_add_thread - Register per-thread ops on a controller
+ * @u: &struct unvme
+ * @ops: pointer to &struct unvmed_thread_ops providing the callbacks.
+ *       See &struct unvmed_thread_ops for the meaning of each op.
+ * @opaque: opaque pointer passed to each callback (e.g. struct thread_data *)
+ *
+ * Store the ops keyed by the calling thread's TID (via gettid()) in the
+ * controller's thread_list.  The reinit path invokes the relevant op on
+ * every registered thread at the appropriate lifecycle point.
+ *
+ * Call once per thread after the thread starts.  Pair with unvmed_del_thread()
+ * when the thread exits to avoid invoking a dangling callback.
+ *
+ * Example:
+ *
+ *   static const struct unvmed_thread_ops my_ops = {
+ *       .reinit_ctrl = app_reinit_cb,
+ *   };
+ *
+ *   static int app_reinit_cb(void *opaque)
+ *   {
+ *       struct app_ctx *ctx = opaque;
+ *       // Each thread re-initializes its actual context associated
+ *       // with the stale old instance.
+ *       return app_remap_buffers(ctx);
+ *   }
+ */
+void unvmed_add_thread(struct unvme *u,
+		       const struct unvmed_thread_ops *ops, void *opaque);
+
+/**
+ * unvmed_del_thread - Unregister an application thread callback from a controller
+ * @u: &struct unvme
+ *
+ * Remove the entry registered by the calling thread (matched by gettid())
+ * from the thread_list.  Call once per thread at close time, paired with
+ * unvmed_add_thread().
+ */
+void unvmed_del_thread(struct unvme *u);
+
+/**
  * unvmed_to_json - Get controller status as JSON object
  * @u: &struct unvme
  *
@@ -2784,5 +3115,65 @@ int unvmed_detach_ns(struct unvme_cmd *cmd, uint32_t nsid,
  * Return: json_object pointer on success, ``NULL`` on failure with ``errno`` set.
  */
 struct json_object *unvmed_to_json(struct unvme *u);
+
+/**
+ * UNVMED_IRQ_F_NO_REAPER - Do not start a reaper thread for the vector
+ *
+ * libunvmed still creates and owns the eventfd VFIO signals, but nothing
+ * inside libunvmed consumes it.  The application observes interrupts with
+ * unvmed_irq_get_count() or unvmed_irq_efd() and is responsible for reaping
+ * the CQs attached to the vector itself.
+ *
+ * Note that unvmed_cmd_wait() sleeps until somebody reaps the CQ, so it must
+ * not be called from the same thread that is expected to do the reaping.
+ */
+#define UNVMED_IRQ_F_NO_REAPER		(1 << 0)
+
+/**
+ * unvmed_init_irq - Initialize interrupt routing for a vector
+ * @u: &struct unvme
+ * @vector: interrupt vector (0 <= vector < nr_irqs)
+ * @flags: ``0``, or ``UNVMED_IRQ_F_NO_REAPER``
+ *
+ * Wire @vector up in VFIO.  With @flags of 0 a reaper thread is started to
+ * reap the CQs attached to the vector.  Calling it again for a vector that is
+ * already initialized is a no-op, unless @flags differ, which fails.
+ *
+ * Must be called before unvmed_create_cq() / unvmed_init_cq() for the same
+ * vector.
+ *
+ * Return: 0 on success, ``-1`` with ``errno`` set on failure.
+ */
+int unvmed_init_irq(struct unvme *u, int vector, unsigned int flags);
+
+/**
+ * unvmed_irq_get_count - Number of interrupts delivered since the last call
+ * @u: &struct unvme
+ * @vector: interrupt vector initialized with ``UNVMED_IRQ_F_NO_REAPER``
+ * @count: output, number of interrupts, ``0`` if none has arrived
+ *
+ * Drain the interrupt counter of @vector.  This never blocks, so it can be
+ * polled, and it never reports the same interrupt twice.
+ *
+ * Return: 0 on success, ``-1`` with ``errno`` set on failure.  ``EBUSY``
+ * means @vector has a reaper thread that owns the eventfd.
+ */
+int unvmed_irq_get_count(struct unvme *u, int vector, uint64_t *count);
+
+/**
+ * unvmed_irq_efd - eventfd VFIO signals for a vector
+ * @u: &struct unvme
+ * @vector: interrupt vector initialized with ``UNVMED_IRQ_F_NO_REAPER``
+ *
+ * Return the eventfd so that the caller can wait on it in its own event loop.
+ * Reading it directly is equivalent to unvmed_irq_get_count(): the fd is
+ * non-blocking and a read drains the whole counter.
+ *
+ * The fd belongs to libunvmed and is closed when the vector is freed.  A
+ * controller reset re-creates it, so do not cache it across one.
+ *
+ * Return: the eventfd on success, ``-1`` with ``errno`` set on failure.
+ */
+int unvmed_irq_efd(struct unvme *u, int vector);
 
 #endif

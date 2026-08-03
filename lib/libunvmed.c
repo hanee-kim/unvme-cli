@@ -54,17 +54,15 @@ static inline enum unvme_state __unvmed_ctrl_get_state(struct unvme *u)
 	return LOAD(u->state);
 }
 
-static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
+static bool ____unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 {
 	enum unvme_state old;
 	bool change = false;
 
-	pthread_rwlock_wrlock(&u->lock);
 	old = __unvmed_ctrl_get_state(u);
 
 	if (old == state) {
 		errno = EALREADY;
-		pthread_rwlock_unlock(&u->lock);
 		return false;
 	}
 
@@ -90,6 +88,7 @@ static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 	case UNVME_ENABLED:
 		switch (old) {
 		case UNVME_ENABLING:
+		case UNVME_VF_ENABLED:
 			change = true;
 			break;
 		default:
@@ -110,7 +109,10 @@ static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 		switch (old) {
 		case UNVME_DISABLED:
 		case UNVME_ENABLED:
+		case UNVME_RESETTING:
 		case UNVME_FATAL:
+		case UNVME_VF_INVALIDATED:
+		case UNVME_VF_RECOVERING:
 			change = true;
 			break;
 		default:
@@ -120,6 +122,65 @@ static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 	case UNVME_FATAL:
 		switch (old) {
 		case UNVME_ENABLING:
+		case UNVME_RESETTING:
+		case UNVME_VF_INVALIDATING:
+		case UNVME_ENABLED:
+			change = true;
+			break;
+		default:
+			break;
+		}
+		break;
+	case UNVME_VF_INVALIDATING:
+		switch (old) {
+		case UNVME_ENABLED:
+		case UNVME_DISABLED:
+		case UNVME_RESETTING:
+		case UNVME_ENABLING:
+		case UNVME_FATAL:
+		case UNVME_VF_ENABLED:
+			change = true;
+			break;
+		default:
+			break;
+		}
+		break;
+	case UNVME_VF_INVALIDATED:
+		switch (old) {
+		case UNVME_ENABLED:
+		case UNVME_FATAL:
+		case UNVME_DISABLED:
+		case UNVME_RESETTING:
+		case UNVME_VF_INVALIDATING:
+		case UNVME_VF_ENABLED:
+			change = true;
+			break;
+		default:
+			break;
+		}
+		break;
+	case UNVME_VF_RECOVERING:
+		switch (old) {
+		case UNVME_TEARDOWN:
+			change = true;
+			break;
+		default:
+			break;
+		}
+		break;
+	case UNVME_VF_RECOVERED:
+		switch (old) {
+		case UNVME_VF_RECOVERING:
+			change = true;
+			break;
+		default:
+			break;
+		}
+		break;
+	case UNVME_VF_ENABLED:
+		switch (old) {
+		case UNVME_DISABLED:
+		case UNVME_VF_RECOVERED:
 			change = true;
 			break;
 		default:
@@ -140,7 +201,38 @@ static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 				unvmed_bdf(u), unvmed_state_str(old), unvmed_state_str(state));
 	}
 
+	return change;
+}
+
+static bool __unvmed_ctrl_cmp_set_state(struct unvme *u, unsigned int old_states,
+				enum unvme_state state)
+{
+	enum unvme_state old;
+	bool change = false;
+
+	pthread_rwlock_wrlock(&u->lock);
+	old = __unvmed_ctrl_get_state(u);
+
+	if (!(old & old_states)) {
+		errno = EAGAIN;
+		goto ret;
+	}
+
+	change = ____unvmed_ctrl_set_state(u, state);
+
+ret:
 	pthread_rwlock_unlock(&u->lock);
+	return change;
+}
+
+static bool __unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
+{
+	bool change = false;
+
+	pthread_rwlock_wrlock(&u->lock);
+	change = ____unvmed_ctrl_set_state(u, state);
+	pthread_rwlock_unlock(&u->lock);
+
 	return change;
 }
 
@@ -297,6 +389,16 @@ bool unvmed_ctrl_enabled(struct unvme *u)
 	return __unvmed_ctrl_get_state(u) == UNVME_ENABLED;
 }
 
+/**
+ * unvmed_ctrl_get_state - Get current controller state
+ * @u: &struct unvme
+ *
+ * Returns the current state of the controller.  This is the public wrapper
+ * around __unvmed_ctrl_get_state() for external callers (e.g. reset framework)
+ * to read controller state.
+ *
+ * Return: Current &enum unvme_state value.
+ */
 enum unvme_state unvmed_ctrl_get_state(struct unvme *u)
 {
 	return __unvmed_ctrl_get_state(u);
@@ -305,6 +407,65 @@ enum unvme_state unvmed_ctrl_get_state(struct unvme *u)
 bool unvmed_ctrl_set_state(struct unvme *u, enum unvme_state state)
 {
 	return __unvmed_ctrl_set_state(u, state);
+}
+
+bool unvmed_ctrl_set_state_fallback(struct unvme *u, enum unvme_state state,
+				    unsigned int cur_states, enum unvme_state fallback)
+{
+	enum unvme_state cur;
+	bool change = false;
+
+	pthread_rwlock_wrlock(&u->lock);
+	cur = __unvmed_ctrl_get_state(u);
+
+	if (____unvmed_ctrl_set_state(u, state) || errno == EALREADY) {
+		change = true;
+		goto ret;
+	}
+
+	if (!(cur & cur_states))
+		goto ret;
+
+	if (____unvmed_ctrl_set_state(u, fallback) || errno == EALREADY) {
+		errno = ENODEV;
+		unvmed_log_info("%s: set controller state fallback (%s -> %s), requested: %s",
+				unvmed_bdf(u), unvmed_state_str(cur), unvmed_state_str(fallback),
+				unvmed_state_str(state));
+	}
+
+ret:
+	pthread_rwlock_unlock(&u->lock);
+	return change;
+}
+
+void unvmed_add_thread(struct unvme *u,
+		       const struct unvmed_thread_ops *ops, void *opaque)
+{
+	struct unvme_thread_entry *entry = zmalloc(sizeof(*entry));
+
+	entry->thread_id = gettid();
+	entry->ops = ops;
+	entry->opaque = opaque;
+
+	pthread_mutex_lock(&u->thread_list_lock);
+	list_add_tail(&u->thread_list, &entry->list);
+	pthread_mutex_unlock(&u->thread_list_lock);
+}
+
+void unvmed_del_thread(struct unvme *u)
+{
+	struct unvme_thread_entry *entry, *next;
+	pid_t tid = gettid();
+
+	pthread_mutex_lock(&u->thread_list_lock);
+	list_for_each_safe(&u->thread_list, entry, next, list) {
+		if (entry->thread_id == tid) {
+			list_del(&entry->list);
+			free(entry);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&u->thread_list_lock);
 }
 
 int unvmed_nr_cmds(struct unvme *u)
@@ -417,7 +578,14 @@ int unvmed_get_sqs(struct unvme *u, struct unvme_sq ***sqs)
 	for (qid = 0; qid < u->nr_sqs; qid++) {
 		struct unvme_sq *usq;
 		usq = unvmed_sq_find(u, qid);
-		if (!usq || (usq && !usq->enabled))
+		/*
+		 * Skip queues whose libvfn backing (usq->q) has been dropped
+		 * by unvmed_discard_sq().  discard clears usq->q but leaves
+		 * usq->enabled set, so an enabled-but-q==NULL entry would
+		 * otherwise be handed back to callers (unvmed_to_json,
+		 * unvmed-print) that dereference usq->q->mem — a NULL deref.
+		 */
+		if (!usq || !usq->enabled || !usq->q)
 			continue;
 
 		(*sqs)[nr_sqs++] = usq;
@@ -443,7 +611,12 @@ int unvmed_get_cqs(struct unvme *u, struct unvme_cq ***cqs)
 
 	for (qid = 0; qid < u->nr_cqs; qid++) {
 		ucq = unvmed_cq_find(u, qid);
-		if (!ucq || (ucq && !ucq->enabled))
+		/*
+		 * See unvmed_get_sqs(): unvmed_discard_cq() clears ucq->q but
+		 * leaves ucq->enabled, so guard against an enabled-but-q==NULL
+		 * entry being dereferenced by callers.
+		 */
+		if (!ucq || !ucq->enabled || !ucq->q)
 			continue;
 
 		(*cqs)[nr_cqs++] = ucq;
@@ -478,7 +651,14 @@ int unvmed_cq_wait_irq(struct unvme *u, int vector)
 		return -1;
 	}
 
-	return eventfd_read(u->efds[vector], &irq);
+	/*
+	 * The eventfd is non-blocking, so a spurious wakeup shows up as EAGAIN
+	 * rather than as a failure.
+	 */
+	if (eventfd_read(u->efds[vector], &irq) < 0 && errno != EAGAIN)
+		return -1;
+
+	return 0;
 }
 
 static struct unvme_sq *__unvmed_find_and_get_sq(struct unvme *u,
@@ -623,23 +803,75 @@ ssize_t unvmed_get_max_xfer_size(struct unvme *u)
 	return (1ULL << u->id_ctrl->mdts) * unvmed_pagesize(u);
 }
 
-static int unvmed_init_irq_reaper(struct unvme *u, int vector)
+/*
+ * refcnt semantics for struct unvme_cq_reaper:
+ *   0      : reaper not initialized, or already torn down
+ *   1      : reaper initialized, no CQ attached
+ *   n >= 2 : reaper initialized, (n - 1) CQs attached
+ */
+static inline bool unvmed_reaper_alive(struct unvme *u, int vector)
+{
+	if (vector < 0 || vector >= u->nr_efds)
+		return false;
+	return atomic_load_acquire(&u->reapers[vector].refcnt);
+}
+
+/*
+ * Take a reference on a live reaper.  A reaper whose refcnt already dropped to
+ * 0 is being torn down and must never be resurrected, so the reference is
+ * taken only if the reaper is still alive.
+ *
+ * Return: ``true`` if a reference has been taken, in which case the caller is
+ * responsible for dropping it with unvmed_put_reaper().
+ */
+static inline bool unvmed_get_reaper(struct unvme *u, int vector)
+{
+	struct unvme_cq_reaper *r;
+	int refcnt;
+
+	if (vector < 0 || vector >= u->nr_efds)
+		return false;
+
+	r = &u->reapers[vector];
+
+	refcnt = atomic_load_acquire(&r->refcnt);
+	while (refcnt > 0 && !atomic_cmpxchg(&r->refcnt, refcnt, refcnt + 1))
+		refcnt = atomic_load_acquire(&r->refcnt);
+
+	return refcnt > 0;
+}
+
+static inline int unvmed_put_reaper(struct unvme *u, int vector)
+{
+	return atomic_dec_fetch(&u->reapers[vector].refcnt);
+}
+
+static int unvmed_init_efd(struct unvme *u, int vector)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
 	struct epoll_event e;
 
-	r->u = u;
-	r->vector = vector;
-	r->efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
-
-	list_head_init(&r->cq_list);
-	pthread_mutex_init(&r->cq_list_lock, NULL);
-
+	/*
+	 * Without EFD_SEMAPHORE a single read drains the whole counter, so it
+	 * answers "how many interrupts have been delivered since the last
+	 * read" rather than handing them out one at a time.  EFD_NONBLOCK
+	 * keeps that read from blocking when none has arrived yet.  Both
+	 * matter for %UNVMED_IRQ_F_NO_REAPER, where the application polls the
+	 * eventfd itself; the reaper thread is fine either way as it only
+	 * reads after epoll_wait() reported the fd readable.
+	 */
+	r->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (r->efd < 0) {
 		unvmed_log_err("%s: failed to create a eventfd (vector=%d, errno=%d \"%s\")",
 				unvmed_bdf(u), vector, errno, strerror(errno));
-		pthread_mutex_destroy(&r->cq_list_lock);
 		return -1;
+	}
+
+	/* Nothing waits on the eventfd without a reaper thread. */
+	if (r->flags & UNVMED_IRQ_F_NO_REAPER) {
+		r->epoll_fd = -1;
+		u->efds[vector] = r->efd;
+		return 0;
 	}
 
 	r->epoll_fd = epoll_create1(0);
@@ -648,9 +880,7 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 				unvmed_bdf(u), vector, errno, strerror(errno));
 		if (errno == EMFILE)  /* Too many open files */
 			unvmed_log_err("%s: check `ulimit -n` for open file limitation", unvmed_bdf(u));
-
 		close(r->efd);
-		pthread_mutex_destroy(&r->cq_list_lock);
 		return -1;
 	}
 
@@ -659,8 +889,43 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 		.data.fd = r->efd,
 	};
 	epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, r->efd, &e);
+	u->efds[vector] = r->efd;
+	return 0;
+}
 
-	u->efds[r->vector] = r->efd;
+static void unvmed_free_efd(int efd, int epoll_fd)
+{
+	if (epoll_fd >= 0) {
+		struct epoll_event e = {
+			.events = EPOLLIN,
+			.data.fd = efd,
+		};
+
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, efd, &e);
+		close(epoll_fd);
+	}
+
+	close(efd);
+}
+
+static int unvmed_init_irq_reaper(struct unvme *u, int vector, unsigned int flags)
+{
+	struct unvme_cq_reaper *r = &u->reapers[vector];
+
+	r->u = u;
+	r->vector = vector;
+	r->flags = flags;
+
+	list_head_init(&r->cq_list);
+	pthread_mutex_init(&r->cq_list_lock, NULL);
+
+	if (unvmed_init_efd(u, vector) < 0) {
+		pthread_mutex_destroy(&r->cq_list_lock);
+		memset(r, 0, sizeof(*r));
+		return -1;
+	}
+	/* Publish last: refcnt is what makes the reaper visible as alive. */
+	atomic_store_release(&r->refcnt, 1);
 
 	unvmed_log_debug("%s: vector=%d initialized (efd=%d, epoll_fd=%d)",
 			unvmed_bdf(u), vector, r->efd, r->epoll_fd);
@@ -669,10 +934,6 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 
 static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
 {
-	struct epoll_event e = {
-		.events = EPOLLIN,
-		.data.fd = r->efd,
-	};
 	struct unvme_reaper_cq_entry *entry, *next;
 
 	pthread_mutex_lock(&r->cq_list_lock);
@@ -685,11 +946,8 @@ static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
 	pthread_mutex_unlock(&r->cq_list_lock);
 	pthread_mutex_destroy(&r->cq_list_lock);
 
-	epoll_ctl(r->epoll_fd, EPOLL_CTL_DEL, r->efd, &e);
+	unvmed_free_efd(r->efd, r->epoll_fd);
 
-	r->u->efds[r->vector] = -1;
-	close(r->efd);
-	close(r->epoll_fd);
 	memset(r, 0, sizeof(*r));
 }
 
@@ -702,8 +960,14 @@ static int unvmed_reaper_add_cq(struct unvme *u, struct unvme_cq *ucq)
 	if (vector < 0 || vector >= u->nr_efds)
 		return 0;
 
+	/* The caller holds a reference on the reaper, so it stays alive here. */
 	r = &u->reapers[vector];
-	if (!atomic_load_acquire(&r->refcnt))
+
+	/*
+	 * The CQ list only tells the reaper thread which CQs to reap, so there
+	 * is nothing to track when the application does the reaping.
+	 */
+	if (r->flags & UNVMED_IRQ_F_NO_REAPER)
 		return 0;
 
 	entry = calloc(1, sizeof(*entry));
@@ -735,6 +999,10 @@ static void unvmed_reaper_del_cq(struct unvme *u,
 
 	r = &u->reapers[vector];
 
+	/* Nothing was ever added; see unvmed_reaper_add_cq(). */
+	if (r->flags & UNVMED_IRQ_F_NO_REAPER)
+		return;
+
 	pthread_mutex_lock(&r->cq_list_lock);
 	list_for_each_safe(&r->cq_list, entry, next, list) {
 		if (entry->ucq == ucq) {
@@ -755,38 +1023,65 @@ static void unvmed_reaper_del_cq(struct unvme *u,
 	}
 }
 
-static int unvmed_free_irq(struct unvme *u, int vector)
+/*
+ * Tear a reaper down.  The caller must have claimed the teardown by taking
+ * refcnt to 0 first, which is what stops unvmed_get_reaper() from attaching a
+ * CQ to a reaper that is already being destroyed.
+ */
+static int __unvmed_free_irq(struct unvme *u, int vector)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
-	int ret;
 
-	if (!atomic_load_acquire(&r->refcnt))
-		return 0;
+	/* There is no reaper thread to wake up and join. */
+	if (!(r->flags & UNVMED_IRQ_F_NO_REAPER)) {
+		eventfd_write(r->efd, 1);
+		pthread_join(r->th, NULL);
+	}
 
-	if (atomic_dec_fetch(&r->refcnt) > 0)
-		return 0;
-
-	/*
-	 * Wake up the blocking threads waiting for the interrupt
-	 * events from the device.
-	 */
-	eventfd_write(r->efd, 1);
-	pthread_join(r->th, NULL);
-
-	ret = vfio_disable_irq(&u->ctrl.pci.dev, vector, 1);
-	if (ret) {
+	if (vfio_disable_irq(&u->ctrl.pci.dev, vector, 1)) {
 		unvmed_log_err("%s: failed to disable irq %d", unvmed_bdf(u), vector);
 		return -1;
 	}
 
 	unvmed_free_irq_reaper(r);
+	u->efds[vector] = -1;
 	return 0;
 }
 
-static int unvmed_init_irq(struct unvme *u, int vector)
+/*
+ * Drop the reference an attached CQ holds and tear the vector down once the
+ * last CQ is gone.  Callers must hold a reference, so refcnt is >= 2 here.
+ */
+static int unvmed_free_irq(struct unvme *u, int vector)
+{
+	struct unvme_cq_reaper *r = &u->reapers[vector];
+	int expected = 1;
+
+	if (!unvmed_reaper_alive(u, vector))
+		return 0;
+
+	/* refcnt > 1 means CQs are still attached; defer teardown. */
+	if (unvmed_put_reaper(u, vector) > 1)
+		return 0;
+
+	/*
+	 * The last CQ is gone.  Claim the teardown by dropping the reference
+	 * unvmed_init_irq() holds, in a single step: refcnt reaches 0 before
+	 * anything is destroyed, so a concurrent unvmed_get_reaper() fails
+	 * outright instead of attaching to a dying reaper.  Losing the race
+	 * means somebody else owns the teardown.
+	 */
+	if (!atomic_cmpxchg(&r->refcnt, expected, 0))
+		return 0;
+
+	return __unvmed_free_irq(u, vector);
+}
+
+static int __unvmed_init_irq(struct unvme *u, int vector, unsigned int flags)
 {
 	struct unvme_cq_reaper *r = &u->reapers[vector];
 	int nr_irqs = u->nr_irqs;
+	int ret;
 
 	if (vector >= nr_irqs) {
 		unvmed_log_err("%s: invalid vector %d", unvmed_bdf(u), vector);
@@ -794,10 +1089,22 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 		return -1;
 	}
 
-	if (atomic_inc_fetch(&r->refcnt) > 1)
+	if (unvmed_reaper_alive(u, vector)) {
+		/*
+		 * Already initialized.  Re-initializing with a different mode
+		 * would either strand an application that is polling the eventfd
+		 * or start a second consumer of it, so refuse instead.
+		 */
+		if (r->flags != flags) {
+			unvmed_log_err("%s: vector=%d already initialized with "
+					"different flags", unvmed_bdf(u), vector);
+			errno = EINVAL;
+			return -1;
+		}
 		return 0;
+	}
 
-	if (unvmed_init_irq_reaper(u, vector)) {
+	if (unvmed_init_irq_reaper(u, vector, flags)) {
 		unvmed_log_err("%s: failed to initialize IRQ reaper (vector=%d)", unvmed_bdf(u), vector);
 		return -1;
 	}
@@ -809,19 +1116,35 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 	 */
 	if (vfio_disable_irq(&u->ctrl.pci.dev, 0, u->nr_irqs)) {
 		unvmed_log_err("%s: failed to disable all irq vectors", unvmed_bdf(u));
-
 		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
 		return -1;
 	}
 
 	if (vfio_set_irq(&u->ctrl.pci.dev, &u->efds[0], 0, nr_irqs)) {
 		unvmed_log_err("%s: failed to set IRQ for vector %d", unvmed_bdf(u), vector);
-
 		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
 		return -1;
 	}
 
-	pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
+	if (flags & UNVMED_IRQ_F_NO_REAPER) {
+		unvmed_log_info("%s: vector=%d is driven by the application",
+				unvmed_bdf(u), vector);
+		return 0;
+	}
+
+	ret = pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
+	if (ret) {
+		unvmed_log_err("%s: failed to create reaper thread (vector=%d, errno=%d \"%s\")",
+				unvmed_bdf(u), vector, ret, strerror(ret));
+		vfio_disable_irq(&u->ctrl.pci.dev, vector, 1);
+		unvmed_free_irq_reaper(r);
+		u->efds[vector] = -1;
+		errno = ret;
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -896,8 +1219,25 @@ static void unvmed_free_irq_all(struct unvme *u)
 {
 	int vector;
 
-	for (vector = 0; vector < u->nr_efds; vector++)
-		unvmed_free_irq(u, vector);
+	for (vector = 0; vector < u->nr_efds; vector++) {
+		struct unvme_cq_reaper *r = &u->reapers[vector];
+		int refcnt;
+
+		/*
+		 * Every CQ attached to the vector left a reference behind and
+		 * unvmed_free_irq() only drops one per call.  Both callers are
+		 * dropping the reaper for good, so take every reference at once:
+		 * a deferred teardown would leave the reaper thread running on
+		 * memory that is freed right after.  Going straight to 0 also
+		 * claims the teardown against a concurrent unvmed_get_reaper().
+		 */
+		refcnt = atomic_load_acquire(&r->refcnt);
+		while (refcnt > 0 && !atomic_cmpxchg(&r->refcnt, refcnt, 0))
+			refcnt = atomic_load_acquire(&r->refcnt);
+
+		if (refcnt > 0)
+			__unvmed_free_irq(u, vector);
+	}
 }
 
 static int unvmed_free_irqs(struct unvme *u)
@@ -980,8 +1320,168 @@ static inline int __unvmed_bdf_to_int(const char *bdf, uint32_t *u_bdf)
 }
 
 /*
- * Initialize NVMe controller instance in libvfn.  If exists, return the
- * existing one, otherwise it will create new one.  NULL if failure happens.
+ * Invoke every registered reinit_ctrl callback under @u->thread_list_lock.
+ *
+ * Why hold the mutex across the callback:
+ *   - unvmed_del_thread() also takes this mutex, so holding it here prevents
+ *     a registered thread from freeing its entry mid-iteration — i.e. it
+ *     forecloses the use-after-free that would happen if we snapshotted
+ *     pointers and released the lock before calling back.
+ *
+ * Caller contract (callback authors):
+ *   - The callback MUST NOT call unvmed_add_thread() / unvmed_del_thread()
+ *     on the same @u, directly or transitively — that would self-deadlock
+ *     on @u->thread_list_lock (non-recursive).
+ *   - The callback MAY call unvmed_map_vaddr()/unvmed_unmap_vaddr(); those
+ *     take @u->lock (rdlock), a separate lock — no ordering hazard with
+ *     this mutex.
+ *
+ * Liveness:
+ *   tgkill(pid, tid, 0) is a best-effort liveness check.  Threads that
+ *   pthread_exit() without calling unvmed_del_thread() first will leave a
+ *   stale entry whose @opaque points to freed memory; ESRCH prunes those
+ *   here but TID reuse can still mask the case.  The application must call
+ *   unvmed_del_thread() before exiting.
+ *
+ * Returns 0 on success, -1 if any callback failed.
+ */
+static int __unvmed_reinit_invoke_callbacks(struct unvme *u)
+{
+	struct unvme_thread_entry *entry, *next;
+	int ret = 0;
+
+	pthread_mutex_lock(&u->thread_list_lock);
+	list_for_each_safe(&u->thread_list, entry, next, list) {
+		if (tgkill(getpid(), entry->thread_id, 0) == -1 &&
+		    errno == ESRCH) {
+			list_del(&entry->list);
+			free(entry);
+			continue;
+		}
+		if (entry->ops->reinit_ctrl &&
+		    entry->ops->reinit_ctrl(entry->opaque)) {
+			unvmed_log_err("%s: thread reinit_ctrl callback failed",
+					unvmed_bdf(u));
+			ret = -1;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&u->thread_list_lock);
+
+	return ret;
+}
+
+/*
+ * Re-initialize a VF controller instance after a PF reset.
+ *
+ * Called from unvmed_init_ctrl() when the controller is found in
+ * UNVME_TEARDOWN state, meaning the PF has already driven the VF through
+ * partial teardown (unvmed_free_vf_ctrl) and is now reinitializing it.
+ *
+ * Flow:
+ *   1. Re-run nvme_ctrl_init() in place, reusing the existing struct unvme.
+ *   2. Reallocate IRQs for the new hardware state.
+ *   3. Transition to UNVME_VF_RECOVERING and invoke every registered thread's
+ *      reinit_ctrl callback so that application threads (e.g. fio) can remap
+ *      their IOMMU buffers without polling.
+ *   4. Transition to UNVME_VF_RECOVERED; the normal enable path
+ *      (unvmed_enable_ctrl) will take it from there to ENABLING -> ENABLED.
+ *
+ * Refcount: enters with the +1 ref taken by the caller's unvmed_get(); on
+ * success returns @u with that ref transferred to the caller (matches the
+ * fresh-init path of unvmed_init_ctrl()). On failure, drops the ref via
+ * unvmed_put() and returns NULL.
+ */
+static struct unvme *__unvmed_reinit_ctrl(struct unvme *u, const char *bdf,
+					  uint32_t max_nr_ioqs)
+{
+	if (!pci_is_vf(bdf)) {
+		unvmed_log_err("%s: reinit support only VF", unvmed_bdf(u));
+		unvmed_put(u);
+		return NULL;
+	}
+
+	u->ctrl.opts.nsqr = max_nr_ioqs - 1;
+	u->ctrl.opts.ncqr = max_nr_ioqs - 1;
+
+	if (nvme_ctrl_init(&u->ctrl, bdf, &u->ctrl.opts)) {
+		unvmed_log_err("%s: failed to init nvme_ctrl", unvmed_bdf(u));
+		unvmed_put(u);
+		return NULL;
+	}
+	u->epoch++;
+
+	u->ctrl.config.nsqa = u->ctrl.opts.nsqr;
+	u->ctrl.config.ncqa = u->ctrl.opts.ncqr;
+
+	/*
+	 * Mirror the fresh-init path: keep nr_sqs/nr_cqs consistent with the
+	 * just-updated opts, so libvfn's ctrl.sq/ctrl.cq array size and our
+	 * shadow array bounds do not drift across reinits.
+	 */
+	u->nr_sqs = u->ctrl.opts.nsqr + 2;
+	u->nr_cqs = u->ctrl.opts.ncqr + 2;
+
+	if (unvmed_alloc_irqs(u)) {
+		unvmed_log_err("%s: failed to initialize IRQs", unvmed_bdf(u));
+
+		nvme_close(&u->ctrl);
+		unvmed_put(u);
+		return NULL;
+	}
+
+	unvmed_ctrl_set_state(u, UNVME_VF_RECOVERING);
+
+	if (__unvmed_reinit_invoke_callbacks(u)) {
+		/*
+		 * Undo what this function did so the controller is not left in
+		 * a half-initialized zombie state (IRQs allocated, ctrl open,
+		 * stuck in VF_RECOVERING with no valid outbound transition).
+		 *
+		 * Roll state back to TEARDOWN so a subsequent unvmed_init_ctrl()
+		 * retry can re-enter this path cleanly.
+		 */
+		unvmed_free_irqs(u);
+		pthread_rwlock_wrlock(&u->lock);
+		nvme_close(&u->ctrl);
+		pthread_rwlock_unlock(&u->lock);
+		unvmed_ctrl_set_state(u, UNVME_TEARDOWN);
+		unvmed_put(u);
+		return NULL;
+	}
+
+	unvmed_ctrl_set_state(u, UNVME_VF_RECOVERED);
+
+	unvmed_log_info("%s: controller re-initialized (nr_sqs=%u, nr_cqs=%u)",
+			unvmed_bdf(u), u->nr_sqs, u->nr_cqs);
+
+	/*
+	 * Hand the caller the same +1 ref the fresh-init path of
+	 * unvmed_init_ctrl() returns: do NOT drop the ref taken by
+	 * unvmed_get() in unvmed_init_ctrl().
+	 */
+	return u;
+}
+
+/*
+ * Look up or (re)initialize the NVMe controller instance for @bdf.
+ *
+ * Three cases, in order:
+ *   1. No struct unvme exists for @bdf yet
+ *        → allocate a fresh instance, run nvme_ctrl_init(), allocate
+ *          IRQs, and return it with state = UNVME_DISABLED.
+ *   2. An instance exists in UNVME_TEARDOWN
+ *        → the PF has already partially torn this VF down via
+ *          unvmed_free_vf_ctrl(); route into __unvmed_reinit_ctrl()
+ *          which reruns nvme_ctrl_init() in place, reallocates IRQs,
+ *          fires each thread's reinit_ctrl callback, and leaves the
+ *          instance in UNVME_VF_RECOVERED for the caller to drive
+ *          through the normal enable path.
+ *   3. An instance exists in any other state
+ *        → return it as-is (unvmed_get() already took a +1 ref).
+ *
+ * Return: pointer to &struct unvme with a +1 refcount taken by this
+ * call, or NULL on failure.
  */
 struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 {
@@ -989,10 +1489,21 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 	struct unvme *u;
 
 	u = unvmed_get(bdf);
-	if (u)
+	if (u) {
+		if (__unvmed_ctrl_get_state(u) == UNVME_TEARDOWN)
+			return __unvmed_reinit_ctrl(u, bdf, max_nr_ioqs);
+
 		return u;
+	}
 
 	u = zmalloc(sizeof(struct unvme));
+	u->state = UNVME_DISABLED;
+	/*
+	 * Initialize the list node self-referentially so unvmed_free_ctrl()'s
+	 * list_del() is safe even on the error path that bails before the
+	 * instance is published via list_add() below.
+	 */
+	list_node_init(&u->list);
 
 	/*
 	 * Zero-based values for I/O queues to pass to `libvfn` excluding the
@@ -1050,18 +1561,32 @@ struct unvme *unvmed_init_ctrl(const char *bdf, uint32_t max_nr_ioqs)
 
 	list_head_init(&u->ns_list);
 	pthread_rwlock_init(&u->ns_list_lock, NULL);
-	list_add(&unvme_list, &u->list);
 	list_head_init(&u->ctx_list);
 
 	list_head_init(&u->mem_list);
 	pthread_rwlock_init(&u->mem_list_lock, NULL);
+
+	list_head_init(&u->thread_list);
+	pthread_mutex_init(&u->thread_list_lock, NULL);
 
 	if(__unvmed_bdf_to_int(unvmed_bdf(u), &u->u_bdf)) {
 		unvmed_free_ctrl(u);
 		return NULL;
 	}
 
+	/*
+	 * Set u_bdf and the initial refcnt before publishing the instance on
+	 * unvme_list.  unvmed_get() matches on u_bdf and atomic_inc()s
+	 * refcnt; if list_add() ran first, another thread could find the
+	 * instance after u_bdf was written and inc refcnt 0->1, which this
+	 * path then overwrote back to 1 via `u->refcnt = 1` — losing the
+	 * getter's reference and leading to a premature free / use-after-
+	 * free.  With u_bdf and refcnt already at 1, any concurrent get
+	 * incs 1->2 and the assignment below is gone, so the ref stays
+	 * balanced.
+	 */
 	u->refcnt = 1;
+	list_add(&unvme_list, &u->list);
 
 	unvmed_log_info("%s: controller initialized (nr_sqs=%u, nr_cqs=%u)",
 			unvmed_bdf(u), u->nr_sqs, u->nr_cqs);
@@ -1159,7 +1684,12 @@ int unvmed_init_ns(struct unvme *u, uint32_t nsid, void *identify)
 			return -1;
 		}
 
-		__unvmed_id_ns(u, nsid, id_ns);
+		if (__unvmed_id_ns(u, nsid, id_ns)) {
+			unvmed_log_err("%s: failed to identify namespace (nsid=%u)",
+					unvmed_bdf(u), nsid);
+			unvmed_pgunmap(id_ns);
+			return -1;
+		}
 	}
 
 	prev = unvmed_ns_get(u, nsid);
@@ -1173,10 +1703,19 @@ int unvmed_init_ns(struct unvme *u, uint32_t nsid, void *identify)
 	} else {
 		int refcnt;
 		ns = (struct __unvme_ns *)prev;
-		if (ns->enabled) {
-			refcnt = unvmed_ns_put(u, prev);
-			assert(refcnt > 0);
-		}
+		/*
+		 * Drop the +1 ref taken by unvmed_ns_get() above.  This used
+		 * to be conditional on ns->enabled, which leaked the ref (and
+		 * thus the namespace) whenever a previously *disabled* ns was
+		 * re-initialized: get raised refcnt to 2, only free_ns_all's
+		 * single put lowered it to 1, so __unvmed_free_ns() never ran.
+		 *
+		 * refcnt was >= 1 before the get (find_and_get returned it),
+		 * so this put lands at >= 1 and @ns stays valid for the
+		 * re-population below.
+		 */
+		refcnt = unvmed_ns_put(u, prev);
+		assert(refcnt > 0);
 	}
 
 	if (id_ns->nlbaf < 16)
@@ -1413,7 +1952,12 @@ int unvmed_init_meta_ns(struct unvme *u, uint32_t nsid, void *nvm_id_ns)
 			goto out;
 		}
 
-		__unvmed_nvm_id_ns(u, nsid, __nvm_id_ns);
+		if (__unvmed_nvm_id_ns(u, nsid, __nvm_id_ns)) {
+			unvmed_log_err("%s: failed to identify nvm namespace (nsid=%u)",
+					unvmed_bdf(u), nsid);
+			ret = -1;
+			goto out;
+		}
 	}
 
 	elbaf = le32_to_cpu(__nvm_id_ns->elbaf[ns->format_idx]);
@@ -1694,19 +2238,15 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 		pthread_spin_init(&usq->lock, 0);
 
 		usq->cmds = calloc(qsize, sizeof(struct unvme_cmd));
+		usq->conflict_cmds = calloc(1, sizeof(struct unvme_cmd));
 
 		/*
 		 * libvfn manages @rq instances for (@qsize-1).
 		 */
 		if (unvmed_cid_init(usq, qsize - 1) < 0) {
 			free(usq->cmds);
+			free(usq->conflict_cmds);
 			free(usq);
-			return NULL;
-		}
-
-		if (unvmed_vcq_init(&usq->vcq, qsize, &usq->vcq.qid)) {
-			if (alloc)
-				free(usq);
 			return NULL;
 		}
 
@@ -1716,9 +2256,9 @@ static struct unvme_sq *unvmed_init_usq(struct unvme *u, uint32_t qid,
 		 * terminating the pending timer.
 		 */
 		if (unvmed_timer_init(&usq->timer, usq)) {
-			unvmed_vcq_free(&usq->vcq);
 			unvmed_cid_free(usq);
 			free(usq->cmds);
+			free(usq->conflict_cmds);
 			free(usq);
 			return NULL;
 		}
@@ -1778,9 +2318,9 @@ static void __unvmed_free_usq(struct unvme *u, struct unvme_sq *usq)
 
 	unvmed_timer_free(&usq->timer);
 	unvmed_cid_free(usq);
-	unvmed_vcq_free(&usq->vcq);
 
 	free(usq->cmds);
+	free(usq->conflict_cmds);
 	free(usq);
 
 	if (!qid)
@@ -1879,12 +2419,56 @@ static void unvmed_free_ns_all(struct unvme *u)
 }
 
 /*
- * Free NVMe controller instance from libvfn and the libunvmed.
+ * Drain @u->mem_list and release every entry registered via
+ * unvmed_mem_alloc().  Each entry owns an IOMMU mapping and a backing page
+ * allocation; unvmed_unmap_vaddr() is gated by a !pci.bdf check, so when the
+ * controller is still alive it actually removes the IOMMU mapping, and when
+ * pci.bdf is already cleared (post nvme_close) it returns ENODEV harmlessly
+ * — vfio releases those mappings automatically on container close, so only
+ * the host-side page allocation has to be freed here.
+ *
+ * Detach each entry under the list lock and unmap/free outside it to avoid
+ * recursing into mem_list_lock through unvmed_unmap_vaddr().
  */
-void unvmed_free_ctrl(struct unvme *u)
+static void unvmed_free_mem_all(struct unvme *u)
 {
-	int qid;
+	struct unvme_dmabuf *dbuf;
 
+	while (true) {
+		pthread_rwlock_wrlock(&u->mem_list_lock);
+		dbuf = list_top(&u->mem_list, struct unvme_dmabuf, list);
+		if (dbuf)
+			list_del(&dbuf->list);
+		pthread_rwlock_unlock(&u->mem_list_lock);
+
+		if (!dbuf)
+			break;
+
+		unvmed_unmap_vaddr(u, dbuf->buf.vaddr);
+		unvmed_pgunmap(dbuf->buf.vaddr);
+		free(dbuf);
+	}
+}
+
+/*
+ * Drain @u->thread_list and free every per-thread callback entry registered
+ * via unvmed_add_thread().  Caller must guarantee no thread is still adding
+ * to or removing from the list at this point (final teardown only).
+ */
+static void unvmed_free_thread_list(struct unvme *u)
+{
+	struct unvme_thread_entry *entry, *next;
+
+	pthread_mutex_lock(&u->thread_list_lock);
+	list_for_each_safe(&u->thread_list, entry, next, list) {
+		list_del(&entry->list);
+		free(entry);
+	}
+	pthread_mutex_unlock(&u->thread_list_lock);
+}
+
+void unvmed_free_vf_ctrl(struct unvme *u)
+{
 	/*
 	 * Set TEARDOWN first via the normal state machine (u->lock) so that any
 	 * new unvmed_map_vaddr/unvmed_unmap_vaddr caller that enters after this
@@ -1911,6 +2495,67 @@ void unvmed_free_ctrl(struct unvme *u)
 			shm_unlink(u->shmem_name);
 	}
 
+	pthread_rwlock_wrlock(&u->lock);
+	nvme_close(&u->ctrl);
+	pthread_rwlock_unlock(&u->lock);
+}
+
+/*
+ * Free NVMe controller instance from libvfn and the libunvmed.
+ */
+void unvmed_free_ctrl(struct unvme *u)
+{
+	int qid;
+
+	/*
+	 * Atomically transition to TEARDOWN under u->lock so the reaper
+	 * thread observes the state change consistently.  Success ==
+	 * "this call is the one performing hardware teardown".  Failure
+	 * means either we are already in TEARDOWN (e.g. unvmed_free_vf_ctrl()
+	 * already ran) or the current state is not a valid teardown source
+	 * (ENABLING / VF_INVALIDATING / VF_RECOVERED / VF_ENABLED) — in both
+	 * cases another path owns nvme_close(), so this call only releases
+	 * host-side page allocations and the dbuf bookkeeping.
+	 */
+	if (__unvmed_ctrl_set_state(u, UNVME_TEARDOWN)) {
+		unvmed_free_irqs(u);
+		unvmed_hmb_free(u);
+
+		/* Clean up shared memory if allocated */
+		if (u->shmem_vaddr && u->shmem_size > 0) {
+			if (u->shmem_iova)
+				unvmed_unmap_vaddr(u, u->shmem_vaddr);
+			munmap(u->shmem_vaddr, u->shmem_size);
+			if (u->shmem_fd >= 0)
+				close(u->shmem_fd);
+			if (u->shmem_name[0])
+				shm_unlink(u->shmem_name);
+		}
+
+		/*
+		 * Drain DMA buffer registry while pci.bdf is still alive so
+		 * unvmed_unmap_vaddr() actually removes the IOMMU mappings.
+		 * Doing this after nvme_close() would leak IOMMU mappings into
+		 * a still-active vfio container (PF + sibling VFs), letting
+		 * the kernel reuse the underlying pages while devices can
+		 * still DMA into them — the path that previously brought the
+		 * host down.
+		 */
+		unvmed_free_mem_all(u);
+
+		pthread_rwlock_wrlock(&u->lock);
+		nvme_close(&u->ctrl);
+		pthread_rwlock_unlock(&u->lock);
+	} else {
+		/*
+		 * IOMMU mappings owned by this controller have either been
+		 * released by the prior nvme_close()/vfio close path or will
+		 * be when the container is finally torn down; only release
+		 * host-side page allocations and the dbuf bookkeeping here.
+		 */
+		unvmed_free_mem_all(u);
+	}
+
 	for (qid = 0; qid < u->nr_sqs; qid++) {
 		if (!u->sqs[qid])
 			continue;
@@ -1926,14 +2571,38 @@ void unvmed_free_ctrl(struct unvme *u)
 	free(u->sqs);
 	free(u->cqs);
 
-	pthread_rwlock_wrlock(&u->lock);
-	nvme_close(&u->ctrl);
-	pthread_rwlock_unlock(&u->lock);
-
 	unvmed_free_ns_all(u);
+
+	/*
+	 * Drain saved-context list (populated by unvmed_ctx_save() on
+	 * disable/reset paths) so an unbalanced save without a paired restore
+	 * does not leak unvme_ctx allocations on final free.
+	 */
+	unvmed_ctx_free(u);
+
+	/*
+	 * Drain leftover per-thread callback entries registered via
+	 * unvmed_add_thread().  Final free is the only safe place to do this:
+	 * caller is responsible for having quiesced application threads, and
+	 * the reaper thread was already joined inside unvmed_free_irqs().
+	 */
+	unvmed_free_thread_list(u);
 
 	if (u->id_ctrl)
 		free(u->id_ctrl);
+
+	/*
+	 * Destroy the locks initialized in unvmed_init_ctrl() last.  All of
+	 * the lists they guard have been drained above, the reaper thread was
+	 * joined inside unvmed_free_irqs(), and the caller has quiesced
+	 * application threads — no concurrent waiter can be on these locks.
+	 */
+	pthread_rwlock_destroy(&u->lock);
+	pthread_rwlock_destroy(&u->sqs_lock);
+	pthread_rwlock_destroy(&u->cqs_lock);
+	pthread_rwlock_destroy(&u->ns_list_lock);
+	pthread_rwlock_destroy(&u->mem_list_lock);
+	pthread_mutex_destroy(&u->thread_list_lock);
 
 	list_del(&u->list);
 	free(u);
@@ -1962,12 +2631,22 @@ static int __unvme_reset_ctrl(struct unvme *u)
 		return -1;
 	}
 
+	if (__unvmed_ctrl_get_state(u) == UNVME_TEARDOWN) {
+		errno = ENODEV;
+		return -1;
+	}
+
 	if (!__unvmed_ctrl_set_state(u, UNVME_RESETTING)) {
 		errno = EBUSY;
 		return -1;
 	}
 
 	cc = unvmed_read32(u, NVME_REG_CC);
+	if (cc == 0xffffffff) {
+		unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+		errno = ENODEV;
+		return -1;
+	}
 	unvmed_write32(u, NVME_REG_CC, cc & ~(1 << NVME_CC_EN_SHIFT));
 	while (1) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
@@ -1977,7 +2656,15 @@ static int __unvme_reset_ctrl(struct unvme *u)
 			errno = ENODEV;
 			return -1;
 		}
-		if (!NVME_CSTS_RDY(csts) && !NVME_CSTS_CFS(csts))
+		if (NVME_CSTS_CFS(csts)) {
+			unvmed_log_err("%s: controller has set CFS (CSTS.CFS)",
+			       unvmed_bdf(u));
+			errno = ENODEV;
+			__unvmed_ctrl_set_state(u, UNVME_FATAL);
+			return -1;
+		}
+
+		if (!NVME_CSTS_RDY(csts))
 			break;
 	}
 	unvmed_log_info("%s: controller reset complete", unvmed_bdf(u));
@@ -2148,6 +2835,18 @@ static inline void unvmed_put_cqe(struct unvme *u, struct unvme_cmd *cmd)
 	unvmed_log_info("%s: canceled command (sqid=%u, cid=%u)", unvmed_bdf(u), cqe.sqid, cqe.cid);
 }
 
+static void __unvmed_put_cqe(struct unvme *u, struct unvme_cmd *cmd)
+{
+	switch (LOAD(cmd->state)) {
+	case UNVME_CMD_S_SUBMITTED:
+	case UNVME_CMD_S_ALLOCATED:
+		unvmed_put_cqe(u, cmd);
+		break;
+	default:
+		break;
+	}
+}
+
 static inline void unvmed_cancel_sq(struct unvme *u, struct unvme_sq *usq)
 {
 	struct unvme_cq *ucq = usq->ucq;
@@ -2210,7 +2909,7 @@ update:
 	ucq->q->head = head;
 	ucq->q->phase = phase;
 
-	for (int i = 0; i < usq->qsize; i++) {
+	for (int i = 0; i < usq->qsize - 1; i++) {
 		cmd = &usq->cmds[i];
 
 		/*
@@ -2221,15 +2920,10 @@ update:
 		 * between our refcnt check and unvmed_put_cqe(), which would
 		 * result in a NULL dereference on cmd->rq.
 		 */
-		switch (LOAD(cmd->state)) {
-		case UNVME_CMD_S_SUBMITTED:
-		case UNVME_CMD_S_ALLOCATED:
-			unvmed_put_cqe(u, cmd);
-			break;
-		default:
-			break;
-		}
+		__unvmed_put_cqe(u, cmd);
 	}
+
+	__unvmed_put_cqe(u, usq->conflict_cmds);
 
 	unvmed_cq_exit(ucq);
 }
@@ -2240,7 +2934,13 @@ static void unvmed_cq_drain(struct unvme *u, struct unvme_cq *ucq)
 	uint32_t head;
 	uint8_t phase;
 
-	if (unvmed_cq_irq_enabled(ucq)) {
+	/*
+	 * Without a reaper thread there is nobody to hand the drain over to,
+	 * and writing to the eventfd would look like a spurious interrupt to
+	 * the application, so drain the CQ inline instead.
+	 */
+	if (unvmed_cq_irq_enabled(ucq) && unvmed_reaper_alive(u, unvmed_cq_iv(ucq)) &&
+			!(u->reapers[unvmed_cq_iv(ucq)].flags & UNVMED_IRQ_F_NO_REAPER)) {
 		struct unvme_cq_reaper *r = &u->reapers[unvmed_cq_iv(ucq)];
 
 		eventfd_write(r->efd, 1);  /* Wake up reaper thread */
@@ -2301,7 +3001,6 @@ void unvmed_cancel_cmd(struct unvme *u, struct unvme_sq *usq)
 	 * fake cq entries with tail pointer being updated to avoid race.
 	 */
 	unvmed_cq_drain(u, usq->ucq);
-	unvmed_vcq_drain(&usq->vcq);
 
 	unvmed_cancel_sq(u, usq);
 
@@ -2331,8 +3030,25 @@ static inline void unvmed_cancel_cmd_all(struct unvme *u)
 
 void unvmed_free_ctx(struct unvme *u)
 {
-	unvmed_free_ns_all(u);
-
+	/*
+	 * Namespaces are NOT torn down here.  Every caller of unvmed_free_ctx()
+	 * is a reset-and-reinit path that re-populates namespaces via
+	 * unvmed_ctx_restore() -> unvmed_init_ns(), which reuses the existing
+	 * ns object (the prev != NULL branch) rather than recreating it.
+	 *
+	 * Calling unvmed_free_ns_all() here would drop a refcnt claim on every
+	 * reset, but unvmed_init_ns() only claims refcnt=1 on first creation
+	 * (prev == NULL) and is balanced (get/put) on re-init.  So each reset
+	 * after the first eats into external holders' references: once a holder
+	 * such as a fio ioengine's ld->ns is the only remaining reference, the
+	 * next reset's put drives refcnt to 0, frees the ns, and leaves the
+	 * holder with a dangling pointer -> use-after-free on its later
+	 * unvmed_ns_put().
+	 *
+	 * Reset only needs to discard the I/O queues; ns metadata is refreshed
+	 * in place by unvmed_init_ns() (and ns->enabled is toggled separately
+	 * by unvmed_disable_ns_all()/unvmed_init_ns()).
+	 */
 	__unvmed_delete_sq_all(u);
 	__unvmed_delete_cq_all(u);
 }
@@ -2440,8 +3156,17 @@ void unvmed_reset_ctrl_graceful(struct unvme *u)
 	u->asq->enabled = false;
 	u->acq->enabled = false;
 
-	unvmed_free_ns_all(u);
-
+	/*
+	 * Namespaces are NOT torn down here, for the same reason as in
+	 * unvmed_free_ctx(): the graceful reset is a reset-and-reinit path whose
+	 * unvmed_ctx_restore() -> unvmed_init_ns() reuses the existing ns object
+	 * (the prev != NULL branch) rather than recreating it.  Dropping a refcnt
+	 * claim here would eat into external holders' references once the driver's
+	 * own claim is gone, driving refcnt to 0 and freeing the ns while a holder
+	 * such as a fio ioengine's ld->ns still references it -> use-after-free.
+	 * Namespaces were already disabled above via unvmed_disable_ns_all();
+	 * reinit re-enables and refreshes them in place.
+	 */
 	__unvmed_delete_sq(u, u->asq);
 	__unvmed_delete_cq(u, u->acq);
 
@@ -2504,7 +3229,16 @@ static void *unvmed_reaper_run(void *opaque)
 		if (unvmed_cq_wait_irq(u, vector))
 			goto out;
 
-		if (!atomic_load_acquire(&r->refcnt))
+		/*
+		 * refcnt == 1 means no CQ is attached: either teardown is in
+		 * progress (unvmed_free_irq() dropped the last CQ reference and
+		 * woke this thread up through the eventfd), or no CQ has been
+		 * attached yet.  The latter cannot lose a completion because a
+		 * reaper is only woken by an interrupt from an attached CQ, and
+		 * unvmed_init_irq() -> unvmed_create_cq() runs in a single caller
+		 * context before any I/O can be submitted.
+		 */
+		if (atomic_load_acquire(&r->refcnt) <= 1)
 			goto out;
 
 		if (__unvmed_ctrl_get_state(u) == UNVME_TEARDOWN)
@@ -2646,19 +3380,39 @@ static void __unvmed_init_mps(struct unvme *u, uint8_t mps)
 	u->ctrl.config.mps = mps;
 }
 
-int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
-		      uint8_t mps, uint8_t ams, uint8_t css, int timeout)
+/*
+ * Internal helper to enable NVMe controller by asserting CC.EN and waiting
+ * for CSTS.RDY.  The @state parameter controls whether state machine
+ * transitions are performed:
+ *
+ * - @state=true: full state transition (ENABLING -> ENABLED). Used by
+ *   unvmed_enable_ctrl() for PF and normal controller enable.
+ * - @state=false: skip state transitions. Used by unvmed_enable_vf() to let
+ *   caller manage VF-specific states (VF_RECOVERING -> VF_RECOVERED -> VF_ENABLED).
+ *
+ * On CSTS.CFS=1 (controller fatal status), sets state to UNVME_FATAL only
+ * if @state=true.
+ */
+int __unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
+		      uint8_t mps, uint8_t ams, uint8_t css, int timeout,
+		      bool state)
 {
 	uint32_t cc;
 	uint32_t csts;
 
-	if (!__unvmed_ctrl_set_state(u, UNVME_ENABLING)) {
+	if (state && !__unvmed_ctrl_set_state(u, UNVME_ENABLING)) {
 		unvmed_log_err("%s: failed to set ENABLING state", unvmed_bdf(u));
 		errno = EBUSY;
 		return -1;
 	}
 
 	cc = unvmed_read32(u, NVME_REG_CC);
+	if (cc == 0xffffffff) {
+		unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+		errno = ENODEV;
+		return -1;
+	}
+
 	if (NVME_CC_EN(cc)) {
 		unvmed_log_err("%s: Controller (%s) has already been enabled (CC.EN=1)",
 		       unvmed_bdf(u), unvmed_bdf(u));
@@ -2675,11 +3429,21 @@ int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 
 	while (1) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
+		if (csts == 0xffffffff) {
+			unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+			errno = ENODEV;
+
+			if (state)
+				__unvmed_ctrl_set_state(u, UNVME_FATAL);
+			return -1;
+		}
 		if (NVME_CSTS_CFS(csts)) {
-			unvmed_log_err("%s: controller has seted CFS (CSTS.CFS)",
+			unvmed_log_err("%s: controller has set CFS (CSTS.CFS)",
 			       unvmed_bdf(u));
 			errno = ENODEV;
-			__unvmed_ctrl_set_state(u, UNVME_FATAL);
+
+			if (state)
+				__unvmed_ctrl_set_state(u, UNVME_FATAL);
 			return -1;
 		} else if (NVME_CSTS_RDY(csts))
 			break;
@@ -2696,12 +3460,58 @@ int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
 	if (u->asq)
 		unvmed_enable_sq(u->asq);
 
-	__unvmed_ctrl_set_state(u, UNVME_ENABLED);
+	if (state && !__unvmed_ctrl_set_state(u, UNVME_ENABLED)) {
+		errno = ENODEV;
+		return -1;
+	}
 
 	unvmed_log_info("%s: controller enabled (iosqes=%u, iocqes=%u, mps=%u, "
 			"ams=%u, css=%u, timeout=%d)",
 			unvmed_bdf(u), iosqes, iocqes, mps, ams, css, timeout);
 
+
+	return 0;
+}
+
+int unvmed_enable_ctrl(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
+		      uint8_t mps, uint8_t ams, uint8_t css, int timeout)
+{
+	return __unvmed_enable_ctrl(u, iosqes, iocqes, mps, ams, css, timeout, true);
+}
+
+/**
+ * unvmed_enable_vf - Enable NVMe Virtual Function controller
+ * @u: &struct unvme
+ * @iosqes: I/O Submission Queue Entry Size (specified as 2^n)
+ * @iocqes: I/O Completion Queue Entry Size (specified as 2^n)
+ * @mps: Memory Page Size (specified as (2 ^ (12 + n)))
+ * @ams: Arbitration Mechanism Selected
+ * @css: I/O Command Set Selected
+ * @timeout: timeout in seconds (0: disabled)
+ *
+ * Enable the given NVMe VF controller by asserting CC.EN to 1 and waiting for
+ * CSTS.RDY.  Unlike unvmed_enable_ctrl(), this function skips state machine
+ * transitions during enable (passes state=false to __unvmed_enable_ctrl()),
+ * letting the caller retain full control over VF-specific states.
+ *
+ * After successful enable, transitions to UNVME_VF_ENABLED.  Typical VF
+ * recovery flow:
+ * 1. Caller sets UNVME_VF_RECOVERING
+ * 2. Caller calls unvmed_enable_vf()
+ * 3. This function sets UNVME_VF_ENABLED
+ *
+ * Return: ``0`` on success, ``-1`` on failure with ``errno`` set.
+ */
+int unvmed_enable_vf(struct unvme *u, uint8_t iosqes, uint8_t iocqes,
+		      uint8_t mps, uint8_t ams, uint8_t css, int timeout)
+{
+	if (__unvmed_enable_ctrl(u, iosqes, iocqes, mps, ams, css, timeout, false))
+		return -1;
+
+	if (!unvmed_ctrl_set_state_fallback(u, UNVME_VF_ENABLED,
+					(UNVME_VF_INVALIDATING | UNVME_VF_INVALIDATED | UNVME_FATAL),
+					UNVME_VF_INVALIDATED))
+		return -1;
 
 	return 0;
 }
@@ -2716,9 +3526,10 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 	uint16_t qflags = 0;
 	uint16_t iv = 0;
 
-	if (vector >= 0 && unvmed_init_irq(u, vector)) {
-		unvmed_log_err("%s: failed to initialize irq (nr_irqs=%d, vector=%d, errno=%d \"%s\")",
-				unvmed_bdf(u), u->nr_irqs, vector, errno, strerror(errno));
+	if (vector >= 0 && !unvmed_reaper_alive(u, vector)) {
+		unvmed_log_err("%s: vector=%d not initialized; call unvmed_init_irq() first",
+				unvmed_bdf(u), vector);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -2806,13 +3617,26 @@ int unvmed_create_cq(struct unvme *u, uint32_t qid, uint32_t qsize, int vector,
 	if (vector < 0) {
 		ucq->q->vector = -1;
 		unvmed_cq_iv(ucq) = -1;
-	} else if (vector >= 0 && unvmed_reaper_add_cq(u, ucq)) {
-		unvmed_log_err("%s: failed to register ucq to reaper (qid=%d)",
-				unvmed_bdf(u), qid);
-		unvmed_cmd_put(cmd);
-		nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
-		unvmed_sq_put(u, asq);
-		return -1;
+	} else {
+		if (!unvmed_get_reaper(u, vector)) {
+			unvmed_log_err("%s: vector=%d not initialized; call "
+					"unvmed_init_irq() first", unvmed_bdf(u), vector);
+			errno = EINVAL;
+			unvmed_cmd_put(cmd);
+			nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
+			unvmed_sq_put(u, asq);
+			return -1;
+		}
+
+		if (unvmed_reaper_add_cq(u, ucq)) {
+			unvmed_log_err("%s: failed to register ucq to reaper (qid=%d)",
+					unvmed_bdf(u), qid);
+			unvmed_put_reaper(u, vector);
+			unvmed_cmd_put(cmd);
+			nvme_discard_cq(&u->ctrl, &u->ctrl.cq[qid]);
+			unvmed_sq_put(u, asq);
+			return -1;
+		}
 	}
 
 	unvmed_enable_cq(ucq);
@@ -2828,8 +3652,14 @@ static void __unvmed_delete_cq(struct unvme *u, struct unvme_cq *ucq)
 	int vector = unvmed_cq_iv(ucq);
 	bool irq = unvmed_cq_irq_enabled(ucq);
 
-	if (irq)
+	/*
+	 * Hold a reference across the list update so that a concurrent teardown
+	 * cannot free the reaper while its CQ list is being walked.
+	 */
+	if (irq && unvmed_get_reaper(u, vector)) {
 		unvmed_reaper_del_cq(u, ucq);
+		unvmed_put_reaper(u, vector);
+	}
 
 	unvmed_discard_cq(u, qid);
 	unvmed_cq_put(u, ucq);
@@ -2852,7 +3682,11 @@ static void __unvmed_delete_cq_all(struct unvme *u)
 		if (!ucq)
 			continue;
 
-		unvmed_reaper_del_cq(u, ucq);
+		if (unvmed_cq_irq_enabled(ucq) &&
+				unvmed_get_reaper(u, unvmed_cq_iv(ucq))) {
+			unvmed_reaper_del_cq(u, ucq);
+			unvmed_put_reaper(u, unvmed_cq_iv(ucq));
+		}
 
 		unvmed_log_info("%s: Deleting ucq (qid=%d)", unvmed_bdf(u), unvmed_cq_id(ucq));
 
@@ -3295,8 +4129,24 @@ static struct unvme_cmd *unvmed_get_cmd_on_reaper(struct unvme *u,
 
 	cmd = &usq->cmds[cqe->cid];
 
-	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED)
-		return NULL;
+	/*
+	 * Resolve the command backing @cqe.  In the normal path the regular
+	 * slot cmds[cid] is in SUBMITTED and is returned directly.  When a
+	 * conflict command (allocated via the single per-SQ conflict slot
+	 * with an explicit cid that collides with an existing one) produced
+	 * this completion, cmds[cid] is not in SUBMITTED, so fall back to the
+	 * conflict slot.  Because the conflict slot is shared across all CIDs
+	 * in the SQ, the cid must be re-checked against @cqe->cid before it is
+	 * accepted; a mismatch means no matching submitted command exists.
+	 */
+	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED) {
+		cmd = usq->conflict_cmds;
+
+		if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED || cmd->cid != cqe->cid)
+			return NULL;
+
+		unvmed_log_info("%s: consumed conflict cmd. (sqid=%u, cid=%u)", unvmed_bdf(u), cqe->sqid, cqe->cid);
+	}
 
 	return cmd;
 }
@@ -3305,6 +4155,7 @@ struct unvme_cmd *unvmed_get_cmd_from_cqe(struct unvme *u,
 					  struct nvme_cqe *cqe)
 {
 	struct unvme_sq *usq;
+	struct unvme_cmd *cmd;
 
 	/*
 	 * We don't have get/put scheme here since @usq instance can only be
@@ -3316,7 +4167,26 @@ struct unvme_cmd *unvmed_get_cmd_from_cqe(struct unvme *u,
 	if (!usq)
 		return NULL;
 
-	return unvmed_get_cmd(usq, cqe->cid);
+	cmd = &usq->cmds[cqe->cid];
+
+	/*
+	 * Same conflict-slot fallback as unvmed_get_cmd_on_reaper(), but used
+	 * on the cross-thread path: this is called by unvmed_vcq_push_to_other()
+	 * to identify a command that belongs to another thread before pushing
+	 * its completion into that thread's VCQ.  Unlike the reaper variant,
+	 * duplicate-completion safety is provided by the caller's
+	 * SUBMITTED -> TO_BE_COMPLETED CAS rather than by this lookup, so no
+	 * log is emitted here.  The cid re-check against @cqe->cid is still
+	 * required because the conflict slot is shared across all CIDs.
+	 */
+	if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED) {
+		cmd = usq->conflict_cmds;
+
+		if (LOAD(cmd->state) != UNVME_CMD_S_SUBMITTED || cmd->cid != cqe->cid)
+			return NULL;
+	}
+
+	return cmd;
 }
 
 static struct nvme_cqe *unvmed_get_completion(struct unvme *u,
@@ -3342,9 +4212,8 @@ static struct nvme_cqe *__unvmed_get_completion(struct unvme *u,
 	struct unvme_cmd *cmd;
 	struct unvme_vcqe __vcqe;
 	struct nvme_cqe *cqe;
-	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
 
-	ret = unvmed_vcq_pop(__vcq, &__vcqe);
+	ret = unvmed_vcq_pop(vcq, &__vcqe);
 	if (ret != -ENOENT) {
 		cqe = &__vcqe.cqe;
 		cmd = unvmed_get_cmd(usq, cqe->cid);
@@ -3377,7 +4246,6 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 		      struct unvme_vcq *vcq, struct nvme_cqe *cqes, int nr_cqes,
 		      bool nowait)
 {
-	struct unvme_vcq *__vcq = vcq ? vcq : &usq->vcq;
 	struct unvme_vcqe __vcqe;
 	struct nvme_cqe *cqe;
 	struct unvme_cmd *cmd;
@@ -3388,7 +4256,7 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 	while (nr < nr_cqes) {
 		if (unvmed_cq_irq_enabled(ucq)) {
 			do {
-				ret = unvmed_vcq_pop(__vcq, &__vcqe);
+				ret = unvmed_vcq_pop(vcq, &__vcqe);
 			} while (ret == -ENOENT && !nowait);
 
 			if (ret)
@@ -3404,7 +4272,7 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 				continue;
 			}
 		} else {
-			cqe = __unvmed_get_completion(u, usq, __vcq, ucq);
+			cqe = __unvmed_get_completion(u, usq, vcq, ucq);
 
 			if (!cqe) {
 				if (nowait)
@@ -3425,9 +4293,9 @@ int __unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *uc
 	return nr;
 }
 
-int unvmed_cq_run(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq, struct nvme_cqe *cqes)
+int unvmed_cq_run(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq, struct unvme_vcq *vcq, struct nvme_cqe *cqes)
 {
-	return __unvmed_cq_run_n(u, usq, ucq, NULL, cqes, ucq->q->qsize - 1, true);
+	return __unvmed_cq_run_n(u, usq, ucq, vcq, cqes, ucq->q->qsize - 1, true);
 }
 
 int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
@@ -3559,6 +4427,11 @@ static int unvmed_pci_restore_state(struct unvme *u, void *config)
 
 	while (true) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
+		if (csts == 0xffffffff) {
+			unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+			errno = ENODEV;
+			return -1;
+		}
 		if (!NVME_CSTS_RDY(csts))
 			break;
 
@@ -3594,6 +4467,7 @@ static int unvmed_pci_wait_reset(struct unvme *u)
 {
 	uint16_t pcie_offset;
 	uint16_t link_status;
+	uint32_t link_cap;
 	uint64_t bar0;
 	char dsp[13];
 
@@ -3608,21 +4482,36 @@ static int unvmed_pci_wait_reset(struct unvme *u)
 		return -1;
 	}
 
-	unvmed_log_debug("%s: waiting for DSP(%s) link to be up ...", unvmed_bdf(u), dsp);
-	while (true) {
-		if (unvmed_pci_get_config(dsp, &link_status, pcie_offset + 0x12, 2)) {
-			unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
-					unvmed_bdf(u), pcie_offset + 0x12, 2);
-			return -1;
+	if (unvmed_pci_get_config(dsp, &link_cap, pcie_offset + 0xc, 4)) {
+		unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
+				unvmed_bdf(u), pcie_offset + 0xc, 4);
+		return -1;
+	}
+
+	/*
+	 * Link Status Register bit [13] (Data Link Layer Link Active) is only
+	 * meaningful when the DSP reports Link Capabilities bit [20] (Data
+	 * Link Layer Link Active Reporting Capable). Otherwise bit [13] is
+	 * reserved and may never read as 1, so skip waiting on it.
+	 */
+	if (link_cap & (1 << 20)) {
+		unvmed_log_debug("%s: waiting for DSP(%s) link to be up ...", unvmed_bdf(u), dsp);
+		while (true) {
+			if (unvmed_pci_get_config(dsp, &link_status, pcie_offset + 0x12, 2)) {
+				unvmed_log_err("%s: failed to CfgRd (offset=%#x, size=%d)",
+						unvmed_bdf(u), pcie_offset + 0x12, 2);
+				return -1;
+			}
+
+			/*
+			 * Wait for the following bitfield in Link Status Register.
+			 *   - [13] Data Link Layer Link Active
+			 */
+			if (link_status & (1 << 13))
+				break;
+
+			usleep(1000);
 		}
-
-		/*
-		 * Wait for the following bitfield in Link Status Register.
-		 *   - [13] Data Link Layer Link Active
-		 */
-		if (link_status & (1 << 13))
-			break;
-
 	}
 
 	unvmed_log_debug("%s: waiting for USP(%s) link to be reset ...",
@@ -3687,6 +4576,11 @@ int unvmed_subsystem_reset(struct unvme *u)
 	 */
 	while (true) {
 		csts = unvmed_read32(u, NVME_REG_CSTS);
+		if (csts == 0xffffffff) {
+			unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+			errno = ENODEV;
+			return -1;
+		}
 		if (NVME_CSTS_NSSRO(csts)) {
 			unvmed_write32(u, NVME_REG_CSTS,
 					1 << NVME_CSTS_NSSRO_SHIFT);
@@ -3849,7 +4743,7 @@ static int unvmed_get_pcie_cap_offset(char *bdf)
 		goto close;
 
 	ret = -1;
-	while (offset < 0x100) {
+	while (offset && offset < 0x100) {
 		if (pread(fd, &cap, 2, offset) < 0)
 			goto close;
 
@@ -4043,7 +4937,17 @@ int unvmed_ctx_init(struct unvme *u)
 	ctx->type = UNVME_CTX_T_CTRL;
 
 	cc = unvmed_read32(u, NVME_REG_CC);
+	if (cc == 0xffffffff) {
+		unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+		errno = ENODEV;
+		return -1;
+	}
 	aqa = unvmed_read32(u, NVME_REG_AQA);
+	if (aqa == 0xffffffff) {
+		unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+		errno = ENODEV;
+		return -1;
+	}
 
 	ctx->ctrl.iosqes = NVME_CC_IOSQES(cc);
 	ctx->ctrl.iocqes = NVME_CC_IOCQES(cc);
@@ -4053,8 +4957,13 @@ int unvmed_ctx_init(struct unvme *u)
 	ctx->ctrl.cq_size = NVME_AQA_ACQS(aqa) + 1;
 	ctx->ctrl.css = NVME_CC_CSS(cc);
 	ctx->ctrl.timeout = u->timeout;
-	if (u->asq)
-		ctx->ctrl.admin_irq = unvmed_cq_iv(u->acq) == 0;
+	/*
+	 * The mode a vector was initialized with has to survive a reset: coming
+	 * back with a reaper thread would silently take the eventfd away from
+	 * an application that is polling it.
+	 */
+	ctx->ctrl.admin_irq = u->asq && unvmed_cq_iv(u->acq) == 0;
+	ctx->ctrl.admin_irq_flags = ctx->ctrl.admin_irq ? u->reapers[0].flags : 0;
 
 	list_add_tail(&u->ctx_list, &ctx->list);
 
@@ -4079,6 +4988,8 @@ int unvmed_ctx_init(struct unvme *u)
 		ctx->cq.qsize = unvmed_cq_size(ucq);
 		ctx->cq.vector = unvmed_cq_iv(ucq);
 		ctx->cq.pc = ucq->pc;
+		ctx->cq.irq_flags = ctx->cq.vector >= 0 ?
+			u->reapers[ctx->cq.vector].flags : 0;
 
 		list_add_tail(&u->ctx_list, &ctx->list);
 		unvmed_cq_put(u, ucq);
@@ -4110,6 +5021,9 @@ static int __unvmed_ctx_restore(struct unvme *u, struct unvme_ctx *ctx)
 {
 	switch (ctx->type) {
 		case UNVME_CTX_T_CTRL:
+			if (ctx->ctrl.admin_irq &&
+					unvmed_init_irq(u, 0, ctx->ctrl.admin_irq_flags))
+				return -1;
 			if (unvmed_create_adminq(u, ctx->ctrl.sq_size,
 						ctx->ctrl.cq_size,
 						ctx->ctrl.admin_irq))
@@ -4124,6 +5038,9 @@ static int __unvmed_ctx_restore(struct unvme *u, struct unvme_ctx *ctx)
 				return ret;
 			return unvmed_init_meta_ns(u, ctx->ns.nsid, NULL);
 		case UNVME_CTX_T_CQ:
+			if (ctx->cq.vector >= 0 &&
+					unvmed_init_irq(u, ctx->cq.vector, ctx->cq.irq_flags))
+				return -1;
 			return unvmed_create_cq(u, ctx->cq.qid, ctx->cq.qsize,
 					ctx->cq.vector, ctx->cq.pc);
 		case UNVME_CTX_T_SQ:
@@ -4237,10 +5154,20 @@ int unvmed_hmb_init(struct unvme *u, uint32_t *bsize, int nr_bsize)
 	u->hmb.hsize = hsize;
 	return 0;
 free:
-	for (i = 0; i < nr_bsize; i++) {
-		if (u->hmb.descs[i].badd) {
-			unvmed_unmap_vaddr(u, (void *)u->hmb.descs_vaddr[i]);
-			unvmed_pgunmap((void *)u->hmb.descs_vaddr[i]);
+	/*
+	 * u->hmb.descs is only assigned after the per-buffer loop starts
+	 * populating entries.  If we got here before that assignment —
+	 * map_vaddr() or descs_vaddr calloc() failure — then u->hmb.descs is
+	 * still NULL and dereferencing u->hmb.descs[i] below would crash.
+	 * Only walk the descriptor array when it actually exists; otherwise
+	 * just release the descs allocation itself.
+	 */
+	if (u->hmb.descs) {
+		for (i = 0; i < nr_bsize; i++) {
+			if (u->hmb.descs[i].badd) {
+				unvmed_unmap_vaddr(u, (void *)u->hmb.descs_vaddr[i]);
+				unvmed_pgunmap((void *)u->hmb.descs_vaddr[i]);
+			}
 		}
 	}
 
@@ -4456,9 +5383,10 @@ static struct unvme_cq *__unvmed_init_cq(struct unvme *u, uint32_t qid, uint32_t
 {
 	struct unvme_cq *ucq;
 
-	if (vector >= 0 && unvmed_init_irq(u, vector)) {
-		unvmed_log_err("%s: failed to initialize irq (nr_irqs=%d, vector=%d, errno=%d \"%s\")",
-				unvmed_bdf(u), u->nr_irqs, vector, errno, strerror(errno));
+	if (vector >= 0 && !unvmed_reaper_alive(u, vector)) {
+		unvmed_log_err("%s: vector=%d not initialized; call unvmed_init_irq() first",
+				unvmed_bdf(u), vector);
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -4485,9 +5413,19 @@ static struct unvme_cq *__unvmed_init_cq(struct unvme *u, uint32_t qid, uint32_t
 	if (vector < 0)
 		unvmed_cq_iv(ucq) = -1;
 
-	if (vector >= 0 && unvmed_reaper_add_cq(u, ucq)) {
-		unvmed_log_err("%s: failed to register ucq to reaper", unvmed_bdf(u));
-		return NULL;
+	if (vector >= 0) {
+		if (!unvmed_get_reaper(u, vector)) {
+			unvmed_log_err("%s: vector=%d not initialized; call "
+					"unvmed_init_irq() first", unvmed_bdf(u), vector);
+			errno = EINVAL;
+			return NULL;
+		}
+
+		if (unvmed_reaper_add_cq(u, ucq)) {
+			unvmed_log_err("%s: failed to register ucq to reaper", unvmed_bdf(u));
+			unvmed_put_reaper(u, vector);
+			return NULL;
+		}
 	}
 
 	return ucq;
@@ -4541,6 +5479,104 @@ int unvmed_free_cq(struct unvme *u, uint16_t qid)
 	unvmed_disable_cq(ucq);
 
 	__unvmed_delete_cq(u, ucq);
+	return 0;
+}
+
+int unvmed_vf_check_reset_allowed(struct unvme *u)
+{
+	static const unsigned int finalize_from =
+		UNVME_VF_INVALIDATING | UNVME_FATAL;
+	enum unvme_state cur;
+
+	if (!u->ctrl.pci.bdf || !pci_is_vf(u->ctrl.pci.bdf)) {
+		errno = ENODEV;
+		return -1;
+	}
+
+	cur = __unvmed_ctrl_get_state(u);
+	if (cur == UNVME_ENABLED)
+		return 0;
+
+	/*
+	 * Best-effort finalize: if the VF is mid-invalidation or FATAL,
+	 * commit INVALIDATED.  Ignore EAGAIN/EALREADY — the state may
+	 * have moved on between the get above and the cmp_set, and the
+	 * outcome is reported below regardless.
+	 */
+	if (!__unvmed_ctrl_cmp_set_state(u, finalize_from,
+				UNVME_VF_INVALIDATED)) {
+		if (errno != EAGAIN && errno != EALREADY) {
+			unvmed_log_err("%s: cmp_set state (mask=0x%x, cur=%s, new=%s, errno=%d)",
+				       unvmed_bdf(u), finalize_from,
+				       unvmed_state_str(cur), unvmed_state_str(UNVME_VF_INVALIDATED),
+				       errno);
+			return -1;
+		}
+	}
+
+	errno = EBUSY;
+	return -1;
+}
+
+int unvmed_vf_start_invalidating(struct unvme *u)
+{
+	/* All states except VF_ENABLED / RESETTING are allowed as sources. */
+	uint32_t allowed = ~(UNVME_VF_ENABLED | UNVME_RESETTING) & ((1U << 11) - 1);
+	enum unvme_state cur;
+
+	if (!u->ctrl.pci.bdf || !pci_is_vf(u->ctrl.pci.bdf)) {
+		errno = ENODEV;
+		return -1;
+	}
+
+	cur = __unvmed_ctrl_get_state(u);
+
+	while (!__unvmed_ctrl_cmp_set_state(u, allowed, UNVME_VF_INVALIDATING)) {
+		if (errno != EAGAIN) {
+			unvmed_log_err("%s: cmp_set state (mask=0x%x, cur=%s, new=%s)",
+				       unvmed_bdf(u), allowed,
+				       unvmed_state_str(cur), unvmed_state_str(UNVME_VF_INVALIDATING));
+			return -1;
+		}
+	}
+	return cur;
+}
+
+int unvmed_vf_finish_invalidated(struct unvme *u, enum unvme_state old)
+{
+	static const uint32_t exit_state =
+		UNVME_VF_INVALIDATED | UNVME_FATAL |
+		UNVME_ENABLED        | UNVME_DISABLED |
+		UNVME_RESETTING      | UNVME_VF_ENABLED;
+	uint32_t csts;
+	enum unvme_state cur;
+
+	if (!u->ctrl.pci.bdf || !pci_is_vf(u->ctrl.pci.bdf)) {
+		errno = ENODEV;
+		return -1;
+	}
+
+	if (!(old & exit_state)) {
+		do {
+			cur = __unvmed_ctrl_get_state(u);
+		} while (!(cur & exit_state));
+	}
+
+	for (;;) {
+		csts = unvmed_read32(u, NVME_REG_CSTS);
+		if (csts == 0xffffffff) {
+			unvmed_log_err("%s: BAR0 inaccessible", unvmed_bdf(u));
+			errno = ENODEV;
+			return -1;
+		}
+		if (!NVME_CSTS_RDY(csts) || NVME_CSTS_CFS(csts))
+			break;
+		usleep(1000);  /* 1 ms — matches Python time.sleep(0.001) */
+	}
+
+	if (!__unvmed_ctrl_set_state(u, UNVME_VF_INVALIDATED) && errno != EALREADY)
+		return -1;
+
 	return 0;
 }
 
@@ -4636,24 +5672,6 @@ struct json_object *unvmed_to_json(struct unvme *u)
 		json_object_array_add(sq_array, sq_obj);
 	}
 	json_object_object_add(status, "sq", sq_array);
-
-	/* Virtual Completion Queues */
-	struct json_object *vcq_array = json_object_new_array();
-	for (int i = 0; i < nr_sqs; i++) {
-		struct unvme_sq *usq = usqs[i];
-		struct json_object *vcq_obj = json_object_new_object();
-
-		json_object_object_add(vcq_obj, "sqid",
-				       json_object_new_int(usq->id));
-		json_object_object_add(vcq_obj, "head",
-				       json_object_new_int(usq->vcq.head));
-		json_object_object_add(vcq_obj, "tail",
-				       json_object_new_int(usq->vcq.tail));
-		json_object_object_add(vcq_obj, "qsize",
-				       json_object_new_int(usq->vcq.qsize));
-		json_object_array_add(vcq_array, vcq_obj);
-	}
-	json_object_object_add(status, "vcq", vcq_array);
 
 	/* Completion Queues */
 	struct json_object *cq_array = json_object_new_array();
@@ -4771,4 +5789,75 @@ struct json_object *unvmed_to_json(struct unvme *u)
 	free(usqs);
 
 	return status;
+}
+
+int unvmed_init_irq(struct unvme *u, int vector, unsigned int flags)
+{
+	if (vector < 0 || vector >= u->nr_efds) {
+		unvmed_log_err("%s: invalid vector %d", unvmed_bdf(u), vector);
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (flags & ~UNVMED_IRQ_F_NO_REAPER) {
+		unvmed_log_err("%s: invalid irq flags %#x", unvmed_bdf(u), flags);
+		errno = EINVAL;
+		return -1;
+	}
+
+	return __unvmed_init_irq(u, vector, flags);
+}
+
+/*
+ * Both accessors below hand the eventfd, or what has accumulated in it, to
+ * the application.  They are only valid for a vector initialized with
+ * %UNVMED_IRQ_F_NO_REAPER: otherwise the reaper thread is the one consuming
+ * the eventfd and a second reader would steal its wakeups.
+ */
+static int unvmed_irq_app_driven(struct unvme *u, int vector)
+{
+	if (!unvmed_reaper_alive(u, vector)) {
+		unvmed_log_err("%s: vector=%d not initialized", unvmed_bdf(u), vector);
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!(u->reapers[vector].flags & UNVMED_IRQ_F_NO_REAPER)) {
+		unvmed_log_err("%s: vector=%d is owned by the reaper thread",
+				unvmed_bdf(u), vector);
+		errno = EBUSY;
+		return -1;
+	}
+
+	return 0;
+}
+
+int unvmed_irq_get_count(struct unvme *u, int vector, uint64_t *count)
+{
+	uint64_t val;
+
+	if (!count) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (unvmed_irq_app_driven(u, vector))
+		return -1;
+
+	if (eventfd_read(u->efds[vector], &val) < 0) {
+		if (errno != EAGAIN)
+			return -1;
+		val = 0;
+	}
+
+	*count = val;
+	return 0;
+}
+
+int unvmed_irq_efd(struct unvme *u, int vector)
+{
+	if (unvmed_irq_app_driven(u, vector))
+		return -1;
+
+	return u->efds[vector];
 }

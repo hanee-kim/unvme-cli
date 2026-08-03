@@ -66,6 +66,13 @@ static void __attribute__((constructor)) unvmed_cmds_init(void)
 extern __thread struct unvme_msg *__msg;
 __thread jmp_buf *__jump = NULL;
 
+static __thread struct unvme_vcq __vcq;
+
+struct unvme_vcq *unvmed_get_thread_vcq(void)
+{
+	return &__vcq;
+}
+
 /*
  * Overrided exit() function which should be called by the external apps.
  */
@@ -730,6 +737,12 @@ int unvme_create_adminq(int argc, char *argv[], struct unvme_msg *msg)
 
 	vector = arg_boolv(noint) ? -1 : 0;
 
+	if (vector >= 0 && unvmed_init_irq(u, vector, 0)) {
+		unvme_pr_err("failed to initialize irq for vector=%d\n", vector);
+		ret = errno;
+		goto out;
+	}
+
 	if (!arg_boolv(cqaddr)) {
 		if (__unvmed_mem_alloc(u, CQE_SIZE * arg_intv(cqsize), &acq,
 					arg_intv(pagesize))) {
@@ -1010,6 +1023,12 @@ int unvme_create_iocq(int argc, char *argv[], struct unvme_msg *msg)
 		goto usq;
 	}
 
+	if (arg_intv(vector) >= 0 && unvmed_init_irq(u, arg_intv(vector), 0)) {
+		unvme_pr_err("failed to initialize irq for vector=%d\n", arg_intv(vector));
+		ret = errno;
+		goto usq;
+	}
+
 	if (!arg_boolv(qaddr)) {
 		if (unvmed_mem_alloc(u, CQE_SIZE * arg_intv(qsize), &cq,
 					unvmed_pagesize(u))) {
@@ -1055,6 +1074,8 @@ int unvme_create_iocq(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -1168,6 +1189,8 @@ int unvme_delete_iocq(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -1338,6 +1361,8 @@ int unvme_create_iosq(int argc, char *argv[], struct unvme_msg *msg)
 		goto cmd;
 	}
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
 
@@ -1457,6 +1482,8 @@ int unvme_delete_iosq(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -1599,6 +1626,8 @@ int unvme_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 		goto usq;
 	}
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(nodb))
 		cmd->flags |= UNVMED_CMD_F_NODB;
 
@@ -1736,6 +1765,8 @@ int unvme_id_ctrl(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto usq;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(nodb))
 		cmd->flags |= UNVMED_CMD_F_NODB;
@@ -1887,6 +1918,8 @@ int unvme_id_active_nslist(int argc, char *argv[], struct unvme_msg *msg)
 		goto cmd;
 	}
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
 
@@ -2023,6 +2056,8 @@ int unvme_nvm_id_ns(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -2178,6 +2213,8 @@ int unvme_set_features(int argc, char *argv[], struct unvme_msg *msg)
 		goto cmd;
 	}
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
 
@@ -2285,6 +2322,8 @@ int unvme_set_features_noq(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -2395,6 +2434,8 @@ int unvme_set_features_hmb(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -2530,6 +2571,8 @@ int unvme_get_features(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -2768,6 +2811,8 @@ int unvme_read(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -3059,6 +3104,8 @@ int unvme_write(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -3370,6 +3417,8 @@ int unvme_passthru(int argc, char *argv[], struct unvme_msg *msg)
 	if (arg_boolv(prp2))
 		cmd->sqe.dptr.prp2 = cpu_to_le64((uint64_t)arg_dblv(prp2));
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
 
@@ -3552,6 +3601,8 @@ int unvme_format(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -3939,6 +3990,7 @@ int unvme_virt_mgmt(int argc, char *argv[], struct unvme_msg *msg)
 		goto cmd;
 	}
 
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -4052,6 +4104,8 @@ int unvme_id_primary_ctrl_caps(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -4170,6 +4224,8 @@ int unvme_id_secondary_ctrl_list(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -4513,6 +4569,8 @@ int unvme_create_ns(int argc, char *argv[], struct unvme_msg *msg)
 		goto cmd;
 	}
 
+	cmd->vcq = __vcq.qid;
+
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
 
@@ -4610,6 +4668,8 @@ int unvme_delete_ns(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -4727,6 +4787,8 @@ int unvme_attach_ns(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
@@ -4846,6 +4908,8 @@ int unvme_detach_ns(int argc, char *argv[], struct unvme_msg *msg)
 		ret = errno;
 		goto cmd;
 	}
+
+	cmd->vcq = __vcq.qid;
 
 	if (arg_boolv(verbose))
 		unvme_pr_sqe(&cmd->sqe);
