@@ -43,10 +43,21 @@ struct wmode_split_entry {
 	unsigned int	perc;
 };
 
+#define ADMIN_SPLIT_MAX	6
+
+struct admin_split_entry {
+	uint8_t		admin_cmd;
+	unsigned int	perc;
+};
+
 struct libunvmed_options {
 	struct thread_data *td;
 	unsigned int nsid;
 	unsigned int sqid;
+	unsigned int admin_cmd;
+	struct admin_split_entry admin_split[ADMIN_SPLIT_MAX];
+	unsigned int admin_split_nr;
+	unsigned int cntlid;
 	uint64_t prp1_offset;
 	unsigned int enable_sgl;
 	unsigned int dtype;
@@ -90,6 +101,27 @@ enum uring_cmd_write_mode {
 enum uring_cmd_verify_mode {
 	FIO_URING_CMD_VMODE_READ = 1,
 	FIO_URING_CMD_VMODE_COMPARE,
+};
+
+enum libunvmed_admin_cmd {
+	LIBUNVMED_ADMIN_ID_CTRL = 1,
+	LIBUNVMED_ADMIN_ID_NS,
+	LIBUNVMED_ADMIN_ID_NSLIST,
+	LIBUNVMED_ADMIN_ID_NVM_NS,
+	LIBUNVMED_ADMIN_ID_PRI_CTRL,
+	LIBUNVMED_ADMIN_ID_SEC_CTRL_LIST,
+	LIBUNVMED_ADMIN_GET_LOG_SMART,
+	LIBUNVMED_ADMIN_GET_LOG_ERROR,
+	LIBUNVMED_ADMIN_GET_LOG_FW_SLOT,
+	LIBUNVMED_ADMIN_GET_LOG_CMD_EFFECTS,
+	LIBUNVMED_ADMIN_GET_LOG_PERSISTENT_EVENT,
+	LIBUNVMED_ADMIN_GET_FEAT_ARBITRATION,
+	LIBUNVMED_ADMIN_GET_FEAT_POWER_MGMT,
+	LIBUNVMED_ADMIN_GET_FEAT_TEMP_THRESHOLD,
+	LIBUNVMED_ADMIN_GET_FEAT_NUM_QUEUES,
+	LIBUNVMED_ADMIN_GET_FEAT_VOLATILE_WC,
+	LIBUNVMED_ADMIN_GET_FEAT_TIMESTAMP,
+	LIBUNVMED_ADMIN_ABORT,
 };
 
 enum libunvmed_error_injections {
@@ -231,6 +263,154 @@ static int str_write_mode_cb(void *data, const char *str)
 	return 0;
 }
 
+static uint8_t admin_cmd_str_to_val(const char *mode)
+{
+	if (!strcmp(mode, "id_ctrl"))
+		return LIBUNVMED_ADMIN_ID_CTRL;
+	if (!strcmp(mode, "id_ns"))
+		return LIBUNVMED_ADMIN_ID_NS;
+	if (!strcmp(mode, "id_nslist"))
+		return LIBUNVMED_ADMIN_ID_NSLIST;
+	if (!strcmp(mode, "id_nvm_ns"))
+		return LIBUNVMED_ADMIN_ID_NVM_NS;
+	if (!strcmp(mode, "id_pri_ctrl"))
+		return LIBUNVMED_ADMIN_ID_PRI_CTRL;
+	if (!strcmp(mode, "id_sec_ctrl_list"))
+		return LIBUNVMED_ADMIN_ID_SEC_CTRL_LIST;
+	if (!strcmp(mode, "log_smart"))
+		return LIBUNVMED_ADMIN_GET_LOG_SMART;
+	if (!strcmp(mode, "log_error"))
+		return LIBUNVMED_ADMIN_GET_LOG_ERROR;
+	if (!strcmp(mode, "log_fw_slot"))
+		return LIBUNVMED_ADMIN_GET_LOG_FW_SLOT;
+	if (!strcmp(mode, "log_cmd_effects"))
+		return LIBUNVMED_ADMIN_GET_LOG_CMD_EFFECTS;
+	if (!strcmp(mode, "log_persistent_event"))
+		return LIBUNVMED_ADMIN_GET_LOG_PERSISTENT_EVENT;
+	if (!strcmp(mode, "feat_arbitration"))
+		return LIBUNVMED_ADMIN_GET_FEAT_ARBITRATION;
+	if (!strcmp(mode, "feat_power_mgmt"))
+		return LIBUNVMED_ADMIN_GET_FEAT_POWER_MGMT;
+	if (!strcmp(mode, "feat_temp_threshold"))
+		return LIBUNVMED_ADMIN_GET_FEAT_TEMP_THRESHOLD;
+	if (!strcmp(mode, "feat_num_queues"))
+		return LIBUNVMED_ADMIN_GET_FEAT_NUM_QUEUES;
+	if (!strcmp(mode, "feat_volatile_wc"))
+		return LIBUNVMED_ADMIN_GET_FEAT_VOLATILE_WC;
+	if (!strcmp(mode, "feat_timestamp"))
+		return LIBUNVMED_ADMIN_GET_FEAT_TIMESTAMP;
+	if (!strcmp(mode, "abort"))
+		return LIBUNVMED_ADMIN_ABORT;
+	return 0xff;
+}
+
+static int str_admin_cmd_cb(void *data, const char *str)
+{
+	struct libunvmed_options *o = data;
+	char *s, *p, *tok;
+	unsigned int total_perc = 0, perc_missing;
+	int i = 0, j;
+
+	/* Single-value: no ':' means single admin command name */
+	if (!strchr(str, ':')) {
+		uint8_t val = admin_cmd_str_to_val(str);
+
+		if (val == 0xff) {
+			libunvmed_log("invalid admin_cmd value: %s\n", str);
+			return 1;
+		}
+
+		o->admin_cmd = val;
+		o->admin_split_nr = 0;
+		return 0;
+	}
+
+	/* Multi-value: e.g., --admin_cmd=id_ctrl/60:id_ns/40 */
+	s = strdup(str);
+	p = s;
+	while ((tok = strsep(&p, ":")) != NULL) {
+		char *perc_str = strchr(tok, '/');
+		unsigned int perc;
+		uint8_t val;
+
+		if (i >= ADMIN_SPLIT_MAX) {
+			libunvmed_log("admin_cmd: too many entries (max %d)\n",
+				ADMIN_SPLIT_MAX);
+			free(s);
+			return 1;
+		}
+
+		if (!perc_str) {
+			libunvmed_log("admin_cmd: missing '/' in entry: %s\n", tok);
+			free(s);
+			return 1;
+		}
+
+		*perc_str++ = '\0';
+		val = admin_cmd_str_to_val(tok);
+		if (val == 0xff) {
+			libunvmed_log("invalid admin_cmd value: %s\n", tok);
+			free(s);
+			return 1;
+		}
+
+		if (*perc_str) {
+			int tmp = atoi(perc_str);
+
+			if (tmp < 0) {
+				libunvmed_log("admin_cmd: percentage must not be negative: %s\n",
+					perc_str);
+				free(s);
+				return 1;
+			}
+
+			perc = (unsigned int)tmp;
+			total_perc += perc;
+		} else {
+			/* blank percentage: fill in evenly later */
+			perc = -1U;
+		}
+
+		o->admin_split[i].admin_cmd = val;
+		o->admin_split[i].perc = perc;
+		i++;
+	}
+	free(s);
+
+	if (i < 2) {
+		libunvmed_log("admin_cmd split needs at least 2 entries\n");
+		return 1;
+	}
+
+	if (total_perc > 100) {
+		libunvmed_log("admin_cmd percentages exceed 100%%\n");
+		return 1;
+	}
+
+	perc_missing = 0;
+	for (j = 0; j < i; j++) {
+		if (o->admin_split[j].perc == -1U)
+			perc_missing++;
+	}
+
+	if (perc_missing) {
+		unsigned int fill = (100 - total_perc) / perc_missing;
+
+		for (j = 0; j < i; j++) {
+			if (o->admin_split[j].perc == -1U)
+				o->admin_split[j].perc = fill;
+		}
+	} else if (total_perc != 100) {
+		libunvmed_log("admin_cmd percentages should add up to 100%%\n");
+		return 1;
+	}
+
+	o->admin_split_nr = i;
+	/* Sentinel: keep o->admin_cmd non-zero so admin dispatch stays active */
+	o->admin_cmd = o->admin_split[0].admin_cmd;
+	return 0;
+}
+
 static int libunvmed_cb_meta_error_injection(void *data, const char *str)
 {
 	struct libunvmed_options *o = data;
@@ -267,6 +447,34 @@ static struct fio_option options[] = {
 		.def = "0",
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_INVALID,
+	},
+	{
+		.name	= "admin_cmd",
+		.lname	= "Send an Admin command instead of Read/Write",
+		.type	= FIO_OPT_STR,
+		.cb	= str_admin_cmd_cb,
+		.help	= "Single: id_ctrl|id_ns|id_nslist|id_nvm_ns|id_pri_ctrl|id_sec_ctrl_list"
+			  "|log_smart|log_error|log_fw_slot|log_cmd_effects|log_persistent_event"
+			  "|feat_arbitration|feat_power_mgmt|feat_temp_threshold|feat_num_queues"
+			  "|feat_volatile_wc|feat_timestamp|abort. "
+			  "Mixed: cmd/pct:cmd/pct:... (e.g. id_ctrl/60:id_ns/40). "
+			  "Blank pct evenly splits the remainder. "
+			  "(--nsid= is the target/starting nsid for id_ns|id_nslist|id_nvm_ns, "
+			  "--cntlid= is the target cntlid for id_pri_ctrl|id_sec_ctrl_list, "
+			  "log_* and feat_* use controller-scoped NSID_ALL, "
+			  "abort randomizes SQID/CID per I/O)",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_INVALID,
+	},
+	{
+		.name	= "cntlid",
+		.lname	= "Controller ID",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct libunvmed_options, cntlid),
+		.help	= "Controller Identifier used by --admin_cmd=id_pri_ctrl|id_sec_ctrl_list",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_INVALID,
 	},
 	{
 		.name = "prp1_offset",
@@ -561,6 +769,10 @@ struct libunvmed_data {
 	uint32_t cdw13_flags[DDIR_RWDIR_CNT];
 	uint8_t write_opcode;
 	struct frand_state wmode_state;
+	struct frand_state admin_state;
+	struct frand_state abort_state;
+	uint16_t abort_sqid_max;
+	uint16_t abort_cid_max;
 };
 
 struct nvme_16b_guard_dif {
@@ -778,6 +990,22 @@ static int libunvmed_check_constraints(struct thread_data *td)
 		return 1;
 	}
 
+	/*
+	 * Data-bearing admin commands (Identify, Get Log Page, Get Features)
+	 * reuse the 4 KiB I/O buffer, so bs must cover NVME_IDENTIFY_DATA_SIZE.
+	 * Abort carries no data buffer and is exempt from this guard.
+	 */
+	if (o->admin_cmd && o->admin_cmd != LIBUNVMED_ADMIN_ABORT) {
+		for_each_rw_ddir(ddir) {
+			if (td->o.max_bs[ddir] &&
+			    td->o.max_bs[ddir] < NVME_IDENTIFY_DATA_SIZE) {
+				libunvmed_log("'--admin_cmd=' requires bs >= %d bytes\n",
+						NVME_IDENTIFY_DATA_SIZE);
+				return 1;
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -936,6 +1164,14 @@ static int fio_libunvmed_init(struct thread_data *td)
 	g_total_threads++;
 
 	ld = td->io_ops_data;
+
+	if (o->admin_split_nr > 1)
+		init_rand_seed(&ld->admin_state, td->rand_seeds[FIO_RAND_WMODE_OFF],
+			       false);
+
+	if (o->admin_cmd == LIBUNVMED_ADMIN_ABORT)
+		init_rand_seed(&ld->abort_state, td->rand_seeds[FIO_RAND_WMODE_OFF],
+			       false);
 
 	if (td_write(td)) {
 		if (o->wmode_split_nr > 1) {
@@ -1235,7 +1471,9 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 		return ret;
 	}
 
-	if (!o->sqid)
+	if (o->admin_cmd)
+		o->sqid = 0;
+	else if (!o->sqid)
 		o->sqid = td->thread_number;
 
 	ld->usq = unvmed_sq_get(u, o->sqid);
@@ -1262,6 +1500,18 @@ static int fio_libunvmed_open_file(struct thread_data *td, struct fio_file *f)
 		ret = -1;
 		td_vmsg(td, EINVAL, "invalid iodepth", "fio_libunvmed_open_file");
 		goto out;
+	}
+
+	if (o->admin_cmd == LIBUNVMED_ADMIN_ABORT) {
+		/*
+		 * Randomize the SQID/CID to abort per I/O.  SQID is bounded by
+		 * the number of queues this job may have created (admin queue 0
+		 * plus per-thread I/O queues), and CID is bounded by the admin
+		 * queue depth.  Non-existent SQID/CID values intentionally
+		 * exercise the controller's Invalid Queue/Command ID error path.
+		 */
+		ld->abort_sqid_max = td->thread_number > 0 ? td->thread_number : 1;
+		ld->abort_cid_max = unvmed_sq_size(ld->usq) - 1;
 	}
 
 	/*
@@ -1931,6 +2181,127 @@ static enum fio_q_status fio_libunvmed_rw(struct thread_data *td,
 	return FIO_Q_QUEUED;
 }
 
+/*
+ * Issue an Identify Controller/Namespace admin command instead of a
+ * Read/Write NVM command.  Reuses the io_u's own data buffer (already
+ * IOMMU-mapped by libunvmed_map_mems()) and the admin queue (--sqid is
+ * forced to 0 for admin_cmd jobs in fio_libunvmed_open_file()), so it
+ * rides the same queue/commit/getevents/cleanup paths as normal I/O.
+ */
+static enum fio_q_status fio_libunvmed_admin(struct thread_data *td,
+					     struct io_u *io_u)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
+	struct unvme_cmd *cmd;
+	struct iovec iov;
+	uint16_t rand_sqid, rand_cid;
+	int ret;
+
+	/* Abort carries no data buffer; bypass the 4 KiB buffer allocation. */
+	if (o->admin_cmd == LIBUNVMED_ADMIN_ABORT) {
+		cmd = unvmed_alloc_cmd_nodata(ld->u, ld->usq, NULL);
+		if (!cmd)
+			return FIO_Q_BUSY;
+
+		rand_sqid = rand_between(&ld->abort_state, 0, ld->abort_sqid_max);
+		rand_cid = rand_between(&ld->abort_state, 0, ld->abort_cid_max);
+		ret = unvmed_cmd_prep_abort(cmd, rand_sqid, rand_cid);
+		if (ret < 0) {
+			unvmed_cmd_put(cmd);
+			return -errno;
+		}
+
+		cmd->opaque = io_u;
+		cmd->vcq = __vcq_qid;
+		unvmed_cmd_post(cmd, &cmd->sqe, UNVMED_CMD_F_NODB);
+		return FIO_Q_QUEUED;
+	}
+
+	iov = (struct iovec) {
+		.iov_base = io_u->xfer_buf,
+		.iov_len = NVME_IDENTIFY_DATA_SIZE,
+	};
+
+	cmd = unvmed_alloc_cmd(ld->u, ld->usq, NULL, io_u->xfer_buf,
+			       NVME_IDENTIFY_DATA_SIZE);
+	if (!cmd)
+		return FIO_Q_BUSY;
+
+	switch (o->admin_cmd) {
+	case LIBUNVMED_ADMIN_ID_NS:
+		ret = unvmed_cmd_prep_id_ns(cmd, o->nsid, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_ID_NSLIST:
+		ret = unvmed_cmd_prep_id_active_nslist(cmd, o->nsid, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_ID_NVM_NS:
+		ret = unvmed_cmd_prep_nvm_id_ns(cmd, o->nsid, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_ID_PRI_CTRL:
+		ret = unvmed_cmd_prep_id_primary_ctrl_caps(cmd, &iov, 1, o->cntlid);
+		break;
+	case LIBUNVMED_ADMIN_ID_SEC_CTRL_LIST:
+		ret = unvmed_cmd_prep_id_secondary_ctrl_list(cmd, &iov, 1, o->cntlid);
+		break;
+	case LIBUNVMED_ADMIN_GET_LOG_SMART:
+		ret = unvmed_cmd_prep_get_log_page(cmd, NVME_NSID_ALL,
+						   NVME_LOG_LID_SMART, 4096, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_LOG_ERROR:
+		ret = unvmed_cmd_prep_get_log_page(cmd, NVME_NSID_ALL,
+						   NVME_LOG_LID_ERROR, 4096, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_LOG_FW_SLOT:
+		ret = unvmed_cmd_prep_get_log_page(cmd, NVME_NSID_ALL,
+						   NVME_LOG_LID_FW_SLOT, 4096,
+						   &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_LOG_CMD_EFFECTS:
+		ret = unvmed_cmd_prep_get_log_page(cmd, NVME_NSID_ALL,
+						   NVME_LOG_LID_CMD_EFFECTS, 4096,
+						   &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_LOG_PERSISTENT_EVENT:
+		ret = unvmed_cmd_prep_get_log_page(cmd, NVME_NSID_ALL,
+						   NVME_LOG_LID_PERSISTENT_EVENT,
+						   4096, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_ARBITRATION:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x01, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_POWER_MGMT:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x02, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_TEMP_THRESHOLD:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x04, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_NUM_QUEUES:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x07, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_VOLATILE_WC:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x06, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_GET_FEAT_TIMESTAMP:
+		ret = unvmed_cmd_prep_get_features(cmd, 0, 0x0e, 0, 0, 0, &iov, 1);
+		break;
+	case LIBUNVMED_ADMIN_ID_CTRL:
+	default:
+		ret = unvmed_cmd_prep_id_ctrl(cmd, &iov, 1);
+		break;
+	}
+
+	if (ret < 0) {
+		unvmed_cmd_put(cmd);
+		return -errno;
+	}
+
+	cmd->opaque = io_u;
+	cmd->vcq = __vcq_qid;
+	unvmed_cmd_post(cmd, &cmd->sqe, UNVMED_CMD_F_NODB);
+	return FIO_Q_QUEUED;
+}
+
 static enum fio_q_status fio_libunvmed_trim(struct thread_data *td,
 					    struct io_u *io_u)
 {
@@ -2046,6 +2417,20 @@ static int fio_libunvmed_prep(struct thread_data *td, struct io_u *io_u)
 		}
 	}
 
+	if (o->admin_split_nr > 1) {
+		unsigned int rand = rand_between(&ld->admin_state, 0, 99);
+		unsigned int perc = 0;
+		int i;
+
+		for (i = 0; i < (int)o->admin_split_nr; i++) {
+			perc += o->admin_split[i].perc;
+			if (rand < perc) {
+				o->admin_cmd = o->admin_split[i].admin_cmd;
+				break;
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -2053,6 +2438,7 @@ static enum fio_q_status fio_libunvmed_queue(struct thread_data *td,
 					  struct io_u *io_u)
 {
 	struct libunvmed_data *ld = td->io_ops_data;
+	struct libunvmed_options *o = td->eo;
 	int ret;
 
 	if (ld->nr_queued == td->o.iodepth)
@@ -2071,7 +2457,10 @@ static enum fio_q_status fio_libunvmed_queue(struct thread_data *td,
 	switch (io_u->ddir) {
 	case DDIR_READ:
 	case DDIR_WRITE:
-		ret = fio_libunvmed_rw(td, io_u);
+		if (o->admin_cmd)
+			ret = fio_libunvmed_admin(td, io_u);
+		else
+			ret = fio_libunvmed_rw(td, io_u);
 		break;
 	case DDIR_TRIM:
 		ret = fio_libunvmed_trim(td, io_u);
@@ -2436,6 +2825,9 @@ static struct io_u *fio_libunvmed_event(struct thread_data *td, int event)
 	/*
 	 * Copy read data to the original buffer for verify phase
 	 */
+	if (o->admin_cmd)
+		goto ret;
+
 	if (o->prp1_offset && io_u->ddir == DDIR_READ)
 		memcpy(io_u->xfer_buf, cmd->buf.iov.iov_base, io_u->xfer_buflen);
 
