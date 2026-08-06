@@ -35,13 +35,6 @@
 static __thread struct unvme_vcq __vcq;
 static __thread uint32_t __vcq_qid;
 
-/*
- * How long fio_libunvmed_getevents() lets @usq->nr_cmds sit without any
- * progress after td->terminate before deciding the device stopped
- * responding and force-liquidating what's left.
- */
-#define UNVMED_STUCK_SECS	3
-
 #define WMODE_SPLIT_MAX	4
 
 struct wmode_split_entry {
@@ -2857,45 +2850,6 @@ ret:
 	return io_u;
 }
 
-/*
- * Force-free whatever's still outstanding on @usq without waiting for a
- * real (or synthetic-cancel) completion. A normal completion path relies
- * on the consumer (this engine's own getevents/event handling) to
- * unvmed_cmd_put() a command down to refcnt 0 once it's done with it; a
- * command still has its original refcnt=1 from allocation for as long as
- * that never happens. We're giving up as that consumer, so take the
- * scan ref and drop it plus the original owning ref to force nr_cmds
- * back to 0 -- unvmed_cmd_get() returns NULL for anything already freed,
- * so this can't double-free.
- */
-static void libunvmed_force_liquidate(struct libunvmed_data *ld,
-				      struct unvme_sq *usq)
-{
-	struct unvme_cmd *cmd;
-	int refcnt;
-	int cid;
-
-	if (!atomic_load_acquire(&usq->nr_cmds))
-		return;
-
-	for (cid = 0; cid < usq->qsize - 1; cid++) {
-		cmd = unvmed_cmd_get(usq, cid);
-		if (!cmd)
-			continue;
-
-		unvmed_cmd_put(cmd);
-
-		refcnt = unvmed_cmd_put(cmd);
-		if (refcnt)
-			log_err("libunvmed: sq%d cid%d: unexpected refcnt=%d "
-				"after forced liquidation, command not freed\n",
-				unvmed_sq_id(usq), cid, refcnt);
-		else
-			unvmed_log_err("fio: freed forcibly cmd (sqid=%d, cid=%d)",
-				       unvmed_sq_id(usq), cid);
-	}
-}
-
 static int fio_libunvmed_getevents(struct thread_data *td, unsigned int min,
 				unsigned int max, const struct timespec *t)
 {
@@ -2909,56 +2863,13 @@ static int fio_libunvmed_getevents(struct thread_data *td, unsigned int min,
 		return 0;
 
 	struct nvme_cqe *cqes = ld->cqes;
-	int nr = 0;
-	int n;
-	int last_nr_cmds = -1;
-	struct timespec last_progress;
+	int ret;
 
-	while (nr < (int)min) {
-		n = __unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq,
-				      cqes + nr, min - nr, true);
-		if (n < 0)
-			return -errno;
-		nr += n;
+	ret = unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq, cqes, min, max);
+	if (ret < 0)
+		return -errno;
 
-		if (td->terminate) {
-			int nr_cmds = atomic_load_acquire(&ld->usq->nr_cmds);
-
-			if (!nr_cmds)
-				return nr;
-
-			/*
-			 * Keep draining as long as @nr_cmds is actually
-			 * moving -- the device is still alive, just not done
-			 * yet. Only force-liquidate once it's sat still for
-			 * UNVMED_STUCK_SECS, which is our signal that it
-			 * stopped responding rather than just being busy.
-			 */
-			if (nr_cmds != last_nr_cmds) {
-				last_nr_cmds = nr_cmds;
-				fio_gettime(&last_progress, NULL);
-				log_err("libunvmed: sq%d: %d command(s) still in "
-					"flight, will force-terminate in %d "
-					"second(s) without further progress\n",
-					unvmed_sq_id(ld->usq), nr_cmds,
-					UNVMED_STUCK_SECS);
-			} else if (utime_since_now(&last_progress) >=
-				   UNVMED_STUCK_SECS * 1000000ULL) {
-				libunvmed_force_liquidate(ld, ld->usq);
-				return nr;
-			}
-		}
-	}
-
-	if (nr < (int)max) {
-		n = __unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq,
-				      cqes + nr, max - nr, true);
-		if (n < 0)
-			return -errno;
-		nr += n;
-	}
-
-	return nr;
+	return ret;
 }
 
 static int fio_libunvmed_get_file_size(struct thread_data *td, struct fio_file *f)
