@@ -805,12 +805,17 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 	r->vector = vector;
 	r->efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
 
+	r->running = false;
+	r->stop = 0;
+	pthread_mutex_init(&r->th_lock, NULL);
+
 	list_head_init(&r->cq_list);
 	pthread_mutex_init(&r->cq_list_lock, NULL);
 
 	if (r->efd < 0) {
 		unvmed_log_err("%s: failed to create a eventfd (vector=%d, errno=%d \"%s\")",
 				unvmed_bdf(u), vector, errno, strerror(errno));
+		pthread_mutex_destroy(&r->th_lock);
 		pthread_mutex_destroy(&r->cq_list_lock);
 		return -1;
 	}
@@ -823,6 +828,7 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 			unvmed_log_err("%s: check `ulimit -n` for open file limitation", unvmed_bdf(u));
 
 		close(r->efd);
+		pthread_mutex_destroy(&r->th_lock);
 		pthread_mutex_destroy(&r->cq_list_lock);
 		return -1;
 	}
@@ -838,6 +844,27 @@ static int unvmed_init_irq_reaper(struct unvme *u, int vector)
 	unvmed_log_debug("%s: vector=%d initialized (efd=%d, epoll_fd=%d)",
 			unvmed_bdf(u), vector, r->efd, r->epoll_fd);
 	return 0;
+}
+
+/*
+ * Wake the reaper thread out of its epoll wait and join it, exactly once.
+ * Safe to call from either the normal teardown path (unvmed_free_irq) or the
+ * async shutdown path (unvmed_stop_reapers): @th_lock serialises the two and
+ * @running ensures the pthread_t is joined only once.
+ */
+static void unvmed_reaper_join(struct unvme_cq_reaper *r)
+{
+	pthread_mutex_lock(&r->th_lock);
+	if (r->running) {
+		/*
+		 * Wake up the blocking thread waiting for interrupt events from
+		 * the device so it re-checks refcnt/state and exits.
+		 */
+		eventfd_write(r->efd, 1);
+		pthread_join(r->th, NULL);
+		r->running = false;
+	}
+	pthread_mutex_unlock(&r->th_lock);
 }
 
 static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
@@ -857,6 +884,7 @@ static void unvmed_free_irq_reaper(struct unvme_cq_reaper *r)
 	}
 	pthread_mutex_unlock(&r->cq_list_lock);
 	pthread_mutex_destroy(&r->cq_list_lock);
+	pthread_mutex_destroy(&r->th_lock);
 
 	epoll_ctl(r->epoll_fd, EPOLL_CTL_DEL, r->efd, &e);
 
@@ -939,12 +967,7 @@ static int unvmed_free_irq(struct unvme *u, int vector)
 	if (atomic_dec_fetch(&r->refcnt) > 0)
 		return 0;
 
-	/*
-	 * Wake up the blocking threads waiting for the interrupt
-	 * events from the device.
-	 */
-	eventfd_write(r->efd, 1);
-	pthread_join(r->th, NULL);
+	unvmed_reaper_join(r);
 
 	ret = vfio_disable_irq(&u->ctrl.pci.dev, vector, 1);
 	if (ret) {
@@ -994,7 +1017,16 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 		return -1;
 	}
 
-	pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r);
+	pthread_mutex_lock(&r->th_lock);
+	if (pthread_create(&r->th, NULL, unvmed_reaper_run, (void *)r)) {
+		pthread_mutex_unlock(&r->th_lock);
+		unvmed_log_err("%s: failed to create reaper thread (vector=%d)",
+				unvmed_bdf(u), vector);
+		unvmed_free_irq_reaper(r);
+		return -1;
+	}
+	r->running = true;
+	pthread_mutex_unlock(&r->th_lock);
 	return 0;
 }
 
@@ -1097,6 +1129,35 @@ static int unvmed_free_irqs(struct unvme *u)
 	u->efds = NULL;
 	u->nr_efds = 0;
 	return 0;
+}
+
+void unvmed_stop_reapers(struct unvme *u)
+{
+	int vector;
+
+	if (!u->reapers)
+		return;
+
+	/*
+	 * Flag every reaper to bail out, then wake and join each one.  This
+	 * deliberately leaves refcnt, controller state, IRQ registration and
+	 * the reaper array itself untouched: the normal teardown path
+	 * (unvmed_free_irqs, reached from unvmed_free_ctrl / reset) still owns
+	 * that accounting and runs later.  unvmed_reaper_join() is idempotent
+	 * against that later teardown via @th_lock / @running, so joining here
+	 * only makes the subsequent join a no-op.
+	 *
+	 * Intended caller: a SIGINT/SIGTERM handler that must stop the native
+	 * reaper threads before the Python layer frees the per-thread virtual
+	 * CQ buffers a reaper would otherwise keep writing completions into
+	 * (use-after-free).
+	 */
+	for (vector = 0; vector < u->nr_efds; vector++) {
+		struct unvme_cq_reaper *r = &u->reapers[vector];
+
+		atomic_store_release(&r->stop, 1);
+		unvmed_reaper_join(r);
+	}
 }
 
 int unvmed_cmb_init(struct unvme *u)
@@ -3067,6 +3128,9 @@ static void *unvmed_reaper_run(void *opaque)
 		struct unvme_reaper_cq_entry *entry;
 
 		if (unvmed_cq_wait_irq(u, vector))
+			goto out;
+
+		if (atomic_load_acquire(&r->stop))
 			goto out;
 
 		if (!atomic_load_acquire(&r->refcnt))

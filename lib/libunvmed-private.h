@@ -220,6 +220,27 @@ struct unvme_cq_reaper {
 	int efd;
 	pthread_t th;
 
+	/*
+	 * Guards the pthread_join() of @th.  Both the normal teardown path
+	 * (unvmed_free_irq) and the async shutdown path (unvmed_stop_reapers,
+	 * driven from a SIGINT/SIGTERM handler) may try to join the reaper.
+	 * @running is set true under @th_lock right after the thread is
+	 * created and cleared once it has been joined, so whichever path runs
+	 * second sees running == false and skips the join instead of joining
+	 * an already-reaped pthread_t (undefined behaviour).
+	 */
+	bool running;
+	pthread_mutex_t th_lock;
+
+	/*
+	 * Async shutdown request (unvmed_stop_reapers).  Checked by the reaper
+	 * loop so it exits without touching controller state or refcnt, which
+	 * the later normal teardown (unvmed_free_irqs) still owns.  Distinct
+	 * from refcnt/state precisely so an early stop does not perturb the
+	 * accounting that teardown relies on.
+	 */
+	int stop;
+
 	struct list_head cq_list;
 	pthread_mutex_t cq_list_lock;
 };

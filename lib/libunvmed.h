@@ -1179,6 +1179,22 @@ uint32_t unvmed_get_epoch(struct unvme *u);
 int unvmed_nr_irqs(struct unvme *u);
 
 /**
+ * unvmed_stop_reapers - Stop all IRQ reaper threads of @u
+ * @u: &struct unvme
+ *
+ * Wake every IRQ reaper thread out of its blocking wait and join it, without
+ * disturbing the controller state, IRQ refcounts or the reaper array.  Safe to
+ * call concurrently with (and before) the normal teardown path
+ * (unvmed_free_ctrl / unvmed_reset_ctrl); the later teardown re-joins
+ * idempotently, so this only makes it a no-op.
+ *
+ * Intended for a SIGINT/SIGTERM handler that must guarantee no reaper thread is
+ * still posting completions into per-thread virtual CQ buffers before the
+ * application frees them.  Idempotent and safe to call multiple times.
+ */
+void unvmed_stop_reapers(struct unvme *u);
+
+/**
  * unvmed_get_sqs - Get created SQ list
  * @u: &struct unvme
  * @sqs: submission queue instance list
