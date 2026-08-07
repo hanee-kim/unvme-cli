@@ -765,6 +765,15 @@ struct libunvmed_data {
 	unsigned int nr_queued;
 	struct nvme_cqe *cqes;
 
+	/*
+	 * Set by fio_libunvmed_terminate() (fio's .terminate ioengine
+	 * callback, invoked on a real Ctrl-C/kill abort) so
+	 * fio_libunvmed_getevents() can stop waiting for @min completions
+	 * right away instead of blocking on a device that may never
+	 * respond again.
+	 */
+	bool terminate;
+
 	uint32_t cdw12_flags[DDIR_RWDIR_CNT];
 	uint32_t cdw13_flags[DDIR_RWDIR_CNT];
 	uint8_t write_opcode;
@@ -2850,6 +2859,22 @@ ret:
 	return io_u;
 }
 
+/*
+ * fio's .terminate ioengine callback: invoked from fio_terminate_threads()
+ * right after td->terminate is set, but only for a real abort (Ctrl-C /
+ * kill), never for an ordinary runtime/size-based end. Mark @ld so
+ * fio_libunvmed_getevents() can stop waiting on a device that may never
+ * complete its outstanding commands again, instead of blocking until @min
+ * completions arrive.
+ */
+static void fio_libunvmed_terminate(struct thread_data *td)
+{
+	struct libunvmed_data *ld = td->io_ops_data;
+
+	if (ld)
+		STORE(ld->terminate, true);
+}
+
 static int fio_libunvmed_getevents(struct thread_data *td, unsigned int min,
 				unsigned int max, const struct timespec *t)
 {
@@ -2863,13 +2888,41 @@ static int fio_libunvmed_getevents(struct thread_data *td, unsigned int min,
 		return 0;
 
 	struct nvme_cqe *cqes = ld->cqes;
-	int ret;
+	int nr = 0;
+	int n;
 
-	ret = unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq, cqes, min, max);
-	if (ret < 0)
-		return -errno;
+	while (nr < (int)min) {
+		n = __unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq,
+				      cqes + nr, min - nr, true);
+		if (n < 0)
+			return -errno;
+		nr += n;
 
-	return ret;
+		if (LOAD(ld->terminate)) {
+			/*
+			 * One last non-blocking pass to pick up anything
+			 * that landed right as the signal came in, then
+			 * return immediately instead of waiting for @min.
+			 */
+			n = __unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq,
+					      cqes + nr, min - nr, true);
+			if (n < 0)
+				return -errno;
+			nr += n;
+
+			return nr;
+		}
+	}
+
+	if (nr < (int)max) {
+		n = __unvmed_cq_run_n(ld->u, ld->usq, ld->ucq, &__vcq,
+				      cqes + nr, max - nr, true);
+		if (n < 0)
+			return -errno;
+		nr += n;
+	}
+
+	return nr;
 }
 
 static int fio_libunvmed_get_file_size(struct thread_data *td, struct fio_file *f)
@@ -2946,6 +2999,7 @@ static struct ioengine_ops ioengine_libunvmed_cmd = {
 	.event = fio_libunvmed_event,
 	.getevents = fio_libunvmed_getevents,
 	.errdetails = fio_libunvmed_errdetails,
+	.terminate = fio_libunvmed_terminate,
 };
 
 static void fio_init fio_libunvmed_register(void)
