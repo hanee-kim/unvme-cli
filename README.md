@@ -4,6 +4,15 @@
 kernel NVMe driver on the user-space.  It also provides I/O benchmarking test
 by `fio` with `libunvmed` ioengine which is bundled within this program.
 
+## Components
+This repository builds two logically separate projects together:
+- **`unvme-cli`** (`src/`) — the `unvme` CLI and `unvmed` daemon that drive an
+  NVMe controller from user-space.
+- **`libunvmed`** (`lib/`) — a standalone user-space NVMe driver library.  It
+  builds as its own shared object (`libunvmed.so`, with a pkg-config file).
+  Application developers are recommended to link against `libunvmed` alone
+  to build their own testing apps, rather than depending on `unvme-cli`.
+
 ## Why unvme-cli?
 - Users can setup user-defined configurations (e.g., IO queues) without kernel driver intervention
 - Users can run *fio* with various testing features based on the
