@@ -1362,8 +1362,10 @@ static int fio_libunvmed_io_u_init(struct thread_data *td, struct io_u *io_u)
 	io_u->engine_data = mo;
 
 	if (td->o.td_ddir == TD_DDIR_TRIM || td->o.td_ddir == TD_DDIR_RANDTRIM) {
-		io_u->buflen = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES * io_u->index;
-		io_u->buf = ld->trim_iomem + io_u->buflen;
+		size_t per_io_size = sizeof(struct nvme_dsm_range) * NVME_DSM_MAX_RANGES;
+		io_u->buf = ld->trim_iomem + per_io_size * io_u->index;
+		io_u->buflen = per_io_size;
+		io_u->xfer_buf = io_u->buf;
 	}
 
 	return 0;
@@ -1723,12 +1725,13 @@ static enum fio_q_status fio_libunvmed_trim(struct thread_data *td,
 		sqe.cdw10 = io_u->number_trim - 1;
 
 		r = malloc(sizeof(struct trim_range) * io_u->number_trim);
-		memcpy(r , buf, sizeof(struct trim_range) * io_u->number_trim);
+		memcpy(r, buf, sizeof(struct trim_range) * io_u->number_trim);
 		for (int i = 0; i < io_u->number_trim; i++) {
 			range[i].cattr = 0;
 			range[i].nlb = cpu_to_le32(libunvmed_get_nlba(ns, r[i].len) + 1);
 			range[i].slba = cpu_to_le64(libunvmed_get_slba(ns, r[i].start));
 		}
+		free(r);
 	}
 
 	if (__unvmed_mapv_prp(cmd, (union nvme_cmd *)&sqe, &cmd->buf.iov, 1)) {
