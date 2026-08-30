@@ -4,6 +4,7 @@
 #endif
 
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include "libunvmed-private.h"
 #include "unvme.h"
 #include "unvmed.h"
+#include "unvmed-ublk.h"
 
 #include <argtable3.h>
 
@@ -4879,4 +4881,106 @@ out:
 		unvmed_put(u);
 	unvme_free_args(argtable);
 	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* ublk-server command                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Thread-local flag: set by signal handler to break the blocking wait.
+ * Each daemon job thread has its own copy.
+ */
+static __thread volatile sig_atomic_t __ublk_stop_requested;
+
+static void __ublk_server_sig(int sig __attribute__((unused)))
+{
+	__ublk_stop_requested = 1;
+}
+
+int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
+{
+	const char *desc =
+		"Expose a NVMe namespace as a ublk block device (/dev/ublkbN).\n"
+		"Multiple independent fio (or other) processes can then perform\n"
+		"I/O on /dev/ublkbN concurrently.  The command blocks until\n"
+		"interrupted (Ctrl-C or 'unvme stop').";
+
+	struct arg_rex *dev      = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN,
+					    "<device>", 0, "[M] Device BDF");
+	struct arg_int *nsid     = arg_int0("n", "nsid", "<n>",
+					    "[O] Namespace ID (default: 1)");
+	struct arg_int *nqueues  = arg_int0("q", "nr-queues", "<n>",
+					    "[O] Number of ublk queues (default: 4)");
+	struct arg_int *qdepth   = arg_int0("d", "queue-depth", "<n>",
+					    "[O] Queue depth (default: 64)");
+	struct arg_int *spin_us  = arg_int0(NULL, "poll-spin-us", "<n>",
+					    "[O] NVMe CQ spin time in us before yield (default: 10)");
+	struct arg_lit *help     = arg_lit0("h", "help", "Show help message");
+	struct arg_end *end      = arg_end(UNVME_ARG_MAX_ERROR);
+
+	void *argtable[] = { dev, nsid, nqueues, qdepth, spin_us, help, end };
+
+	/* Argument defaults */
+	arg_intv(nsid)    = 1;
+	arg_intv(nqueues) = UNVMED_UBLK_DEF_NR_QUEUES;
+	arg_intv(qdepth)  = UNVMED_UBLK_DEF_DEPTH;
+	arg_intv(spin_us) = UNVMED_UBLK_DEF_POLL_US;
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	struct unvme *u = unvmed_get(arg_strv(dev));
+	if (!u) {
+		unvme_pr_err("%s is not added to unvmed\n", arg_strv(dev));
+		unvme_free_args(argtable);
+		return ENODEV;
+	}
+
+	if (arg_intv(nqueues) < 1 ||
+	    arg_intv(nqueues) > UNVMED_UBLK_MAX_QUEUES ||
+	    arg_intv(qdepth) < 1 || arg_intv(nsid) < 1) {
+		unvme_pr_err("invalid ublk-server arguments\n");
+		unvme_free_args(argtable);
+		return EINVAL;
+	}
+
+	struct unvmed_ublk_server *server =
+		unvmed_ublk_server_start(u,
+					 (uint32_t)arg_intv(nsid),
+					 (uint32_t)arg_intv(nqueues),
+					 (uint32_t)arg_intv(qdepth),
+					 (uint32_t)arg_intv(spin_us));
+	if (!server) {
+		unvme_pr_err("failed to start ublk server: %s\n",
+			     strerror(errno));
+		unvme_free_args(argtable);
+		return errno ? errno : EIO;
+	}
+
+	unvme_pr("ublk server running on /dev/ublkb%d\n", server->dev_id);
+	unvme_flush_stdio();
+
+	/*
+	 * Install a per-thread signal handler so that SIGINT/SIGTERM
+	 * delivered via pthread_kill() breaks the pause() loop cleanly
+	 * without killing the whole daemon process.
+	 */
+	__ublk_stop_requested = 0;
+	struct sigaction sa_new = { .sa_handler = __ublk_server_sig };
+	struct sigaction sa_old_int, sa_old_term;
+	sigemptyset(&sa_new.sa_mask);
+	sigaction(SIGINT,  &sa_new, &sa_old_int);
+	sigaction(SIGTERM, &sa_new, &sa_old_term);
+
+	/* Block until signalled or any queue handler exits unexpectedly */
+	while (!__ublk_stop_requested && server->running)
+		pause();
+
+	sigaction(SIGINT,  &sa_old_int,  NULL);
+	sigaction(SIGTERM, &sa_old_term, NULL);
+
+	unvmed_ublk_server_stop(server);
+
+	unvme_free_args(argtable);
+	return 0;
 }
