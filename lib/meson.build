@@ -1,13 +1,30 @@
 libunvmed_inc = include_directories('.')
+
+# ublk server support requires Linux UAPI kernel headers.
+# Install them with:
+#   Ubuntu/Debian : apt install linux-libc-dev
+#   RHEL/Fedora   : dnf install kernel-headers
+c = meson.get_compiler('c')
+foreach hdr : ['linux/ublk_cmd.h', 'linux/io_uring.h']
+  if not c.has_header(hdr)
+    error('Missing kernel UAPI header: ' + hdr + '\n' +
+          'Install kernel headers:\n' +
+          '  Ubuntu/Debian : apt install linux-libc-dev\n' +
+          '  RHEL/Fedora   : dnf install kernel-headers')
+  endif
+endforeach
+
 libunvmed_src = [
   'libunvmed.c',
   'libunvmed-vcq.c',
   'libunvmed-cmds.c',
   'libunvmed-logs.c',
+  'libunvmed-ublk.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',
   'libunvmed-logs.h',
+  'libunvmed-ublk.h',
 ]
 
 ver = '1.0.0'

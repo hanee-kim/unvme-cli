@@ -89,6 +89,8 @@ static struct command cmds[] = {
 #ifdef UNVME_FIO
 	{"fio",			"Run fio built as shared object",			UNVME_APP_CMD | UNVME_DAEMON_CMD | UNVME_NODEV_CMD,	unvme_fio},
 #endif
+	{"ublk-add",		"Start ublk server, expose /dev/ublkb<N>",		UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_ublk_add},
+	{"ublk-del",		"Stop ublk server and remove /dev/ublkb<N>",		UNVME_DRIVER_CMD | UNVME_DAEMON_CMD | UNVME_DEV_CMD,	unvme_ublk_del},
 	UNVME_CMDS_END
 };
 

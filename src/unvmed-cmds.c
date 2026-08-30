@@ -26,6 +26,7 @@
 
 #include "libunvmed.h"
 #include "libunvmed-private.h"
+#include "libunvmed-ublk.h"
 #include "unvme.h"
 #include "unvmed.h"
 
@@ -4877,6 +4878,169 @@ buf:
 out:
 	if (u)
 		unvmed_put(u);
+	unvme_free_args(argtable);
+	return ret;
+}
+
+/* =========================================================================
+ * ublk commands — expose NVMe namespaces as Linux block devices via ublk
+ *
+ * State tracking: active ublk devices are kept in a process-global linked
+ * list so that ublk-del can look up the handle returned by unvmed_ublk_start.
+ * ========================================================================= */
+
+struct __ublk_entry {
+	char                   bdf[UNVME_BDF_STRLEN];
+	int                    dev_id;
+	struct unvme_ublk_dev *ublk;
+	struct list_node       list;
+};
+
+static LIST_HEAD(__ublk_devs);
+static pthread_mutex_t __ublk_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct __ublk_entry *__ublk_find(const char *bdf, int dev_id)
+{
+	struct __ublk_entry *e;
+	list_for_each(&__ublk_devs, e, list) {
+		if (streq(e->bdf, bdf) && e->dev_id == dev_id)
+			return e;
+	}
+	return NULL;
+}
+
+int unvme_ublk_add(int argc, char *argv[], struct unvme_msg *msg)
+{
+	struct unvme          *u;
+	struct unvme_ublk_dev *ublk;
+	struct __ublk_entry   *entry;
+
+	struct arg_rex *dev;
+	struct arg_int *nsid;
+	struct arg_int *dev_id;
+	struct arg_int *nr_queues;
+	struct arg_int *queue_depth;
+	struct arg_int *base_sqid;
+	struct arg_lit *help;
+	struct arg_end *end;
+
+	const char *desc =
+		"Start a ublk block-device server backed by an NVMe namespace.\n"
+		"On success /dev/ublkb<dev-id> appears and any number of fio\n"
+		"(or other) processes can issue I/O to it directly.";
+
+	void *argtable[] = {
+		dev         = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN, "<device>", 0,
+				       "[M] NVMe controller BDF (e.g. 0000:01:00.0)"),
+		nsid        = arg_int1("n", "nsid",        "<n>", "[M] NVMe namespace ID"),
+		dev_id      = arg_int1("i", "dev-id",      "<n>", "[M] ublk device number (produces /dev/ublkb<n>)"),
+		nr_queues   = arg_int0("q", "queues",      "<n>", "[O] Number of queue pairs / worker threads (default: 1)"),
+		queue_depth = arg_int0("d", "queue-depth", "<n>", "[O] Max in-flight I/Os per queue (default: 64)"),
+		base_sqid   = arg_int0("s", "base-sqid",  "<n>", "[O] First NVMe I/O queue ID to allocate (default: 1)"),
+		help        = arg_lit0("h", "help", "Show help message"),
+		end         = arg_end(UNVME_ARG_MAX_ERROR),
+	};
+	int ret = 0;
+
+	arg_intv(nr_queues)   = 1;
+	arg_intv(queue_depth) = 64;
+	arg_intv(base_sqid)   = 1;
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	u = unvmed_get(arg_strv(dev));
+	if (!u) {
+		unvme_pr_err("%s is not added to unvmed\n", arg_strv(dev));
+		ret = ENODEV;
+		goto out;
+	}
+
+	pthread_mutex_lock(&__ublk_mutex);
+	if (__ublk_find(arg_strv(dev), arg_intv(dev_id))) {
+		pthread_mutex_unlock(&__ublk_mutex);
+		unvme_pr_err("ublk device %d for %s already running\n",
+			     arg_intv(dev_id), arg_strv(dev));
+		ret = EEXIST;
+		goto out;
+	}
+	pthread_mutex_unlock(&__ublk_mutex);
+
+	ublk = unvmed_ublk_start(u,
+				  (uint32_t)arg_intv(nsid),
+				  arg_intv(dev_id),
+				  arg_intv(nr_queues),
+				  arg_intv(queue_depth),
+				  arg_intv(base_sqid));
+	if (!ublk) {
+		unvme_pr_err("failed to start ublk device %d\n", arg_intv(dev_id));
+		ret = EIO;
+		goto out;
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		unvmed_ublk_stop(ublk);
+		ret = ENOMEM;
+		goto out;
+	}
+	strncpy(entry->bdf, arg_strv(dev), sizeof(entry->bdf) - 1);
+	entry->dev_id = arg_intv(dev_id);
+	entry->ublk   = ublk;
+
+	pthread_mutex_lock(&__ublk_mutex);
+	list_add_tail(&__ublk_devs, &entry->list);
+	pthread_mutex_unlock(&__ublk_mutex);
+
+	unvme_pr("/dev/ublkb%d is ready\n", arg_intv(dev_id));
+
+out:
+	unvme_free_args(argtable);
+	return ret;
+}
+
+int unvme_ublk_del(int argc, char *argv[], struct unvme_msg *msg)
+{
+	struct __ublk_entry *entry;
+
+	struct arg_rex *dev;
+	struct arg_int *dev_id;
+	struct arg_lit *help;
+	struct arg_end *end;
+
+	const char *desc =
+		"Stop the ublk block-device server for /dev/ublkb<dev-id>.\n"
+		"Waits for in-flight I/O to drain, destroys the block device,\n"
+		"and releases all associated NVMe queues and DMA buffers.";
+
+	void *argtable[] = {
+		dev    = arg_rex1(NULL, NULL, UNVME_BDF_PATTERN, "<device>", 0,
+				  "[M] NVMe controller BDF"),
+		dev_id = arg_int1("i", "dev-id", "<n>", "[M] ublk device number to stop"),
+		help   = arg_lit0("h", "help", "Show help message"),
+		end    = arg_end(UNVME_ARG_MAX_ERROR),
+	};
+	int ret = 0;
+
+	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
+
+	pthread_mutex_lock(&__ublk_mutex);
+	entry = __ublk_find(arg_strv(dev), arg_intv(dev_id));
+	if (!entry) {
+		pthread_mutex_unlock(&__ublk_mutex);
+		unvme_pr_err("ublk device %d for %s not found\n",
+			     arg_intv(dev_id), arg_strv(dev));
+		ret = ENODEV;
+		goto out;
+	}
+	list_del(&entry->list);
+	pthread_mutex_unlock(&__ublk_mutex);
+
+	unvmed_ublk_stop(entry->ublk);
+	free(entry);
+
+	unvme_pr("/dev/ublkb%d stopped\n", arg_intv(dev_id));
+
+out:
 	unvme_free_args(argtable);
 	return ret;
 }
