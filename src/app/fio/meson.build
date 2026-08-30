@@ -11,7 +11,7 @@ fio_src = [
 fio_lib = static_library(
   'unvmed',
   [fio_src],
-  dependencies: [vfn_lib, nvme_lib, unvmed_dep],
+  dependencies: [vfn_lib, nvme_lib, jsonc_lib, unvmed_dep],
   include_directories: fio_inc,
 )
 
