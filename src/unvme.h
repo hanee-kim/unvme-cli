@@ -243,6 +243,8 @@ int unvme_flr(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_hot_reset(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_link_disable(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_fio(int argc, char *argv[], struct unvme_msg *msg);
+int unvme_ublk_start(int argc, char *argv[], struct unvme_msg *msg);
+int unvme_ublk_stop(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_create_ns(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_delete_ns(int argc, char *argv[], struct unvme_msg *msg);
 int unvme_attach_ns(int argc, char *argv[], struct unvme_msg *msg);

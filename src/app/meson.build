@@ -13,3 +13,7 @@ if fio != ''
     error('"' + fio + '" does not exist.')
   endif
 endif
+
+if get_option('with-ublk')
+  subdir('ublk')
+endif
