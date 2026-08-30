@@ -202,6 +202,11 @@ static struct unvme_cmd *__unvmed_cmd_alloc(struct unvme *u,
 	struct nvme_rq *rq;
 	uint16_t __cid;
 
+	if (usq->flags & UNVMED_SQ_F_UBLK_OWNED) {
+		errno = EBUSY;
+		return NULL;
+	}
+
 	if (cid) {
 		__cid = *cid;
 

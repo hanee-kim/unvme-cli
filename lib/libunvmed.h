@@ -287,6 +287,8 @@ unvme_declare_sq(unvme_sq);
 enum unvme_sq_flags {
 	/* SQ is frozen due to command timeout */
 	UNVMED_SQ_F_FROZEN	= 1 << 0,
+	/* SQ is owned by a ublk server; direct I/O commands are rejected */
+	UNVMED_SQ_F_UBLK_OWNED	= 1 << 1,
 };
 
 enum unvme_cmd_state {
@@ -479,7 +481,8 @@ static inline bool unvmed_sq_ready(struct unvme_sq *usq)
 {
 	if (!usq)
 		return false;
-	if (!usq->enabled || usq->flags & UNVMED_SQ_F_FROZEN)
+	if (!usq->enabled || usq->flags & UNVMED_SQ_F_FROZEN ||
+	    usq->flags & UNVMED_SQ_F_UBLK_OWNED)
 		return false;
 	return true;
 }
@@ -1771,6 +1774,23 @@ int unvmed_cq_run(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq, s
  */
 int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
 		    struct unvme_vcq *vcq, struct nvme_cqe *cqes, int min, int max);
+
+/**
+ * unvmed_cq_run_n_multi - Reap CQ entries when multiple SQs share one CQ.
+ * @u: &struct unvme
+ * @ucq: completion queue to poll (shared by multiple SQs)
+ * @cqes: output array for raw completion queue entries
+ * @max: maximum number of entries to reap
+ *
+ * Reads raw CQEs directly from the hardware CQ, resolves the owning SQ per
+ * entry via cqe->sqid, and marks each command COMPLETED without going through
+ * the per-SQ VCQ pipeline.  The caller must release each command via
+ * unvmed_cmd_put() after inspecting the returned CQEs.
+ *
+ * Return: Number of CQEs reaped.
+ */
+int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
+			   struct nvme_cqe *cqes, int max);
 
 /**
  * unvmed_sq_update_tail - Update tail pointer of the given submission queue.
