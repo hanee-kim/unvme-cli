@@ -55,7 +55,7 @@ else
   vfn_lib = dependency('libvfn', version: '>=5.1.0', static: static)
 endif
 
-nvme_lib = dependency('libnvme', version: '>=1.8.0', static: static)
+nvme_lib = dependency('libnvme', version: '>=1.8', static: static)
 jsonc_lib = dependency('json-c', version: '>=0.15', static: static)
 
 subdir('ccan')
