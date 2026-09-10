@@ -3,6 +3,7 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dirent.h>
@@ -223,14 +224,14 @@ int unvme_log_level(int argc, char *argv[], struct unvme_msg *msg)
 	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
 
 	if (arg_boolv(level)) {
-		int prev = __log_level;
+		int prev = atomic_load_explicit(&__log_level, memory_order_relaxed);
 		unvmed_log_set_level(arg_intv(level));
 		unvme_pr("Log level changed to %s (prev: %s)\n",
-			 loglv_to_str(__log_level),
+			 loglv_to_str(atomic_load_explicit(&__log_level, memory_order_relaxed)),
 			 loglv_to_str(prev));
 	} else {
 		unvme_pr("Current log level: %s\n",
-			 loglv_to_str(__log_level));
+			 loglv_to_str(atomic_load_explicit(&__log_level, memory_order_relaxed)));
 	}
 
 	unvme_free_args(argtable);

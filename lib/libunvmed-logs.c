@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -27,7 +28,7 @@ DEFINE_STATIC_KEY_FALSE(unvmed_log_key_debug);
  */
 void unvmed_log_set_level(int level)
 {
-	__log_level = level;
+	atomic_store_explicit(&__log_level, level, memory_order_relaxed);
 
 	if (level >= UNVME_LOG_INFO)
 		unvmed_static_key_enable(&unvmed_log_key_info);
@@ -40,19 +41,30 @@ void unvmed_log_set_level(int level)
 		unvmed_static_key_disable(&unvmed_log_key_debug);
 }
 
-static void unvme_datetime(char *datetime)
+static void unvme_datetime(char *datetime, size_t sz)
 {
 	struct timeval tv;
-	struct tm *tm;
-	char usec[16];
+	struct tm tmv;
+	size_t n;
 
 	gettimeofday(&tv, NULL);
-	tm = localtime(&tv.tv_sec);
 
-	strftime(datetime, 32, "%Y-%m-%d %H:%M:%S", tm);
+	/* localtime_r is thread-safe (unlike localtime). */
+	if (!localtime_r(&tv.tv_sec, &tmv)) {
+		/* Fallback: use epoch seconds on localtime_r failure. */
+		snprintf(datetime, sz, "%ld.??????", (long)tv.tv_sec);
+		return;
+	}
 
-	sprintf(usec, ".%06ld", tv.tv_usec);
-	strcat(datetime, usec);
+	n = strftime(datetime, sz, "%Y-%m-%d %H:%M:%S", &tmv);
+	if (!n) {
+		/* strftime buffer too small or locale issue. */
+		snprintf(datetime, sz, "????-??-?? ??:??:??");
+		return;
+	}
+
+	/* Append microseconds — guaranteed to fit (sz >= 32, n <= 19). */
+	snprintf(datetime + n, sz - n, ".%06ld", (long)tv.tv_usec);
 }
 
 /*
@@ -72,29 +84,44 @@ void __unvmed_log_write(int lv, const char *func, int line,
 	char     datetime[32];
 	char     msg[UNVMED_LOG_MSG_SIZE];
 	va_list  va;
-	int      n;
+	int      n, m;
 
-	unvme_datetime(datetime);
+	/* Bounds-check lv to avoid OOB access on lvstr. */
+	if ((unsigned)lv > UNVME_LOG_LAST)
+		lv = UNVME_LOG_ERR;
+
+	unvme_datetime(datetime, sizeof(datetime));
 
 	n = snprintf(msg, sizeof(msg), "%s| %s | %s: %d: ",
 		     lvstr[lv], datetime, func, line);
+	/* Guard against snprintf truncation before appending the body. */
+	if (n < 0)
+		n = 0;
+	if (n >= (int)sizeof(msg) - 1)
+		n = (int)sizeof(msg) - 2;
 
 	va_start(va, fmt);
-	n += vsnprintf(msg + n, sizeof(msg) - n, fmt, va);
+	m = vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, va);
 	va_end(va);
 
+	if (m > 0)
+		n += (m < (int)(sizeof(msg) - (size_t)n)) ? m
+						: (int)(sizeof(msg) - (size_t)n) - 1;
+
+	/* Append newline, ensuring it always fits. */
 	if (n < (int)sizeof(msg) - 1) {
 		msg[n++] = '\n';
 	} else {
-		/* Message was truncated — overwrite the last byte with '\n' */
-		n = sizeof(msg) - 1;
+		n = (int)sizeof(msg) - 1;
 		msg[n - 1] = '\n';
 	}
 
 	unvmed_log_ring_push(&__log_ring, msg, (uint32_t)n);
 }
 
-__thread char __buf[256];
+/* Per-thread scratch buffer for command-description helpers.
+ * 'static' prevents it from being exported from the DSO. */
+static __thread char __buf[256];
 #define LOG_MAX_LEN sizeof(__buf)
 
 static const char *unvmed_log_delete_sq(union nvme_cmd *sqe)
@@ -221,10 +248,17 @@ void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 {
 	bool admin = (!sqid) ? true : false;
 	int psdt = (sqe->flags >> 6) & 0x3;
-	char * psdt_type;
+	const char *psdt_type;
 	uint64_t dptr0 = 0;
 	uint64_t dptr1 = 0;
 	const char *str;
+
+	/* Guard the whole function: formatting is wasted work when debug
+	 * logging is disabled. */
+#ifndef UNVME_DEBUG
+	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
+		return;
+#endif
 
 	switch(psdt) {
 		case 0:
@@ -254,7 +288,14 @@ void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 
 void unvmed_log_cmd_cmpl(const char *bdf, struct nvme_cqe *cqe)
 {
-	uint16_t sfp = le16_to_cpu(cqe->sfp);
+	uint16_t sfp;
+
+#ifndef UNVME_DEBUG
+	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
+		return;
+#endif
+
+	sfp = le16_to_cpu(cqe->sfp);
 
 	unvmed_log_debug("unvmed_cmd_cmpl: %s: cqe (qid=%d, cid=%d, "
 		 "dw0=0x%x, dw1=0x%x, head=%d, phase=%d, sct=0x%x, sc=0x%x, "

@@ -21,6 +21,7 @@ libunvmed_so = shared_library(
   dependencies: [vfn_lib, nvme_lib, jsonc_lib],
   link_with: [ccan_lib],
   include_directories: [ccan_inc, libunvmed_inc],
+  c_args: ['-DLIBUNVMED_INTERNAL'],
   install: true,
   install_dir: get_option('libdir'),
 )

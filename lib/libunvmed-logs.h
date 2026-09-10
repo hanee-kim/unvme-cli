@@ -3,10 +3,11 @@
 #ifndef LIBUNVMED_LOG_H
 #define LIBUNVMED_LOG_H
 
+#include <stdatomic.h>
 #include "libunvmed-jump-label.h"
 
 extern int __unvmed_logfd;
-extern volatile int __log_level;
+extern _Atomic int __log_level;
 
 enum {
 	UNVME_LOG_ERR,
@@ -30,7 +31,7 @@ DECLARE_STATIC_KEY_FALSE(unvmed_log_key_info);
 DECLARE_STATIC_KEY_FALSE(unvmed_log_key_debug);
 
 /*
- * Cold write path — noinline + cold keeps the timestamp/dprintf code out
+ * Cold write path — noinline + cold keeps the timestamp/ring-push code out
  * of the hot I/O path's instruction cache.
  */
 __attribute__((cold, noinline, format(printf, 4, 5)))
