@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #define _GNU_SOURCE
 
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <time.h>
 #include <signal.h>
 
@@ -23,10 +26,15 @@
 #include <json-c/json.h>
 
 #include "libunvmed.h"
+#include "libunvmed-logs.h"
+#include "libunvmed-log-ring.h"
+#include "libunvmed-trace.h"
 #include "libunvmed-private.h"
 
-int __unvmed_logfd = 0;
-int __log_level = 0;
+/* -1, not 0: a 0 default would alias stdin and make any stray write to the
+ * log fd corrupt the process's standard input. */
+int __unvmed_logfd = -1;
+_Atomic int __log_level = 0;
 
 static void *unvmed_reaper_run(void *opaque);
 static void __unvmed_free_ns(struct __unvme_ns *ns);
@@ -290,14 +298,105 @@ static int unvmed_create_logfile(const char *logfile)
 	return fd;
 }
 
+/*
+ * Companion trace file for @logfile: "/var/log/unvmed.log" becomes
+ * "/var/log/unvmed.trace".  The per-I/O records go here in binary so the
+ * text log stays something cat and grep can read, and `unvme log` merges the
+ * two back into one stream.
+ *
+ * Returns -1 on any failure; a missing trace file only costs the per-I/O
+ * records, so it must not stop the text log from working.
+ */
+static int unvmed_create_tracefile(const char *logfile)
+{
+	char  path[PATH_MAX];
+	size_t len = strlen(logfile);
+	struct unvme_trace_file_hdr hdr = { 0 };
+	int   fd;
+
+	if (len + sizeof(".trace") > sizeof(path))
+		return -1;
+
+	/* Swap a trailing ".log" for ".trace", else just append. */
+	if (len > 4 && !strcmp(logfile + len - 4, ".log"))
+		len -= 4;
+	memcpy(path, logfile, len);
+	memcpy(path + len, ".trace", sizeof(".trace"));
+
+	fd = creat(path, 0644);
+	if (fd < 0)
+		return -1;
+
+	memcpy(hdr.magic, UNVME_TRACE_MAGIC, sizeof(UNVME_TRACE_MAGIC));
+	hdr.version  = UNVME_TRACE_VERSION;
+	hdr.hdr_size = sizeof(hdr);
+	hdr.pid      = (uint64_t)getpid();
+
+	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
+ * Serialise unvmed_init() so concurrent callers cannot both run the body.
+ *
+ * A plain `static bool` guard is not enough: two threads can both read it as
+ * false before either writes true, and would then each call
+ * unvmed_log_ring_init() on the same __log_ring — issuing atomic_init() on
+ * live atomics while the first logger thread is already running (C11 UB) and
+ * leaving two logger threads writing to the same fd.
+ *
+ * The mutex also makes a late caller *wait* for initialization to finish
+ * rather than returning while the ring is still half-built.
+ */
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_initialized = false;
+
 void unvmed_init(const char *logfile, int log_level)
 {
-	if (logfile)
-		__unvmed_logfd = unvmed_create_logfile(logfile);
+	pthread_mutex_lock(&g_init_lock);
 
-	atomic_store_release(&__log_level, log_level);
+	if (g_initialized) {
+		pthread_mutex_unlock(&g_init_lock);
+		return;
+	}
+
+	if (logfile) {
+		int fd = unvmed_create_logfile(logfile);
+		if (fd < 0) {
+			fprintf(stderr, "unvmed_init: failed to open logfile '%s'\n",
+				logfile);
+		} else {
+			int tfd = unvmed_create_tracefile(logfile);
+
+			__unvmed_logfd = fd;
+			if (unvmed_log_ring_init(&__log_ring, fd, tfd) != 0) {
+				fprintf(stderr,
+					"unvmed_init: failed to start log thread\n");
+				close(fd);
+				if (tfd >= 0)
+					close(tfd);
+				__unvmed_logfd = -1;
+			} else {
+				atexit(unvmed_fini);
+			}
+		}
+	}
+
+	unvmed_log_set_level(log_level);
 
 	unvmed_vcq_pool_init();
+
+	g_initialized = true;
+	pthread_mutex_unlock(&g_init_lock);
+}
+
+void unvmed_fini(void)
+{
+	unvmed_log_ring_stop(&__log_ring);
 }
 
 int unvmed_parse_bdf(const char *input, char *bdf)
@@ -995,6 +1094,7 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 
 	if (unvmed_init_irq_reaper(u, vector)) {
 		unvmed_log_err("%s: failed to initialize IRQ reaper (vector=%d)", unvmed_bdf(u), vector);
+		atomic_dec_fetch(&r->refcnt);
 		return -1;
 	}
 
@@ -1006,6 +1106,7 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 	if (vfio_disable_irq(&u->ctrl.pci.dev, 0, u->nr_irqs)) {
 		unvmed_log_err("%s: failed to disable all irq vectors", unvmed_bdf(u));
 
+		atomic_dec_fetch(&r->refcnt);
 		unvmed_free_irq_reaper(r);
 		return -1;
 	}
@@ -1013,6 +1114,7 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 	if (vfio_set_irq(&u->ctrl.pci.dev, &u->efds[0], 0, nr_irqs)) {
 		unvmed_log_err("%s: failed to set IRQ for vector %d", unvmed_bdf(u), vector);
 
+		atomic_dec_fetch(&r->refcnt);
 		unvmed_free_irq_reaper(r);
 		return -1;
 	}
@@ -1022,6 +1124,7 @@ static int unvmed_init_irq(struct unvme *u, int vector)
 		pthread_mutex_unlock(&r->th_lock);
 		unvmed_log_err("%s: failed to create reaper thread (vector=%d)",
 				unvmed_bdf(u), vector);
+		atomic_dec_fetch(&r->refcnt);
 		unvmed_free_irq_reaper(r);
 		return -1;
 	}
@@ -1092,6 +1195,11 @@ static int unvmed_alloc_irqs(struct unvme *u)
 
 	u->nr_efds = u->nr_irqs;
 	u->reapers = calloc(u->nr_efds, sizeof(struct unvme_cq_reaper));
+	if (!u->reapers) {
+		free(u->efds);
+		u->efds = NULL;
+		return -1;
+	}
 	unvmed_log_info("%s: %d IRQ vectors are allocated (supported=%d)",
 			unvmed_bdf(u), u->nr_irqs, u->irq_info.count);
 	return 0;
@@ -4220,6 +4328,7 @@ int unvmed_sq_update_tail(struct unvme *u, struct unvme_sq *usq)
 static inline int unvmed_pci_get_config(const char *bdf, void *buf,
 					off_t offset, size_t size) {
 	char *path = NULL;
+	ssize_t nr;
 	int ret;
 	int fd;
 
@@ -4233,8 +4342,8 @@ static inline int unvmed_pci_get_config(const char *bdf, void *buf,
 		return -1;
 	}
 
-	ret = pread(fd, buf, size, offset);
-	if (ret < size) {
+	nr = pread(fd, buf, size, offset);
+	if (nr < 0 || (size_t)nr != size) {
 		unvmed_log_err("failed to read config register");
 		close(fd);
 		free(path);
@@ -4336,7 +4445,7 @@ static void unvmed_quirk_dsp_sleep_after_reset(struct unvme *u)
 
 static int unvmed_pci_wait_reset(struct unvme *u)
 {
-	uint16_t pcie_offset;
+	int pcie_offset;
 	uint16_t link_status;
 	uint32_t link_cap;
 	uint64_t bar0;
@@ -4348,7 +4457,7 @@ static int unvmed_pci_wait_reset(struct unvme *u)
 	}
 
 	pcie_offset = unvmed_get_pcie_cap_offset(dsp);
-	if (pcie_offset == -1) {
+	if (pcie_offset < 0) {
 		unvmed_log_err("%s: failed to get PCIe Cap. register offset (0xffff)", unvmed_bdf(u));
 		return -1;
 	}
@@ -4484,8 +4593,8 @@ int unvmed_flr(struct unvme *u)
 	}
 
 
-	uint16_t pcie_offset = unvmed_get_pcie_cap_offset(unvmed_bdf(u));
-	if (pcie_offset == -1) {
+	int pcie_offset = unvmed_get_pcie_cap_offset(unvmed_bdf(u));
+	if (pcie_offset < 0) {
 		unvmed_log_err("%s: failed to get PCIe Cap. register offset (0xffff)", unvmed_bdf(u));
 		ret = -1;
 		goto close;
@@ -4606,10 +4715,12 @@ static int unvmed_get_pcie_cap_offset(char *bdf)
 		return -1;
 
 	fd = open(path, O_RDWR);
-	if (fd < 0)
+	if (fd < 0) {
+		ret = -1;
 		goto free;
+	}
 
-	ret = pread(fd, &offset, 2, 0x34);  /* Firts cap. pointer */
+	ret = pread(fd, &offset, 2, 0x34);  /* First cap. pointer */
 	if (ret < 0)
 		goto close;
 
@@ -4712,7 +4823,7 @@ int unvmed_link_disable(struct unvme *u)
 	char *path = NULL;
 	char config[4096];
 	char dsp[13];
-	uint16_t pcie_offset;
+	int pcie_offset;
 	uint16_t control;
 	int ret;
 	int fd;
@@ -4737,7 +4848,7 @@ int unvmed_link_disable(struct unvme *u)
 	}
 
 	pcie_offset = unvmed_get_pcie_cap_offset(dsp);
-	if (pcie_offset == -1) {
+	if (pcie_offset < 0) {
 		ret = -1;
 		goto close;
 	}

@@ -4,10 +4,14 @@ libunvmed_src = [
   'libunvmed-vcq.c',
   'libunvmed-cmds.c',
   'libunvmed-logs.c',
+  'libunvmed-jump-label.c',
+  'libunvmed-log-ring.c',
+  'libunvmed-trace.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',
   'libunvmed-logs.h',
+  'libunvmed-trace.h',
 ]
 
 ver = '1.0.0'
@@ -19,6 +23,7 @@ libunvmed_so = shared_library(
   dependencies: [vfn_lib, nvme_lib, jsonc_lib],
   link_with: [ccan_lib],
   include_directories: [ccan_inc, libunvmed_inc],
+  c_args: ['-DLIBUNVMED_INTERNAL'],
   install: true,
   install_dir: get_option('libdir'),
 )

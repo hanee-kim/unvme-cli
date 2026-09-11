@@ -3,6 +3,7 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dirent.h>
@@ -27,6 +28,7 @@
 #include "libunvmed.h"
 #include "libunvmed-private.h"
 #include "unvme.h"
+#include "libunvmed-log-ring.h"
 #include "unvmed.h"
 
 #include <argtable3.h>
@@ -211,26 +213,44 @@ int unvme_log_level(int argc, char *argv[], struct unvme_msg *msg)
 		"Get or set log level of unvmed process. If `level` is given,\n"
 		"the log level will be set by the given value. If not, print\n"
 		"the current log level.  It defaults to INFO in release build\n"
-		"and to DEBUG in debug build.";
+		"and to DEBUG in debug build.\n"
+		"\n"
+		"At DEBUG level every command and completion is logged.  If they\n"
+		"arrive faster than the logger can write them out, the default is\n"
+		"to drop the excess so that I/O is never held up.  --lossless=1\n"
+		"reverses that: nothing is dropped, and a submission waits when\n"
+		"the log falls behind.  Use it when the run is being analysed\n"
+		"from its logs rather than measured for throughput.";
 
 	struct arg_lit *help = arg_lit0("h", "help", "Show help message");
 	struct arg_int *level = arg_int0(NULL, NULL, "<n>", "level (0:ERROR,1:INFO,2:DEBUG)");
+	struct arg_int *lossless = arg_int0(NULL, "lossless", "<0|1>",
+			"0: drop logs under pressure (default), 1: never drop, stall instead");
 	struct arg_end *end = arg_end(UNVME_ARG_MAX_ERROR);
 
 
-	void *argtable[] = { help, level, end };
+	void *argtable[] = { help, level, lossless, end };
 
 	unvme_parse_args_locked(argc, argv, argtable, help, end, desc);
 
 	if (arg_boolv(level)) {
-		int prev = atomic_load_acquire(&__log_level);
-		atomic_store_release(&__log_level, arg_intv(level));
+		int prev = atomic_load_explicit(&__log_level, memory_order_relaxed);
+		unvmed_log_set_level(arg_intv(level));
 		unvme_pr("Log level changed to %s (prev: %s)\n",
-			 loglv_to_str(atomic_load_acquire(&__log_level)),
+			 loglv_to_str(atomic_load_explicit(&__log_level, memory_order_relaxed)),
 			 loglv_to_str(prev));
-	} else {
+	} else if (!arg_boolv(lossless)) {
 		unvme_pr("Current log level: %s\n",
-			 loglv_to_str(atomic_load_acquire(&__log_level)));
+			 loglv_to_str(atomic_load_explicit(&__log_level, memory_order_relaxed)));
+	}
+
+	if (arg_boolv(lossless)) {
+		bool on = arg_intv(lossless) != 0;
+
+		unvmed_log_ring_set_lossless(&__log_ring, on);
+		unvme_pr("Log loss policy: %s\n", on
+			 ? "lossless (submissions wait when the log falls behind)"
+			 : "lossy (excess logs dropped, I/O never waits)");
 	}
 
 	unvme_free_args(argtable);
