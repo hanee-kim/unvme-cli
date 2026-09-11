@@ -43,30 +43,66 @@ void unvmed_log_set_level(int level)
 		unvmed_static_key_disable(&unvmed_log_key_debug);
 }
 
+/*
+ * Seconds-resolution timestamp cache.
+ *
+ * localtime_r() + strftime() together cost more than everything else in a log
+ * line, and their result only changes once a second.  Cache the formatted
+ * "YYYY-MM-DD HH:MM:SS" and rebuild it only when the second rolls over.
+ *
+ * Per-thread, so there is no lock and no cross-core sharing; each logging
+ * thread keeps its own copy hot in its own cache.
+ */
+static __thread time_t __dt_sec = (time_t)-1;
+static __thread char   __dt_date[20];	/* "YYYY-MM-DD HH:MM:SS" + NUL */
+static __thread size_t __dt_len;
+
+/* Six fixed digits, no snprintf: this runs on every single log line. */
+static inline void unvme_usec6(char *p, long usec)
+{
+	for (int i = 5; i >= 0; i--) {
+		p[i] = (char)('0' + (usec % 10));
+		usec /= 10;
+	}
+}
+
 static void unvme_datetime(char *datetime, size_t sz)
 {
 	struct timeval tv;
-	struct tm tmv;
-	size_t n;
 
 	gettimeofday(&tv, NULL);
 
-	/* localtime_r is thread-safe (unlike localtime). */
-	if (!localtime_r(&tv.tv_sec, &tmv)) {
-		/* Fallback: use epoch seconds on localtime_r failure. */
-		snprintf(datetime, sz, "%ld.??????", (long)tv.tv_sec);
+	if (tv.tv_sec != __dt_sec) {
+		struct tm tmv;
+
+		/* localtime_r is thread-safe (unlike localtime). */
+		if (!localtime_r(&tv.tv_sec, &tmv)) {
+			/* Fallback: use epoch seconds on localtime_r failure. */
+			snprintf(datetime, sz, "%ld.??\?\?\?\?", (long)tv.tv_sec);
+			return;
+		}
+
+		__dt_len = strftime(__dt_date, sizeof(__dt_date),
+				    "%Y-%m-%d %H:%M:%S", &tmv);
+		if (!__dt_len) {
+			/* strftime buffer too small or locale issue. */
+			snprintf(datetime, sz, "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?");
+			return;
+		}
+
+		__dt_sec = tv.tv_sec;
+	}
+
+	/* date + '.' + 6 digits + NUL */
+	if (sz < __dt_len + 8) {
+		snprintf(datetime, sz, "%ld", (long)tv.tv_sec);
 		return;
 	}
 
-	n = strftime(datetime, sz, "%Y-%m-%d %H:%M:%S", &tmv);
-	if (!n) {
-		/* strftime buffer too small or locale issue. */
-		snprintf(datetime, sz, "????-??-?? ??:??:??");
-		return;
-	}
-
-	/* Append microseconds — guaranteed to fit (sz >= 32, n <= 19). */
-	snprintf(datetime + n, sz - n, ".%06ld", (long)tv.tv_usec);
+	memcpy(datetime, __dt_date, __dt_len);
+	datetime[__dt_len] = '.';
+	unvme_usec6(datetime + __dt_len + 1, (long)tv.tv_usec);
+	datetime[__dt_len + 7] = '\0';
 }
 
 /*
@@ -246,8 +282,25 @@ static const char *unvmed_log_admin_cmd(union nvme_cmd *sqe)
 	return unvmed_log_common(sqe);
 }
 
+/*
+ * These two run on every submitted command and every completion, so the guard
+ * below decides whether an fio run pays ~0.5us per I/O for string formatting
+ * it may then throw away.
+ *
+ * It must be #ifdef, not #ifndef.  unvmed_log_debug() is compiled out unless
+ * UNVME_DEBUG is set, so the two build modes need opposite things, and the
+ * inverted test got both of them wrong: a release build formatted every
+ * command and emitted nothing, while a debug build formatted every command
+ * even at ERROR level because the guard had been preprocessed away.
+ */
 void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 {
+#ifndef UNVME_DEBUG
+	/* No debug output exists in this build — do not format anything. */
+	(void)bdf;
+	(void)sqid;
+	(void)sqe;
+#else
 	bool admin = (!sqid) ? true : false;
 	int psdt = (sqe->flags >> 6) & 0x3;
 	const char *psdt_type;
@@ -255,12 +308,8 @@ void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 	uint64_t dptr1 = 0;
 	const char *str;
 
-	/* Guard the whole function: formatting is wasted work when debug
-	 * logging is disabled. */
-#ifndef UNVME_DEBUG
 	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
 		return;
-#endif
 
 	switch(psdt) {
 		case 0:
@@ -286,16 +335,19 @@ void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 		 bdf, sqid, sqe->cid, le32_to_cpu(sqe->nsid),
 		 sqe->flags & 0x3, psdt, psdt_type, le64_to_cpu(sqe->mptr),
 		 dptr0, dptr1, str);
+#endif /* UNVME_DEBUG */
 }
 
 void unvmed_log_cmd_cmpl(const char *bdf, struct nvme_cqe *cqe)
 {
+#ifndef UNVME_DEBUG
+	(void)bdf;
+	(void)cqe;
+#else
 	uint16_t sfp;
 
-#ifndef UNVME_DEBUG
 	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
 		return;
-#endif
 
 	sfp = le16_to_cpu(cqe->sfp);
 
@@ -307,6 +359,7 @@ void unvmed_log_cmd_cmpl(const char *bdf, struct nvme_cqe *cqe)
 		 le16_to_cpu(cqe->sqhd), sfp & 0x1,
 		 (sfp >> 9) & 0x7, (sfp >> 1) & 0xFF,
 		 (sfp >> 12) & 0xFF, (sfp >> 14) & 0x1, (sfp >> 15) & 0x1);
+#endif /* UNVME_DEBUG */
 }
 
 void unvmed_log_cmd_vcq_push(struct nvme_cqe *cqe)

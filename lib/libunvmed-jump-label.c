@@ -36,9 +36,18 @@ struct __unvmed_jump_entry {
  * automatically for any section whose name is a valid C identifier.
  * These symbols cover only THIS shared object's section; they are used
  * exclusively within libunvmed.so (LIBUNVMED_INTERNAL builds).
+ *
+ * Weak, because the linker only synthesises them if the section exists at
+ * all.  A build in which every static-branch site happened to be compiled
+ * out would otherwise fail to link with an undefined reference from this
+ * file — making the library's linkability depend on some unrelated
+ * translation unit happening to use a key.  Weak symbols resolve to NULL
+ * instead, and the loop below then simply finds no entries.
  */
-extern struct __unvmed_jump_entry __start___unvme_jump_table[];
-extern struct __unvmed_jump_entry __stop___unvme_jump_table[];
+extern struct __unvmed_jump_entry __start___unvme_jump_table[]
+	__attribute__((weak));
+extern struct __unvmed_jump_entry __stop___unvme_jump_table[]
+	__attribute__((weak));
 
 #ifdef __x86_64__
 

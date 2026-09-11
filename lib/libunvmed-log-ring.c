@@ -59,17 +59,66 @@ static bool ring_pop(struct unvmed_log_ring *r, char *out, uint32_t *out_len)
 	return true;
 }
 
+/*
+ * Batched output.
+ *
+ * One write(2) per message caps the drain rate at roughly one syscall's worth
+ * of work per message, which is far slower than producers can fill the ring —
+ * so the ring runs full and messages get dropped even though the consumer is
+ * doing nothing but writing.  Accumulating into a buffer and issuing one
+ * write per batch removes the syscall from the per-message cost.
+ */
+#define LOG_BATCH_SIZE	(64 * 1024)
+
+struct log_batch {
+	size_t n;
+	char   b[LOG_BATCH_SIZE];
+};
+
+static void batch_flush(int fd, struct log_batch *w)
+{
+	if (w->n) {
+		write_all(fd, w->b, (uint32_t)w->n);
+		w->n = 0;
+	}
+}
+
+/*
+ * Drain the ring straight into the batch buffer — ring_pop() copies directly
+ * to its final location, so a message is copied once, not twice.
+ */
+static void drain(struct unvmed_log_ring *r, struct log_batch *w)
+{
+	uint32_t len;
+
+	for (;;) {
+		/* Reserve room for the largest message before popping into it. */
+		if (w->n + UNVMED_LOG_MSG_SIZE > sizeof(w->b))
+			batch_flush(r->fd, w);
+
+		if (!ring_pop(r, w->b + w->n, &len))
+			return;
+
+		w->n += len;
+	}
+}
+
 static void *logger_thread(void *arg)
 {
 	struct unvmed_log_ring *r = arg;
-	char     buf[UNVMED_LOG_MSG_SIZE];
-	uint32_t len;
+	struct log_batch w = { .n = 0 };
 	struct timespec ts;
 
 	while (atomic_load_explicit(&r->running, memory_order_acquire)) {
 		/* Drain every ready slot without sleeping */
-		while (ring_pop(r, buf, &len))
-			write_all(r->fd, buf, len);
+		drain(r, &w);
+
+		/*
+		 * Flush before sleeping.  Batching may hold messages back, but
+		 * only while there is more to drain — a log that goes quiet
+		 * must not leave its last lines sitting in the buffer.
+		 */
+		batch_flush(r->fd, &w);
 
 		/*
 		 * Sleep until a producer signals or 1 ms elapses.
@@ -105,8 +154,7 @@ static void *logger_thread(void *arg)
 	 * shutdown forever.
 	 */
 	for (int i = 0; i < 100000; i++) {
-		while (ring_pop(r, buf, &len))
-			write_all(r->fd, buf, len);
+		drain(r, &w);
 
 		if (!atomic_load_explicit(&r->n_producers, memory_order_seq_cst))
 			break;
@@ -115,8 +163,8 @@ static void *logger_thread(void *arg)
 	}
 
 	/* Producers have quiesced — drain what they published on the way out. */
-	while (ring_pop(r, buf, &len))
-		write_all(r->fd, buf, len);
+	drain(r, &w);
+	batch_flush(r->fd, &w);
 
 	return NULL;
 }
