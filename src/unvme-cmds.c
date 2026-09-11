@@ -17,6 +17,7 @@
 #include <ccan/str/str.h>
 
 #include "unvme.h"
+#include "libunvmed-trace.h"
 
 #include <argtable3.h>
 
@@ -194,44 +195,34 @@ int unvme_stop(int argc, char *argv[], struct unvme_msg *msg)
 int unvme_log(int argc, char *argv[], struct unvme_msg *msg)
 {
 	struct arg_lit *nvme;
+	struct arg_lit *follow;
 	struct arg_lit *help;
 	struct arg_end *end;
 	const char *desc = "Show logs written by unvmed process.";
 
 	void *argtable[] = {
 		nvme = arg_lit0("n", "nvme", "Show NVMe command log only"),
+		follow = arg_lit0("f", "follow", "Keep printing as new logs arrive"),
 		help = arg_lit0("h", "help", "Show help message"),
 		end = arg_end(20),
 	};
+	int ret;
 
 	unvme_parse_args(argc, argv, argtable, help, end, desc);
 
-	char *line = NULL;
-	size_t len;
-	FILE *file;
-	int ret;
-
-	file = fopen(UNVME_DAEMON_LOG, "r");
-	if (!file) {
-		unvme_pr_err("failed to open unvme log file\n");
+	/*
+	 * Two sources: the text log, and the binary trace holding the per-I/O
+	 * records (which are captured raw so the I/O path never formats).
+	 * unvmed_log_dump() merges them back into one time-ordered stream, so
+	 * this still shows everything the way it always did.
+	 */
+	ret = unvmed_log_dump(stdout, UNVME_DAEMON_LOG, UNVME_DAEMON_TRACE,
+			      arg_boolv(nvme) > 0, arg_boolv(follow) > 0);
+	if (ret) {
+		unvme_pr_err("failed to read unvme log files\n");
 		ret = ENOENT;
-		goto out;
 	}
 
-	while ((ret = getline(&line, &len, file)) != -1) {
-		if (arg_boolv(nvme) > 0) {
-			if (strstarts(line, "NVME"))
-				unvme_pr("%s", line);
-		} else
-			unvme_pr("%s", line);
-	}
-
-	fclose(file);
-	if (line)
-		free(line);
-
-	ret = 0;
-out:
 	unvme_free_args(argtable);
 	return ret;
 }

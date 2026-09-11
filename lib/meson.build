@@ -6,10 +6,12 @@ libunvmed_src = [
   'libunvmed-logs.c',
   'libunvmed-jump-label.c',
   'libunvmed-log-ring.c',
+  'libunvmed-trace.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',
   'libunvmed-logs.h',
+  'libunvmed-trace.h',
 ]
 
 ver = '1.0.0'

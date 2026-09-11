@@ -40,23 +40,13 @@
 /*
  * Slot payload kinds.
  *
- * TEXT is a line that the caller already rendered.  Every other kind is a
- * binary record: the caller stores raw fields and the logger thread renders
- * them, keeping vsnprintf off the hot path entirely — the same split the
- * kernel's tracepoints use between writing an event and reading a trace.
- *
- * Values above UNVMED_LOG_REC_TEXT are opaque to the ring; it just hands
- * them to the formatter supplied at init.
+ * TEXT is a line the caller already rendered; it goes to the text log.
+ * Anything else is a binary record and is written verbatim to the trace
+ * file, to be rendered only when somebody reads it back.  Nothing is
+ * formatted on either the I/O thread or the logger thread — the same split
+ * the kernel makes between writing a trace event and reporting it.
  */
 #define UNVMED_LOG_REC_TEXT    0
-
-/*
- * Render a binary record into @out.  Called on the logger thread only.
- * Returns the number of bytes written (0 to drop the record).
- */
-typedef uint32_t (*unvmed_log_format_fn)(uint8_t type, const void *rec,
-					 uint32_t len, char *out,
-					 uint32_t outsz);
 
 struct unvmed_log_slot {
 	_Atomic uint64_t seq;
@@ -102,18 +92,27 @@ struct unvmed_log_ring {
 	pthread_mutex_t         lock;
 	pthread_cond_t          cond;
 	_Atomic bool            running;
-	int                     fd;
-	unvmed_log_format_fn    format;
+	int                     fd;		/* text log */
+	int                     fd_trace;	/* binary records, may be -1 */
+
+	/*
+	 * Lossless: when the ring is full, make the producer wait for space
+	 * instead of dropping the record.  Costs I/O latency exactly when the
+	 * log cannot keep up, which is the trade a run being analysed from its
+	 * logs wants and a throughput measurement does not.
+	 */
+	_Atomic bool            lossless;
 
 	_Atomic uint64_t        n_dropped;
+	_Atomic uint64_t        n_stalled;	/* pushes that had to wait */
 };
 
-/* @format may be NULL if only UNVMED_LOG_REC_TEXT is ever pushed. */
-int  unvmed_log_ring_init(struct unvmed_log_ring *r, int fd,
-			  unvmed_log_format_fn format);
+/* @fd_trace may be -1 if only UNVMED_LOG_REC_TEXT is ever pushed. */
+int  unvmed_log_ring_init(struct unvmed_log_ring *r, int fd, int fd_trace);
 void unvmed_log_ring_push(struct unvmed_log_ring *r, uint8_t type,
 			  const void *rec, uint32_t len);
 void unvmed_log_ring_stop(struct unvmed_log_ring *r);
+void unvmed_log_ring_set_lossless(struct unvmed_log_ring *r, bool lossless);
 
 extern struct unvmed_log_ring __log_ring;
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #include <errno.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -79,40 +80,37 @@ struct log_batch {
 
 static void batch_flush(int fd, struct log_batch *w)
 {
-	if (w->n) {
+	if (w->n && fd >= 0)
 		write_all(fd, w->b, (uint32_t)w->n);
-		w->n = 0;
-	}
+	w->n = 0;
 }
 
 /*
- * Drain the ring into the batch buffer.
- *
- * Already-rendered text is popped straight to its final location.  A binary
- * record is popped into scratch and rendered into the batch by the formatter
- * — this is where vsnprintf runs, on this thread, instead of on the I/O
- * thread that produced the event.
+ * Drain the ring, routing each payload to its file: rendered text to the text
+ * log, binary records verbatim to the trace.  Nothing is formatted here — a
+ * record costs one memcpy and its share of a batched write.
  */
-static void drain(struct unvmed_log_ring *r, struct log_batch *w)
+static void drain(struct unvmed_log_ring *r, struct log_batch *text,
+		  struct log_batch *trace)
 {
 	char     rec[UNVMED_LOG_MSG_SIZE];
 	uint32_t len;
 	uint8_t  type;
 
 	for (;;) {
-		/* Reserve room for the longest rendered line. */
-		if (w->n + UNVMED_LOG_LINE_MAX > sizeof(w->b))
-			batch_flush(r->fd, w);
-
 		if (!ring_pop(r, rec, &len, &type))
 			return;
 
 		if (type == UNVMED_LOG_REC_TEXT) {
-			memcpy(w->b + w->n, rec, len);
-			w->n += len;
-		} else if (r->format) {
-			w->n += r->format(type, rec, len, w->b + w->n,
-					  UNVMED_LOG_LINE_MAX);
+			if (text->n + len > sizeof(text->b))
+				batch_flush(r->fd, text);
+			memcpy(text->b + text->n, rec, len);
+			text->n += len;
+		} else if (r->fd_trace >= 0) {
+			if (trace->n + len > sizeof(trace->b))
+				batch_flush(r->fd_trace, trace);
+			memcpy(trace->b + trace->n, rec, len);
+			trace->n += len;
 		}
 	}
 }
@@ -120,19 +118,22 @@ static void drain(struct unvmed_log_ring *r, struct log_batch *w)
 static void *logger_thread(void *arg)
 {
 	struct unvmed_log_ring *r = arg;
-	struct log_batch w = { .n = 0 };
+	static struct log_batch text, trace;   /* 128 KiB: too big for the stack */
 	struct timespec ts;
+
+	text.n = trace.n = 0;
 
 	while (atomic_load_explicit(&r->running, memory_order_acquire)) {
 		/* Drain every ready slot without sleeping */
-		drain(r, &w);
+		drain(r, &text, &trace);
 
 		/*
 		 * Flush before sleeping.  Batching may hold messages back, but
 		 * only while there is more to drain — a log that goes quiet
 		 * must not leave its last lines sitting in the buffer.
 		 */
-		batch_flush(r->fd, &w);
+		batch_flush(r->fd, &text);
+		batch_flush(r->fd_trace, &trace);
 
 		/*
 		 * Sleep until a producer signals or 1 ms elapses.
@@ -168,7 +169,7 @@ static void *logger_thread(void *arg)
 	 * shutdown forever.
 	 */
 	for (int i = 0; i < 100000; i++) {
-		drain(r, &w);
+		drain(r, &text, &trace);
 
 		if (!atomic_load_explicit(&r->n_producers, memory_order_seq_cst))
 			break;
@@ -177,14 +178,19 @@ static void *logger_thread(void *arg)
 	}
 
 	/* Producers have quiesced — drain what they published on the way out. */
-	drain(r, &w);
-	batch_flush(r->fd, &w);
+	drain(r, &text, &trace);
+	batch_flush(r->fd, &text);
+	batch_flush(r->fd_trace, &trace);
 
 	return NULL;
 }
 
-int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd,
-			 unvmed_log_format_fn format)
+void unvmed_log_ring_set_lossless(struct unvmed_log_ring *r, bool lossless)
+{
+	atomic_store_explicit(&r->lossless, lossless, memory_order_relaxed);
+}
+
+int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd, int fd_trace)
 {
 	int rc;
 
@@ -196,11 +202,12 @@ int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd,
 
 	atomic_init(&r->write_pos, 0);
 	atomic_init(&r->n_dropped, 0);
+	atomic_init(&r->n_stalled, 0);
 	atomic_init(&r->n_producers, 0);
 	atomic_init(&r->running,   true);
 	r->read_pos = 0;
 	r->fd       = fd;
-	r->format   = format;
+	r->fd_trace = fd_trace;
 
 	pthread_mutex_init(&r->lock, NULL);
 	pthread_cond_init(&r->cond,  NULL);
@@ -229,6 +236,7 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r, uint8_t type,
 	struct unvmed_log_slot *slot;
 	uint64_t pos, seq;
 	int64_t  dif;
+	bool     stalled = false;
 
 	/*
 	 * Announce ourselves as an in-flight producer *before* testing
@@ -270,7 +278,33 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r, uint8_t type,
 			/* CAS lost: pos was updated to the current write_pos;
 			 * retry with the new value. */
 		} else if (dif < 0) {
-			/* Ring full — drop without advancing write_pos. */
+			/*
+			 * Ring full.  Either give up on this record, or wait
+			 * for the logger thread to free a slot — the caller's
+			 * choice, since it trades I/O latency for a complete
+			 * log and only bites when the log cannot keep up.
+			 *
+			 * Waiting is safe here: nothing is claimed yet, so we
+			 * hold no slot, and the logger thread is independent
+			 * of us.  Re-check @running so a stop during the wait
+			 * cannot strand us.
+			 */
+			if (atomic_load_explicit(&r->lossless,
+						 memory_order_relaxed) &&
+			    atomic_load_explicit(&r->running,
+						 memory_order_acquire)) {
+				if (!stalled) {
+					atomic_fetch_add_explicit(
+						&r->n_stalled, 1,
+						memory_order_relaxed);
+					stalled = true;
+				}
+				sched_yield();
+				pos = atomic_load_explicit(&r->write_pos,
+							   memory_order_relaxed);
+				continue;
+			}
+
 			atomic_fetch_add_explicit(&r->n_dropped, 1,
 						  memory_order_relaxed);
 			atomic_fetch_sub_explicit(&r->n_producers, 1,
@@ -356,14 +390,24 @@ void unvmed_log_ring_stop(struct unvmed_log_ring *r)
 
 	pthread_join(r->thread, NULL);
 
-	/* Report any dropped messages. */
+	/* Report what the ring had to do under pressure. */
 	uint64_t dropped = atomic_load_explicit(&r->n_dropped,
 						memory_order_relaxed);
-	if (dropped > 0 && r->fd >= 0) {
-		char dmsg[80];
-		int  dlen = snprintf(dmsg, sizeof(dmsg),
-				     "log: %llu message(s) dropped (ring full)\n",
-				     (unsigned long long)dropped);
+	uint64_t stalled = atomic_load_explicit(&r->n_stalled,
+						memory_order_relaxed);
+	if ((dropped || stalled) && r->fd >= 0) {
+		char dmsg[128];
+		int  dlen;
+
+		if (dropped)
+			dlen = snprintf(dmsg, sizeof(dmsg),
+					"log: %llu message(s) dropped (ring full)\n",
+					(unsigned long long)dropped);
+		else
+			dlen = snprintf(dmsg, sizeof(dmsg),
+					"log: %llu push(es) waited for ring space "
+					"(lossless mode, nothing dropped)\n",
+					(unsigned long long)stalled);
 		/* (size_t), not (uint32_t): the comparison must stay in the
 		 * same type as sizeof so a truncating snprintf is detected. */
 		if (dlen > 0 && (size_t)dlen < sizeof(dmsg))

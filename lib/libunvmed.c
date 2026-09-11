@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #define _GNU_SOURCE
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <time.h>
@@ -27,6 +28,7 @@
 #include "libunvmed.h"
 #include "libunvmed-logs.h"
 #include "libunvmed-log-ring.h"
+#include "libunvmed-trace.h"
 #include "libunvmed-private.h"
 
 /* -1, not 0: a 0 default would alias stdin and make any stray write to the
@@ -297,6 +299,48 @@ static int unvmed_create_logfile(const char *logfile)
 }
 
 /*
+ * Companion trace file for @logfile: "/var/log/unvmed.log" becomes
+ * "/var/log/unvmed.trace".  The per-I/O records go here in binary so the
+ * text log stays something cat and grep can read, and `unvme log` merges the
+ * two back into one stream.
+ *
+ * Returns -1 on any failure; a missing trace file only costs the per-I/O
+ * records, so it must not stop the text log from working.
+ */
+static int unvmed_create_tracefile(const char *logfile)
+{
+	char  path[PATH_MAX];
+	size_t len = strlen(logfile);
+	struct unvme_trace_file_hdr hdr = { 0 };
+	int   fd;
+
+	if (len + sizeof(".trace") > sizeof(path))
+		return -1;
+
+	/* Swap a trailing ".log" for ".trace", else just append. */
+	if (len > 4 && !strcmp(logfile + len - 4, ".log"))
+		len -= 4;
+	memcpy(path, logfile, len);
+	memcpy(path + len, ".trace", sizeof(".trace"));
+
+	fd = creat(path, 0644);
+	if (fd < 0)
+		return -1;
+
+	memcpy(hdr.magic, UNVME_TRACE_MAGIC, sizeof(UNVME_TRACE_MAGIC));
+	hdr.version  = UNVME_TRACE_VERSION;
+	hdr.hdr_size = sizeof(hdr);
+	hdr.pid      = (uint64_t)getpid();
+
+	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
  * Serialise unvmed_init() so concurrent callers cannot both run the body.
  *
  * A plain `static bool` guard is not enough: two threads can both read it as
@@ -326,12 +370,15 @@ void unvmed_init(const char *logfile, int log_level)
 			fprintf(stderr, "unvmed_init: failed to open logfile '%s'\n",
 				logfile);
 		} else {
+			int tfd = unvmed_create_tracefile(logfile);
+
 			__unvmed_logfd = fd;
-			if (unvmed_log_ring_init(&__log_ring, fd,
-						 unvmed_log_formatter()) != 0) {
+			if (unvmed_log_ring_init(&__log_ring, fd, tfd) != 0) {
 				fprintf(stderr,
 					"unvmed_init: failed to start log thread\n");
 				close(fd);
+				if (tfd >= 0)
+					close(tfd);
 				__unvmed_logfd = -1;
 			} else {
 				atexit(unvmed_fini);
