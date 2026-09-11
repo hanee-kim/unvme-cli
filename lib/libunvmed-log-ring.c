@@ -35,7 +35,8 @@ static void write_all(int fd, const char *buf, uint32_t len)
  * Returns true and copies the message when a ready slot is found.
  * Advances read_pos and marks the slot free for future producers.
  */
-static bool ring_pop(struct unvmed_log_ring *r, char *out, uint32_t *out_len)
+static bool ring_pop(struct unvmed_log_ring *r, char *out, uint32_t *out_len,
+		     uint8_t *out_type)
 {
 	uint64_t pos = r->read_pos;
 	uint64_t idx = pos & (UNVMED_LOG_RING_SLOTS - 1);
@@ -49,6 +50,7 @@ static bool ring_pop(struct unvmed_log_ring *r, char *out, uint32_t *out_len)
 	if (len > UNVMED_LOG_MSG_SIZE)
 		len = UNVMED_LOG_MSG_SIZE;
 	*out_len = len;
+	*out_type = slot->type;
 	memcpy(out, slot->msg, len);
 
 	/* Release slot back to producers: seq = pos + RING_SLOTS */
@@ -84,22 +86,34 @@ static void batch_flush(int fd, struct log_batch *w)
 }
 
 /*
- * Drain the ring straight into the batch buffer — ring_pop() copies directly
- * to its final location, so a message is copied once, not twice.
+ * Drain the ring into the batch buffer.
+ *
+ * Already-rendered text is popped straight to its final location.  A binary
+ * record is popped into scratch and rendered into the batch by the formatter
+ * — this is where vsnprintf runs, on this thread, instead of on the I/O
+ * thread that produced the event.
  */
 static void drain(struct unvmed_log_ring *r, struct log_batch *w)
 {
+	char     rec[UNVMED_LOG_MSG_SIZE];
 	uint32_t len;
+	uint8_t  type;
 
 	for (;;) {
-		/* Reserve room for the largest message before popping into it. */
-		if (w->n + UNVMED_LOG_MSG_SIZE > sizeof(w->b))
+		/* Reserve room for the longest rendered line. */
+		if (w->n + UNVMED_LOG_LINE_MAX > sizeof(w->b))
 			batch_flush(r->fd, w);
 
-		if (!ring_pop(r, w->b + w->n, &len))
+		if (!ring_pop(r, rec, &len, &type))
 			return;
 
-		w->n += len;
+		if (type == UNVMED_LOG_REC_TEXT) {
+			memcpy(w->b + w->n, rec, len);
+			w->n += len;
+		} else if (r->format) {
+			w->n += r->format(type, rec, len, w->b + w->n,
+					  UNVMED_LOG_LINE_MAX);
+		}
 	}
 }
 
@@ -169,7 +183,8 @@ static void *logger_thread(void *arg)
 	return NULL;
 }
 
-int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd)
+int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd,
+			 unvmed_log_format_fn format)
 {
 	int rc;
 
@@ -185,6 +200,7 @@ int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd)
 	atomic_init(&r->running,   true);
 	r->read_pos = 0;
 	r->fd       = fd;
+	r->format   = format;
 
 	pthread_mutex_init(&r->lock, NULL);
 	pthread_cond_init(&r->cond,  NULL);
@@ -207,8 +223,8 @@ int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd)
  *
  * Never blocks: if the ring is full the message is dropped.
  */
-void unvmed_log_ring_push(struct unvmed_log_ring *r,
-			  const char *msg, uint32_t len)
+void unvmed_log_ring_push(struct unvmed_log_ring *r, uint8_t type,
+			  const void *rec, uint32_t len)
 {
 	struct unvmed_log_slot *slot;
 	uint64_t pos, seq;
@@ -268,14 +284,15 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r,
 	}
 
 	/*
-	 * The consumer writes exactly @len bytes and never treats the payload
+	 * The consumer uses exactly @len bytes and never treats the payload
 	 * as a C string, so the full slot is usable — clamping to
 	 * UNVMED_LOG_MSG_SIZE - 1 would silently shear the trailing newline
 	 * off a message that exactly fills the slot.
 	 */
 	uint32_t n = (len < UNVMED_LOG_MSG_SIZE) ? len : UNVMED_LOG_MSG_SIZE;
-	memcpy(slot->msg, msg, n);
-	slot->len = n;
+	memcpy(slot->msg, rec, n);
+	slot->len  = n;
+	slot->type = type;
 
 	/* Publish to consumer */
 	atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);

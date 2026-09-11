@@ -21,6 +21,18 @@
 DEFINE_STATIC_KEY_FALSE(unvmed_log_key_info);
 DEFINE_STATIC_KEY_FALSE(unvmed_log_key_debug);
 
+static uint32_t unvmed_log_format(uint8_t type, const void *rec, uint32_t len,
+				  char *out, uint32_t outsz);
+
+/*
+ * Hands unvmed_init() the renderer for binary records without exporting the
+ * record layouts, which stay private to this file.
+ */
+unvmed_log_format_fn unvmed_log_formatter(void)
+{
+	return unvmed_log_format;
+}
+
 /*
  * unvmed_log_set_level — single call-site for changing the log level.
  * Updates __log_level for display and patches the branch sites for the
@@ -66,11 +78,10 @@ static inline void unvme_usec6(char *p, long usec)
 	}
 }
 
-static void unvme_datetime(char *datetime, size_t sz)
+static void unvme_datetime_tv(const struct timeval *tvp, char *datetime,
+			      size_t sz)
 {
-	struct timeval tv;
-
-	gettimeofday(&tv, NULL);
+	struct timeval tv = *tvp;
 
 	if (tv.tv_sec != __dt_sec) {
 		struct tm tmv;
@@ -103,6 +114,14 @@ static void unvme_datetime(char *datetime, size_t sz)
 	datetime[__dt_len] = '.';
 	unvme_usec6(datetime + __dt_len + 1, (long)tv.tv_usec);
 	datetime[__dt_len + 7] = '\0';
+}
+
+static void unvme_datetime(char *datetime, size_t sz)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	unvme_datetime_tv(&tv, datetime, sz);
 }
 
 /*
@@ -154,7 +173,73 @@ void __unvmed_log_write(int lv, const char *func, int line,
 		msg[n - 1] = '\n';
 	}
 
-	unvmed_log_ring_push(&__log_ring, msg, (uint32_t)n);
+	unvmed_log_ring_push(&__log_ring, UNVMED_LOG_REC_TEXT, msg, (uint32_t)n);
+}
+
+/*
+ * Binary records for the per-I/O log sites.
+ *
+ * unvmed_log_cmd_post/cmpl and the vCQ pair run once per submitted command
+ * and once per completion, so rendering them on the calling thread puts a
+ * vsnprintf — the single most expensive thing in a log line — directly in the
+ * I/O path.  Instead the caller stores the raw fields and the logger thread
+ * renders them, which is the same division of labour as a kernel tracepoint:
+ * writing the event is cheap and bounded, and the expensive text only exists
+ * if and when someone reads the trace.
+ *
+ * What may be stored:
+ *   - @func comes from __func__, which has static storage duration, so the
+ *     pointer stays valid for the life of the process.
+ *   - @bdf is *copied*, not pointed to: it lives in the controller and the
+ *     controller can be freed between the push and the render.
+ *   - the SQE/CQE are copied by value; they are small and the caller's copy
+ *     is reused as soon as we return.
+ */
+enum {
+	UNVMED_LOG_REC_CMD_POST = 1,
+	UNVMED_LOG_REC_CMD_CMPL,
+	UNVMED_LOG_REC_VCQ_PUSH,
+	UNVMED_LOG_REC_VCQ_POP,
+};
+
+#define UNVMED_LOG_BDF_LEN	16
+
+struct unvmed_log_rec_hdr {
+	struct timeval  tv;
+	const char     *func;
+	uint32_t        line;
+};
+
+struct unvmed_log_rec_post {
+	struct unvmed_log_rec_hdr hdr;
+	char            bdf[UNVMED_LOG_BDF_LEN];
+	uint32_t        sqid;
+	union nvme_cmd  sqe;
+};
+
+struct unvmed_log_rec_cqe {
+	struct unvmed_log_rec_hdr hdr;
+	char            bdf[UNVMED_LOG_BDF_LEN];
+	struct nvme_cqe cqe;
+};
+
+static inline void unvmed_log_rec_hdr_init(struct unvmed_log_rec_hdr *h,
+					   const char *func, uint32_t line)
+{
+	gettimeofday(&h->tv, NULL);
+	h->func = func;
+	h->line = line;
+}
+
+/* Copy at most UNVMED_LOG_BDF_LEN-1 bytes and always NUL-terminate. */
+static inline void unvmed_log_rec_set_bdf(char *dst, const char *bdf)
+{
+	if (!bdf) {
+		dst[0] = '\0';
+		return;
+	}
+	strncpy(dst, bdf, UNVMED_LOG_BDF_LEN - 1);
+	dst[UNVMED_LOG_BDF_LEN - 1] = '\0';
 }
 
 /* Per-thread scratch buffer for command-description helpers.
@@ -283,58 +368,179 @@ static const char *unvmed_log_admin_cmd(union nvme_cmd *sqe)
 }
 
 /*
- * These two run on every submitted command and every completion, so the guard
- * below decides whether an fio run pays ~0.5us per I/O for string formatting
- * it may then throw away.
+ * ---------------------------------------------------------------------------
+ * Render side — runs on the logger thread, never on an I/O thread.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Common "LEVEL | datetime | func: line: " prefix, from the record's own
+ * timestamp so lines carry the time of the event, not of the rendering. */
+static uint32_t unvmed_log_rec_prefix(const struct unvmed_log_rec_hdr *h,
+				      char *out, uint32_t outsz)
+{
+	char datetime[32];
+	int  n;
+
+	unvme_datetime_tv(&h->tv, datetime, sizeof(datetime));
+	n = snprintf(out, outsz, "DEBUG   | %s | %s: %u: ",
+		     datetime, h->func ? h->func : "?", h->line);
+
+	if (n < 0)
+		return 0;
+	return (n >= (int)outsz) ? outsz - 1 : (uint32_t)n;
+}
+
+static uint32_t unvmed_log_render_cqe(const char *tag, const char *bdf,
+				      const struct nvme_cqe *cqe,
+				      char *out, uint32_t outsz)
+{
+	uint16_t sfp = le16_to_cpu(cqe->sfp);
+	int n;
+
+	if (bdf && bdf[0])
+		n = snprintf(out, outsz, "%s: %s: cqe (qid=%d, cid=%d, ",
+			     tag, bdf, cqe->sqid, cqe->cid);
+	else
+		n = snprintf(out, outsz, "cqe (qid=%d, cid=%d, ",
+			     cqe->sqid, cqe->cid);
+	if (n < 0 || (uint32_t)n >= outsz)
+		return 0;
+
+	int m = snprintf(out + n, outsz - (uint32_t)n,
+			 "dw0=0x%x, dw1=0x%x, head=%d, phase=%d, sct=0x%x, "
+			 "sc=0x%x, crd=0x%x, more=%d, dnr=%d)\n",
+			 le32_to_cpu(cqe->dw0), le32_to_cpu(cqe->dw1),
+			 le16_to_cpu(cqe->sqhd), sfp & 0x1,
+			 (sfp >> 9) & 0x7, (sfp >> 1) & 0xFF,
+			 (sfp >> 12) & 0xFF, (sfp >> 14) & 0x1,
+			 (sfp >> 15) & 0x1);
+	if (m < 0)
+		return 0;
+	return (uint32_t)n + (((uint32_t)m >= outsz - (uint32_t)n)
+			      ? outsz - (uint32_t)n - 1 : (uint32_t)m);
+}
+
+static uint32_t unvmed_log_render_post(const struct unvmed_log_rec_post *p,
+				       char *out, uint32_t outsz)
+{
+	const union nvme_cmd *sqe = &p->sqe;
+	bool admin = !p->sqid;
+	int psdt = (sqe->flags >> 6) & 0x3;
+	const char *psdt_type;
+	uint64_t dptr0 = 0, dptr1 = 0;
+	const char *str;
+	int n;
+
+	switch (psdt) {
+	case 0:
+		psdt_type = "prp";
+		dptr0 = le64_to_cpu(sqe->dptr.prp1);
+		dptr1 = le64_to_cpu(sqe->dptr.prp2);
+		break;
+	case 1:
+	case 2:
+		psdt_type = "sgl";
+		dptr0 = le64_to_cpu(sqe->dptr.sgl.addr);
+		dptr1 = le32_to_cpu(sqe->dptr.sgl.len);
+		break;
+	default:
+		psdt_type = "reserved";
+	}
+
+	str = admin ? unvmed_log_admin_cmd((union nvme_cmd *)sqe)
+		    : unvmed_log_io_cmd((union nvme_cmd *)sqe);
+
+	n = snprintf(out, outsz,
+		     "unvmed_cmd_post: %s: sqe (qid=%d, cid=%d, nsid=%d, "
+		     "fuse=0x%x, psdt=%d(%s), mptr=0x%lx, "
+		     "dptr0=0x%lx, dptr1=0x%lx, cmd=(%s))\n",
+		     p->bdf, p->sqid, sqe->cid, le32_to_cpu(sqe->nsid),
+		     sqe->flags & 0x3, psdt, psdt_type,
+		     le64_to_cpu(sqe->mptr), dptr0, dptr1, str);
+	if (n < 0)
+		return 0;
+	return ((uint32_t)n >= outsz) ? outsz - 1 : (uint32_t)n;
+}
+
+/*
+ * Ring formatter callback.  Returns bytes written; 0 drops the record.
+ * Every path leaves the line newline-terminated.
+ */
+static uint32_t unvmed_log_format(uint8_t type, const void *rec, uint32_t len,
+				  char *out, uint32_t outsz)
+{
+	const struct unvmed_log_rec_hdr *hdr = rec;
+	uint32_t n;
+
+	if (len < sizeof(*hdr) || outsz < 64)
+		return 0;
+
+	n = unvmed_log_rec_prefix(hdr, out, outsz);
+	if (!n)
+		return 0;
+
+	switch (type) {
+	case UNVMED_LOG_REC_CMD_POST:
+		if (len < sizeof(struct unvmed_log_rec_post))
+			return 0;
+		n += unvmed_log_render_post(rec, out + n, outsz - n);
+		break;
+	case UNVMED_LOG_REC_CMD_CMPL:
+	case UNVMED_LOG_REC_VCQ_PUSH:
+	case UNVMED_LOG_REC_VCQ_POP: {
+		const struct unvmed_log_rec_cqe *c = rec;
+
+		if (len < sizeof(*c))
+			return 0;
+		n += unvmed_log_render_cqe(
+			type == UNVMED_LOG_REC_CMD_CMPL ? "unvmed_cmd_cmpl"
+							: NULL,
+			c->bdf, &c->cqe, out + n, outsz - n);
+		break;
+	}
+	default:
+		return 0;
+	}
+
+	/* Guarantee termination even if a renderer truncated. */
+	if (out[n - 1] != '\n') {
+		if (n >= outsz)
+			n = outsz - 1;
+		out[n++] = '\n';
+	}
+	return n;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Capture side — runs on the I/O thread.  No formatting happens here.
+ * ---------------------------------------------------------------------------
  *
- * It must be #ifdef, not #ifndef.  unvmed_log_debug() is compiled out unless
- * UNVME_DEBUG is set, so the two build modes need opposite things, and the
- * inverted test got both of them wrong: a release build formatted every
- * command and emitted nothing, while a debug build formatted every command
- * even at ERROR level because the guard had been preprocessed away.
+ * The #ifdef (not #ifndef) matters: unvmed_log_debug() and these records only
+ * exist when UNVME_DEBUG is set, so the two build modes need opposite things.
+ * The inverted test got both wrong — a release build captured every command
+ * and emitted nothing, and a debug build captured every command even at ERROR
+ * level because the guard had been preprocessed away.
  */
 void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe)
 {
 #ifndef UNVME_DEBUG
-	/* No debug output exists in this build — do not format anything. */
 	(void)bdf;
 	(void)sqid;
 	(void)sqe;
 #else
-	bool admin = (!sqid) ? true : false;
-	int psdt = (sqe->flags >> 6) & 0x3;
-	const char *psdt_type;
-	uint64_t dptr0 = 0;
-	uint64_t dptr1 = 0;
-	const char *str;
+	struct unvmed_log_rec_post rec;
 
 	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
 		return;
 
-	switch(psdt) {
-		case 0:
-			psdt_type = "prp";
-			dptr0 = le64_to_cpu(sqe->dptr.prp1);
-			dptr1 = le64_to_cpu(sqe->dptr.prp2);
-			break;
-		case 1:
-		case 2:
-			psdt_type = "sgl";
-			dptr0 = le64_to_cpu(sqe->dptr.sgl.addr);
-			dptr1 = le32_to_cpu(sqe->dptr.sgl.len);
-			break;
-		default:
-			psdt_type = "reserved";
-	}
+	unvmed_log_rec_hdr_init(&rec.hdr, __func__, __LINE__);
+	unvmed_log_rec_set_bdf(rec.bdf, bdf);
+	rec.sqid = sqid;
+	rec.sqe  = *sqe;
 
-	str = (admin) ? unvmed_log_admin_cmd(sqe) : unvmed_log_io_cmd(sqe);
-
-	unvmed_log_debug("unvmed_cmd_post: %s: sqe (qid=%d, cid=%d, nsid=%d, "
-		 "fuse=0x%x, psdt=%d(%s), mptr=0x%lx, "
-		 "dptr0=0x%lx, dptr1=0x%lx, cmd=(%s))",
-		 bdf, sqid, sqe->cid, le32_to_cpu(sqe->nsid),
-		 sqe->flags & 0x3, psdt, psdt_type, le64_to_cpu(sqe->mptr),
-		 dptr0, dptr1, str);
+	unvmed_log_ring_push(&__log_ring, UNVMED_LOG_REC_CMD_POST,
+			     &rec, sizeof(rec));
 #endif /* UNVME_DEBUG */
 }
 
@@ -344,44 +550,54 @@ void unvmed_log_cmd_cmpl(const char *bdf, struct nvme_cqe *cqe)
 	(void)bdf;
 	(void)cqe;
 #else
-	uint16_t sfp;
+	struct unvmed_log_rec_cqe rec;
 
 	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
 		return;
 
-	sfp = le16_to_cpu(cqe->sfp);
+	unvmed_log_rec_hdr_init(&rec.hdr, __func__, __LINE__);
+	unvmed_log_rec_set_bdf(rec.bdf, bdf);
+	rec.cqe = *cqe;
 
-	unvmed_log_debug("unvmed_cmd_cmpl: %s: cqe (qid=%d, cid=%d, "
-		 "dw0=0x%x, dw1=0x%x, head=%d, phase=%d, sct=0x%x, sc=0x%x, "
-		 "crd=0x%x, more=%d, dnr=%d)",
-		 bdf, cqe->sqid, cqe->cid,
-		 le32_to_cpu(cqe->dw0), le32_to_cpu(cqe->dw1),
-		 le16_to_cpu(cqe->sqhd), sfp & 0x1,
-		 (sfp >> 9) & 0x7, (sfp >> 1) & 0xFF,
-		 (sfp >> 12) & 0xFF, (sfp >> 14) & 0x1, (sfp >> 15) & 0x1);
+	unvmed_log_ring_push(&__log_ring, UNVMED_LOG_REC_CMD_CMPL,
+			     &rec, sizeof(rec));
 #endif /* UNVME_DEBUG */
 }
 
 void unvmed_log_cmd_vcq_push(struct nvme_cqe *cqe)
 {
-	uint16_t sfp = le16_to_cpu(cqe->sfp);
+#ifndef UNVME_DEBUG
+	(void)cqe;
+#else
+	struct unvmed_log_rec_cqe rec;
 
-	unvmed_log_debug("cqe (qid=%d, cid=%d, dw0=0x%x, dw1=0x%x, head=%d, "
-		 "phase=%d, sct=0x%x, sc=0x%x, crd=0x%x, more=%d, dnr=%d)",
-		 cqe->sqid, cqe->cid, le32_to_cpu(cqe->dw0),
-		 le32_to_cpu(cqe->dw1), le16_to_cpu(cqe->sqhd), sfp & 0x1,
-		 (sfp >> 9) & 0x7, (sfp >> 1) & 0xFF,
-		 (sfp >> 12) & 0xFF, (sfp >> 14) & 0x1, (sfp >> 15) & 0x1);
+	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
+		return;
+
+	unvmed_log_rec_hdr_init(&rec.hdr, __func__, __LINE__);
+	rec.bdf[0] = '\0';
+	rec.cqe = *cqe;
+
+	unvmed_log_ring_push(&__log_ring, UNVMED_LOG_REC_VCQ_PUSH,
+			     &rec, sizeof(rec));
+#endif /* UNVME_DEBUG */
 }
 
 void unvmed_log_cmd_vcq_pop(struct nvme_cqe *cqe)
 {
-	uint16_t sfp = le16_to_cpu(cqe->sfp);
+#ifndef UNVME_DEBUG
+	(void)cqe;
+#else
+	struct unvmed_log_rec_cqe rec;
 
-	unvmed_log_debug("cqe (qid=%d, cid=%d, dw0=0x%x, dw1=0x%x, head=%d, "
-		 "phase=%d, sct=0x%x, sc=0x%x, crd=0x%x, more=%d, dnr=%d)",
-		 cqe->sqid, cqe->cid, le32_to_cpu(cqe->dw0),
-		 le32_to_cpu(cqe->dw1), le16_to_cpu(cqe->sqhd), sfp & 0x1,
-		 (sfp >> 9) & 0x7, (sfp >> 1) & 0xFF,
-		 (sfp >> 12) & 0xFF, (sfp >> 14) & 0x1, (sfp >> 15) & 0x1);
+	if (!unvmed_static_branch_unlikely(&unvmed_log_key_debug))
+		return;
+
+	unvmed_log_rec_hdr_init(&rec.hdr, __func__, __LINE__);
+	rec.bdf[0] = '\0';
+	rec.cqe = *cqe;
+
+	unvmed_log_ring_push(&__log_ring, UNVMED_LOG_REC_VCQ_POP,
+			     &rec, sizeof(rec));
+#endif /* UNVME_DEBUG */
 }

@@ -5,6 +5,7 @@
 
 #include <stdatomic.h>
 #include "libunvmed-jump-label.h"
+#include "libunvmed-log-ring.h"
 
 extern int __unvmed_logfd;
 extern _Atomic int __log_level;
@@ -90,6 +91,9 @@ void unvmed_log_set_level(int level);
 /*
  * libunvmed-logs.c
  */
+/* Renderer for the binary per-I/O records; pass to unvmed_log_ring_init(). */
+unvmed_log_format_fn unvmed_log_formatter(void);
+
 void unvmed_log_cmd_post(const char *bdf, uint32_t sqid, union nvme_cmd *sqe);
 void unvmed_log_cmd_cmpl(const char *bdf, struct nvme_cqe *cqe);
 void unvmed_log_cmd_vcq_push(struct nvme_cqe *cqe);

@@ -33,10 +33,35 @@
 
 #define UNVMED_LOG_RING_SLOTS  (1u << 13)   /* 8 192 — must be power of 2 */
 #define UNVMED_LOG_MSG_SIZE    256
+/* Upper bound on one rendered log line (a formatted record is longer than
+ * the record itself). */
+#define UNVMED_LOG_LINE_MAX    512
+
+/*
+ * Slot payload kinds.
+ *
+ * TEXT is a line that the caller already rendered.  Every other kind is a
+ * binary record: the caller stores raw fields and the logger thread renders
+ * them, keeping vsnprintf off the hot path entirely — the same split the
+ * kernel's tracepoints use between writing an event and reading a trace.
+ *
+ * Values above UNVMED_LOG_REC_TEXT are opaque to the ring; it just hands
+ * them to the formatter supplied at init.
+ */
+#define UNVMED_LOG_REC_TEXT    0
+
+/*
+ * Render a binary record into @out.  Called on the logger thread only.
+ * Returns the number of bytes written (0 to drop the record).
+ */
+typedef uint32_t (*unvmed_log_format_fn)(uint8_t type, const void *rec,
+					 uint32_t len, char *out,
+					 uint32_t outsz);
 
 struct unvmed_log_slot {
 	_Atomic uint64_t seq;
 	uint32_t         len;
+	uint8_t          type;
 	char             msg[UNVMED_LOG_MSG_SIZE];
 };
 
@@ -78,13 +103,16 @@ struct unvmed_log_ring {
 	pthread_cond_t          cond;
 	_Atomic bool            running;
 	int                     fd;
+	unvmed_log_format_fn    format;
 
 	_Atomic uint64_t        n_dropped;
 };
 
-int  unvmed_log_ring_init(struct unvmed_log_ring *r, int fd);
-void unvmed_log_ring_push(struct unvmed_log_ring *r,
-			  const char *msg, uint32_t len);
+/* @format may be NULL if only UNVMED_LOG_REC_TEXT is ever pushed. */
+int  unvmed_log_ring_init(struct unvmed_log_ring *r, int fd,
+			  unvmed_log_format_fn format);
+void unvmed_log_ring_push(struct unvmed_log_ring *r, uint8_t type,
+			  const void *rec, uint32_t len);
 void unvmed_log_ring_stop(struct unvmed_log_ring *r);
 
 extern struct unvmed_log_ring __log_ring;

@@ -327,7 +327,8 @@ void unvmed_init(const char *logfile, int log_level)
 				logfile);
 		} else {
 			__unvmed_logfd = fd;
-			if (unvmed_log_ring_init(&__log_ring, fd) != 0) {
+			if (unvmed_log_ring_init(&__log_ring, fd,
+						 unvmed_log_formatter()) != 0) {
 				fprintf(stderr,
 					"unvmed_init: failed to start log thread\n");
 				close(fd);
