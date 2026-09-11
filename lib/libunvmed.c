@@ -29,7 +29,9 @@
 #include "libunvmed-log-ring.h"
 #include "libunvmed-private.h"
 
-int __unvmed_logfd = 0;
+/* -1, not 0: a 0 default would alias stdin and make any stray write to the
+ * log fd corrupt the process's standard input. */
+int __unvmed_logfd = -1;
 _Atomic int __log_level = 0;
 
 static void *unvmed_reaper_run(void *opaque);
@@ -294,13 +296,29 @@ static int unvmed_create_logfile(const char *logfile)
 	return fd;
 }
 
+/*
+ * Serialise unvmed_init() so concurrent callers cannot both run the body.
+ *
+ * A plain `static bool` guard is not enough: two threads can both read it as
+ * false before either writes true, and would then each call
+ * unvmed_log_ring_init() on the same __log_ring — issuing atomic_init() on
+ * live atomics while the first logger thread is already running (C11 UB) and
+ * leaving two logger threads writing to the same fd.
+ *
+ * The mutex also makes a late caller *wait* for initialization to finish
+ * rather than returning while the ring is still half-built.
+ */
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_initialized = false;
+
 void unvmed_init(const char *logfile, int log_level)
 {
-	static bool initialized = false;
+	pthread_mutex_lock(&g_init_lock);
 
-	if (initialized)
+	if (g_initialized) {
+		pthread_mutex_unlock(&g_init_lock);
 		return;
-	initialized = true;
+	}
 
 	if (logfile) {
 		int fd = unvmed_create_logfile(logfile);
@@ -323,6 +341,9 @@ void unvmed_init(const char *logfile, int log_level)
 	unvmed_log_set_level(log_level);
 
 	unvmed_vcq_pool_init();
+
+	g_initialized = true;
+	pthread_mutex_unlock(&g_init_lock);
 }
 
 void unvmed_fini(void)

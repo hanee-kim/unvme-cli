@@ -58,6 +58,20 @@ struct unvmed_log_ring {
 
 	struct unvmed_log_slot          slots[UNVMED_LOG_RING_SLOTS];
 
+	/*
+	 * In-flight producers: incremented on entry to push() and decremented
+	 * once the slot has been published.  unvmed_log_ring_stop() clears
+	 * @running and then waits for this to reach zero, so a producer that
+	 * passed the @running check can never publish a message after the
+	 * logger thread's final drain has already run.
+	 *
+	 * Producers only touch this on the (already cold) logging path, and it
+	 * lives on its own cache line so the RMW does not bounce the line that
+	 * carries @write_pos.
+	 */
+	_Alignas(64) _Atomic uint32_t   n_producers;
+	char                            _np_pad[64 - sizeof(_Atomic uint32_t)];
+
 	/* Logger thread */
 	pthread_t               thread;
 	pthread_mutex_t         lock;

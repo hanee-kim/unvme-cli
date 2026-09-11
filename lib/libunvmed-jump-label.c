@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -7,20 +8,26 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <linux/membarrier.h>
+#endif
+
 #include "libunvmed-jump-label.h"
 
 /*
- * Jump table entry — three PC-relative fields, each stored as a signed
- * offset from itself to its referent.  This layout is ASLR/PIE-safe:
- * the referent address is simply &field + field.
+ * Jump table entry — two PC-relative fields, each stored as a signed offset
+ * from itself to its referent.  This layout is ASLR/PIE-safe: the referent
+ * address is simply &field + field.
  *
- *   code   (int32_t): &NOP_instruction - &entry->code
- *   target (int32_t): &l_yes_label     - &entry->target
- *   key    (int64_t): &key_variable    - &entry->key
+ *   code (int64_t): &branch_site  - &entry->code
+ *   key  (int64_t): &key_variable - &entry->key
+ *
+ * The branch target is not recorded: the rel32 displacement is baked into
+ * the site by the assembler and never rewritten at runtime.
  */
 struct __unvmed_jump_entry {
-	int32_t code;
-	int32_t target;
+	int64_t code;
 	int64_t key;
 };
 
@@ -35,8 +42,13 @@ extern struct __unvmed_jump_entry __stop___unvme_jump_table[];
 
 #ifdef __x86_64__
 
-/* 5-byte Intel multi-byte NOP */
-static const uint8_t k_nop5[5] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
+/*
+ * The two interchangeable opcodes for the 5-byte branch site.  Both consume
+ * the same 4-byte displacement that follows, so swapping one for the other
+ * never changes the instruction length.
+ */
+#define OP_JMP_REL32	0xe9	/* JMP rel32     — key enabled  */
+#define OP_TEST_EAX	0xa9	/* TEST EAX,imm32 — key disabled */
 
 /*
  * Serialise concurrent calls to unvmed_static_key_enable/disable.
@@ -44,38 +56,78 @@ static const uint8_t k_nop5[5] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
  */
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * patch_site — overwrite the first 5 bytes of an 8-byte aligned site.
- *
- * Uses /proc/self/mem so the write never removes EXEC permission from the
- * page (avoids SIGSEGV on other threads executing the same page — S1-1).
- * pwrite handles cross-page sites transparently (S1-2).
- *
- * Atomicity across CPUs (S1-3): we read the existing 8-byte word, splice
- * in the new 5 bytes, and write back with a single 8-byte atomic store.
- * The site is 8-byte aligned (enforced by .balign 8 in the macro), so
- * x86-64 guarantees the store is atomic from the bus's perspective.
- * An MFENCE after the store pushes the write out of the store buffer.
- * Other CPUs see either the old or new 8 bytes — never a torn value.
- *
- * Note: a fully correct cross-core serialization would require an IPI to
- * all other CPUs (as Linux text_poke does), but log-level changes are
- * infrequent enough that the remaining window is acceptable.
- */
-static void patch_site(int mem_fd, uint8_t *site, const uint8_t patch[5])
+#ifdef __linux__
+static int sys_membarrier(int cmd)
 {
-	uint64_t word;
+	return (int)syscall(__NR_membarrier, cmd, 0, 0);
+}
 
-	/* Read current 8 bytes (site is 8-byte aligned). */
-	memcpy(&word, site, 8);
-	/* Splice the new 5-byte instruction into the low bytes. */
-	memcpy(&word, patch, 5);
+/*
+ * sync_cores — force every other thread of this process through a core
+ * serializing instruction, so none of them keeps executing a stale copy of
+ * a branch site we just rewrote.
+ *
+ * This is the userspace counterpart of the IPI that the kernel's text_poke()
+ * issues: MFENCE alone only drains *this* CPU's store buffer and says nothing
+ * about instruction fetch on other cores.
+ *
+ * Correctness does not depend on this — the single-byte patch is safe on its
+ * own (see patch_site).  It bounds *latency*: without it a core could keep
+ * running the previous encoding until it happens to serialize for some other
+ * reason.  Best effort accordingly: the SYNC_CORE command needs a one-time
+ * registration and is missing on older kernels, where we settle for making
+ * the store globally visible.
+ */
+static void sync_cores(void)
+{
+	static _Atomic int state;   /* 0 = unknown, 1 = usable, -1 = unsupported */
+	int st = atomic_load_explicit(&state, memory_order_acquire);
 
-	/* Write via /proc/self/mem — kernel handles page permissions. */
-	if (pwrite(mem_fd, &word, 8, (off_t)(uintptr_t)site) != 8)
+	if (st == 0) {
+		st = sys_membarrier(
+			MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE)
+			? -1 : 1;
+		atomic_store_explicit(&state, st, memory_order_release);
+	}
+
+	if (st == 1 &&
+	    !sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE))
 		return;
 
+	/* Fallback: at least make the store globally visible. */
 	__asm__ volatile("mfence" ::: "memory");
+}
+#else
+static void sync_cores(void)
+{
+	__asm__ volatile("mfence" ::: "memory");
+}
+#endif
+
+/*
+ * patch_site — flip the opcode byte of a 5-byte branch site.
+ *
+ * Exactly one byte is written.  The four displacement bytes that follow are
+ * assembler-generated and never change, so a core fetching the site
+ * concurrently always decodes a complete, valid, 5-byte instruction — either
+ * the old one or the new one.  That is what makes this safe without stopping
+ * the world: the danger in cross-modifying code is a torn *instruction*, and
+ * a single-byte store cannot tear.
+ *
+ * The write goes through /proc/self/mem so it never has to mprotect the page
+ * writable — which would momentarily drop EXEC and fault any thread running
+ * there — and so a site spanning a page boundary is handled by the kernel.
+ *
+ * The site is never read back: that would be a plain load from memory other
+ * threads are executing, a data race with no defined behaviour, and the byte
+ * we would learn is one we already know.
+ */
+static void patch_site(int mem_fd, uint8_t *site, uint8_t opcode)
+{
+	/* Nothing useful to do on failure: the site keeps its previous
+	 * encoding, so the branch stays in its old state rather than
+	 * becoming invalid. */
+	(void)!pwrite(mem_fd, &opcode, 1, (off_t)(uintptr_t)site);
 }
 
 static void update_key(unvmed_static_key_t *key, bool enable)
@@ -102,26 +154,18 @@ static void update_key(unvmed_static_key_t *key, bool enable)
 		if (k != key)
 			continue;
 
-		uint8_t *nop = (uint8_t *)((char *)&e->code + e->code);
-
-		if (enable) {
-			/*
-			 * Build JMP rel32: opcode 0xe9 + signed 32-bit offset.
-			 * The offset is from the next instruction (nop + 5) to
-			 * the taken-branch target.
-			 */
-			uint8_t *tgt = (uint8_t *)((char *)&e->target + e->target);
-			int32_t rel  = (int32_t)(tgt - (nop + 5));
-			uint8_t jmp[5];
-			jmp[0] = 0xe9;
-			memcpy(&jmp[1], &rel, 4);
-			patch_site(mem_fd, nop, jmp);
-		} else {
-			patch_site(mem_fd, nop, k_nop5);
-		}
+		patch_site(mem_fd, (uint8_t *)((char *)&e->code + e->code),
+			   enable ? OP_JMP_REL32 : OP_TEST_EAX);
 	}
 
 	close(mem_fd);
+
+	/*
+	 * All sites for this key are now rewritten; serialize the other cores
+	 * once, rather than per-site, so none of them keeps executing a stale
+	 * instruction.
+	 */
+	sync_cores();
 unlock:
 	pthread_mutex_unlock(&g_patch_mutex);
 }

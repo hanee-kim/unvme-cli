@@ -28,7 +28,9 @@ DEFINE_STATIC_KEY_FALSE(unvmed_log_key_debug);
  */
 void unvmed_log_set_level(int level)
 {
-	atomic_store_explicit(&__log_level, level, memory_order_relaxed);
+	/* release, not relaxed: pairs with readers so a thread that observes
+	 * the newly patched static key cannot still read a stale level. */
+	atomic_store_explicit(&__log_level, level, memory_order_release);
 
 	if (level >= UNVME_LOG_INFO)
 		unvmed_static_key_enable(&unvmed_log_key_info);

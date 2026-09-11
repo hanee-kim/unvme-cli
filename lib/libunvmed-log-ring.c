@@ -87,7 +87,34 @@ static void *logger_thread(void *arg)
 		pthread_mutex_unlock(&r->lock);
 	}
 
-	/* Final drain — flush whatever producers published before stop */
+	/*
+	 * Shutdown drain.
+	 *
+	 * Clearing @running does not mean the ring is quiet: a producer that
+	 * had already passed the @running check may still be between claiming
+	 * its slot and publishing it.  Draining once and exiting here would
+	 * lose every such message — and, worse, lose everything queued behind
+	 * it, because a claimed-but-unpublished slot is a hole that stops
+	 * ring_pop() dead and strands the entire rest of the ring.
+	 *
+	 * So keep draining until the in-flight producer count reaches zero.
+	 * At that point no claims are outstanding, so no holes remain, and the
+	 * final pass below is guaranteed to reach the end of the ring.
+	 *
+	 * Bounded (~seconds) so a wedged or SIGSTOPped producer cannot hang
+	 * shutdown forever.
+	 */
+	for (int i = 0; i < 100000; i++) {
+		while (ring_pop(r, buf, &len))
+			write_all(r->fd, buf, len);
+
+		if (!atomic_load_explicit(&r->n_producers, memory_order_seq_cst))
+			break;
+
+		usleep(1);
+	}
+
+	/* Producers have quiesced — drain what they published on the way out. */
 	while (ring_pop(r, buf, &len))
 		write_all(r->fd, buf, len);
 
@@ -106,6 +133,7 @@ int unvmed_log_ring_init(struct unvmed_log_ring *r, int fd)
 
 	atomic_init(&r->write_pos, 0);
 	atomic_init(&r->n_dropped, 0);
+	atomic_init(&r->n_producers, 0);
 	atomic_init(&r->running,   true);
 	r->read_pos = 0;
 	r->fd       = fd;
@@ -138,9 +166,28 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r,
 	uint64_t pos, seq;
 	int64_t  dif;
 
-	/* Bail out early if the ring has been stopped. */
-	if (!atomic_load_explicit(&r->running, memory_order_acquire))
+	/*
+	 * Announce ourselves as an in-flight producer *before* testing
+	 * @running, and test @running with seq_cst.
+	 *
+	 * This is the store-load (Dekker) half of the shutdown handshake:
+	 * unvmed_log_ring_stop() stores running=false, and the logger thread
+	 * then waits for n_producers to fall to zero before its final drain,
+	 * both seq_cst.  Sequential consistency is required — plain
+	 * acquire/release permits the store and the load to be reordered on
+	 * both sides, which would let each miss the other and resurrect the
+	 * lost-message race this handshake exists to close.
+	 *
+	 * The guarantee: if this thread goes on to claim a slot, the logger
+	 * thread cannot finish draining until we have published it.
+	 */
+	atomic_fetch_add_explicit(&r->n_producers, 1, memory_order_seq_cst);
+
+	if (!atomic_load_explicit(&r->running, memory_order_seq_cst)) {
+		atomic_fetch_sub_explicit(&r->n_producers, 1,
+					  memory_order_release);
 		return;
+	}
 
 	pos = atomic_load_explicit(&r->write_pos, memory_order_relaxed);
 
@@ -162,6 +209,8 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r,
 			/* Ring full — drop without advancing write_pos. */
 			atomic_fetch_add_explicit(&r->n_dropped, 1,
 						  memory_order_relaxed);
+			atomic_fetch_sub_explicit(&r->n_producers, 1,
+						  memory_order_release);
 			return;
 		} else {
 			/* Another producer is ahead; re-read write_pos. */
@@ -170,12 +219,25 @@ void unvmed_log_ring_push(struct unvmed_log_ring *r,
 		}
 	}
 
-	uint32_t n = (len < UNVMED_LOG_MSG_SIZE) ? len : UNVMED_LOG_MSG_SIZE - 1;
+	/*
+	 * The consumer writes exactly @len bytes and never treats the payload
+	 * as a C string, so the full slot is usable — clamping to
+	 * UNVMED_LOG_MSG_SIZE - 1 would silently shear the trailing newline
+	 * off a message that exactly fills the slot.
+	 */
+	uint32_t n = (len < UNVMED_LOG_MSG_SIZE) ? len : UNVMED_LOG_MSG_SIZE;
 	memcpy(slot->msg, msg, n);
 	slot->len = n;
 
 	/* Publish to consumer */
 	atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
+
+	/*
+	 * Release our in-flight reference only after publishing.  Until this
+	 * point unvmed_log_ring_stop() will keep waiting, guaranteeing the
+	 * logger thread's final drain runs after this message is visible.
+	 */
+	atomic_fetch_sub_explicit(&r->n_producers, 1, memory_order_release);
 
 	/*
 	 * Signal the logger thread.  trylock avoids ever blocking the hot
@@ -192,10 +254,27 @@ void unvmed_log_ring_stop(struct unvmed_log_ring *r)
 {
 	bool was_running;
 
-	/* Idempotent: do nothing if already stopped. */
+	/*
+	 * Idempotent: do nothing if already stopped.
+	 *
+	 * seq_cst (not acq_rel): this store is the other half of the shutdown
+	 * handshake described in push(), pairing with push()'s seq_cst load of
+	 * @running.  The matching wait on @n_producers lives in the logger
+	 * thread, which is the side that actually drains; pthread_join() below
+	 * therefore already waits for it.
+	 */
 	was_running = atomic_exchange_explicit(&r->running, false,
-					       memory_order_acq_rel);
+					       memory_order_seq_cst);
 	if (!was_running)
+		return;
+
+	/*
+	 * Cannot join ourselves.  Reachable only if the logger thread itself
+	 * ends up here (e.g. an exit(3) from inside write_all()'s call stack);
+	 * @running is already cleared, so the thread will drain and unwind on
+	 * its own.  Joining would deadlock (EDEADLK at best).
+	 */
+	if (pthread_equal(pthread_self(), r->thread))
 		return;
 
 	/*
@@ -220,7 +299,9 @@ void unvmed_log_ring_stop(struct unvmed_log_ring *r)
 		int  dlen = snprintf(dmsg, sizeof(dmsg),
 				     "log: %llu message(s) dropped (ring full)\n",
 				     (unsigned long long)dropped);
-		if (dlen > 0 && (uint32_t)dlen < sizeof(dmsg))
+		/* (size_t), not (uint32_t): the comparison must stay in the
+		 * same type as sizeof so a truncating snprintf is detected. */
+		if (dlen > 0 && (size_t)dlen < sizeof(dmsg))
 			write_all(r->fd, dmsg, (uint32_t)dlen);
 	}
 

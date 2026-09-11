@@ -9,14 +9,29 @@
  * Userspace static branch (jump label), mirroring the Linux kernel's
  * jump_label infrastructure.
  *
- * Key disabled  →  branch site holds a 5-byte NOP followed by a 3-byte NOP
- *                  (8 bytes total, 8-byte aligned).  The CPU executes the
- *                  NOPs and falls through.  Zero compare, zero prediction.
+ * The branch site always holds a 5-byte instruction whose 4-byte tail is the
+ * rel32 displacement to the taken-branch target, baked in by the assembler.
+ * Only the opcode byte is ever rewritten:
  *
- * Key enabled   →  the 5-byte NOP is patched to a 5-byte JMP rel32 via an
- *                  8-byte atomic store (the trailing 3 NOP bytes are
- *                  unchanged dead code).  The CPU always takes the jump —
- *                  no misprediction, still no compare instruction.
+ *   Key disabled  →  A9 id  =  TEST EAX, imm32
+ *                    Five bytes, no branch, no memory access; the immediate
+ *                    is the (ignored) displacement.  Falls through.
+ *
+ *   Key enabled   →  E9 id  =  JMP rel32
+ *                    Same five bytes, now taken.  No compare, no
+ *                    misprediction.
+ *
+ * Why a one-byte patch rather than swapping a 5-byte NOP for a 5-byte JMP:
+ * rewriting several bytes of a live instruction is cross-modifying code.  A
+ * core that is fetching the site concurrently may pair the new opcode with
+ * the stale displacement still in its prefetch buffer and branch to a wild
+ * address — an aligned 8-byte store does not prevent this, because the
+ * hazard is in instruction fetch, not in store atomicity.  Rewriting a
+ * single byte removes the hazard by construction: both encodings are exactly
+ * five bytes and both are valid, so any core observes either the whole old
+ * instruction or the whole new one.
+ *
+ * TEST writes EFLAGS, hence the "cc" clobber below.
  *
  * Patching is done by unvmed_static_key_enable/disable at level-change
  * time (rare), not on every log call (hot path).
@@ -50,15 +65,13 @@ typedef struct {
 
 /*
  * asm goto emits (per call site):
- *   1. An 8-byte aligned block: 5-byte NOP + 3-byte NOP.
- *   2. An entry in the __unvme_jump_table ELF section recording three
- *      PC-relative offsets: to the NOP, to the taken-branch target, and
- *      to the key variable.  All offsets are relative to their own field
- *      address → ASLR/PIE safe with no runtime fixup.
- *
- * The 8-byte aligned block lets patch_site() replace the first 5 bytes
- * with a single 8-byte atomic store, preventing other CPUs from ever
- * fetching a partially-written instruction.
+ *   1. The 5-byte branch site: opcode byte + rel32 to l_yes.  The
+ *      displacement is resolved by the assembler/linker, so the runtime
+ *      never computes or writes it — and a target out of rel32 range is a
+ *      link error rather than a silently truncated jump.
+ *   2. An entry in the __unvme_jump_table ELF section holding two
+ *      PC-relative offsets: to the site and to the key.  Each offset is
+ *      relative to its own field address → ASLR/PIE safe, no runtime fixup.
  *
  * __label__ declarations must appear before any other declarations in a
  * GCC statement-expression block.
@@ -68,22 +81,18 @@ typedef struct {
 	__label__ l_yes, l_out;						\
 	bool __ret;							\
 	asm goto(							\
-		".balign 8\n\t"						\
 		"1:\n\t"						\
-		/* 5-byte NOP: 0f 1f 44 00 00 */			\
-		".byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n\t"		\
-		/* 3-byte NOP padding for 8-byte atomic store */	\
-		".byte 0x0f, 0x1f, 0x00\n\t"				\
+		/* A9 id = TEST EAX, imm32 — patched to E9 (JMP rel32) */\
+		".byte 0xa9\n\t"					\
+		".long %l[l_yes] - (1b + 5)\n\t"			\
 		".pushsection __unvme_jump_table, \"aw\"\n\t"		\
 		".balign 8\n\t"						\
-		/* &NOP - &entry.code  (int32) */			\
-		".long 1b - .\n\t"					\
-		/* &l_yes - &entry.target  (int32) */			\
-		".long %l[l_yes] - .\n\t"				\
-		/* &key - &entry.key  (int64, protected so non-preemptible) */\
+		/* &site - &entry.code */				\
+		".quad 1b - .\n\t"					\
+		/* &key - &entry.key (protected → non-preemptible) */	\
 		".quad %c0 - .\n\t"					\
 		".popsection\n\t"					\
-		: : "i" (key) : : l_yes);				\
+		: : "i" (key) : "cc" : l_yes);				\
 	__ret = false;							\
 	goto l_out;							\
 l_yes:									\
