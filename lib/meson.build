@@ -5,6 +5,7 @@ libunvmed_src = [
   'libunvmed-cmds.c',
   'libunvmed-logs.c',
   'libunvmed-jump-label.c',
+  'libunvmed-log-ring.c',
 ]
 libunvmed_hdr = [
   'libunvmed.h',
