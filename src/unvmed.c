@@ -321,9 +321,11 @@ static void unvme_release(int signum)
 	unvmed_log_info("unvmed(pid=%d) terminated (signum=%d, sigtype='%s')",
 			getpid(), signum, strsignal(signum));
 
+	/* _exit(): atexit handlers join the logger thread and take a mutex,
+	 * neither of which is safe from a signal handler. */
 	if (signum == SIGTERM)
-		exit(EXIT_SUCCESS);
-	exit(EXIT_FAILURE);
+		_exit(EXIT_SUCCESS);
+	_exit(EXIT_FAILURE);
 }
 
 static void unvme_error(int signum)
