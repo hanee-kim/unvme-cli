@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later OR MIT
 #define _GNU_SOURCE
 
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <time.h>
 #include <signal.h>
 
@@ -23,10 +26,14 @@
 #include <json-c/json.h>
 
 #include "libunvmed.h"
+#include "libunvmed-logs.h"
+#include "libunvmed-log-ring.h"
+#include "libunvmed-trace.h"
 #include "libunvmed-private.h"
 
-int __unvmed_logfd = 0;
-int __log_level = 0;
+/* -1, not 0: a 0 default would alias stdin. */
+int __unvmed_logfd = -1;
+_Atomic int __log_level = 0;
 
 static void *unvmed_reaper_run(void *opaque);
 static void __unvmed_free_ns(struct __unvme_ns *ns);
@@ -290,14 +297,95 @@ static int unvmed_create_logfile(const char *logfile)
 	return fd;
 }
 
+/*
+ * Companion trace file for @logfile: unvmed.log gets unvmed.trace beside it.
+ * Returns -1 on any failure - a missing trace file costs only the per-I/O
+ * records, so it must not stop the text log from working.
+ */
+static int unvmed_create_tracefile(const char *logfile)
+{
+	char  path[PATH_MAX];
+	size_t len = strlen(logfile);
+	struct unvme_trace_file_hdr hdr = { 0 };
+	int   fd;
+
+	if (len + sizeof(".trace") > sizeof(path))
+		return -1;
+
+	/* Swap a trailing ".log" for ".trace", else just append. */
+	if (len > 4 && !strcmp(logfile + len - 4, ".log"))
+		len -= 4;
+	memcpy(path, logfile, len);
+	memcpy(path + len, ".trace", sizeof(".trace"));
+
+	fd = creat(path, 0644);
+	if (fd < 0)
+		return -1;
+
+	memcpy(hdr.magic, UNVME_TRACE_MAGIC, sizeof(UNVME_TRACE_MAGIC));
+	hdr.version  = UNVME_TRACE_VERSION;
+	hdr.hdr_size = sizeof(hdr);
+	hdr.pid      = (uint64_t)getpid();
+
+	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
+ * A plain `static bool` guard would not do: two callers can both read it as
+ * false before either writes it, and would then each initialise the same
+ * ring.  The mutex also makes a late caller wait for initialization instead
+ * of returning while the ring is half-built.
+ */
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_initialized = false;
+
 void unvmed_init(const char *logfile, int log_level)
 {
-	if (logfile)
-		__unvmed_logfd = unvmed_create_logfile(logfile);
+	pthread_mutex_lock(&g_init_lock);
 
-	atomic_store_release(&__log_level, log_level);
+	if (g_initialized) {
+		pthread_mutex_unlock(&g_init_lock);
+		return;
+	}
+
+	if (logfile) {
+		int fd = unvmed_create_logfile(logfile);
+		if (fd < 0) {
+			fprintf(stderr, "unvmed_init: failed to open logfile '%s'\n",
+				logfile);
+		} else {
+			int tfd = unvmed_create_tracefile(logfile);
+
+			__unvmed_logfd = fd;
+			if (unvmed_log_ring_init(&__log_ring, fd, tfd) != 0) {
+				fprintf(stderr,
+					"unvmed_init: failed to start log thread\n");
+				close(fd);
+				if (tfd >= 0)
+					close(tfd);
+				__unvmed_logfd = -1;
+			} else {
+				atexit(unvmed_fini);
+			}
+		}
+	}
+
+	unvmed_log_set_level(log_level);
 
 	unvmed_vcq_pool_init();
+
+	g_initialized = true;
+	pthread_mutex_unlock(&g_init_lock);
+}
+
+void unvmed_fini(void)
+{
+	unvmed_log_ring_stop(&__log_ring);
 }
 
 int unvmed_parse_bdf(const char *input, char *bdf)

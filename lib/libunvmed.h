@@ -807,6 +807,7 @@ int unvmed_vcq_push_to_other(struct unvme *u, struct nvme_cqe *cqe);
  * Initialize libunvmed library in the current process context.
  */
 void unvmed_init(const char *logfile, int log_level);
+void unvmed_fini(void);
 
 /**
  * unvmed_parse_bdf - Parse a given input string to fully formed bdf
