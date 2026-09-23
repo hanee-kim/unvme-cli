@@ -27,6 +27,7 @@ struct unvme_msg;
 #define UNVMED_UBLK_DEF_DEPTH       64
 #define UNVMED_UBLK_DEF_POLL_US     10   /* hybrid: spin 10 μs then yield */
 #define UNVMED_UBLK_MAX_IO_SIZE     (512 * 1024)  /* bounce buf slot cap */
+#define UNVMED_UBLK_BOUNCE_ALIGN    (2 * 1024 * 1024) /* THP-friendly */
 
 #define UBLK_CTRL_DEV               "/dev/ublk-control"
 

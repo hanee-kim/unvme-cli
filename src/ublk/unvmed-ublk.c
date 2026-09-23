@@ -253,13 +253,27 @@ static int unvmed_ublk_queue_init_bounce(struct unvmed_ublk_queue *q)
 	size_t total = (size_t)s->queue_depth * q->slot_size;
 	uint64_t iova;
 
+	/*
+	 * Back the bounce buffer with transparent hugepages when possible.
+	 * It is queue_depth * slot_size (32 MiB per queue by default); with
+	 * 4 KiB pages both the kernel's copy into the slots and the device's
+	 * DMA through the IOMMU take a TLB/IOTLB miss on nearly every page.
+	 * 2 MiB alignment lets THP (and VFIO's IOMMU mapping of physically
+	 * contiguous ranges) use large pages.  If THP is disabled this is
+	 * just an aligned allocation.  Freed with unvmed_pgunmap() (free()).
+	 */
+	total = ALIGN_UP(total, UNVMED_UBLK_BOUNCE_ALIGN);
 	q->bounce_total = total;
 
-	if (unvmed_pgmap(u, &q->bounce, total) < 0) {
+	if (posix_memalign(&q->bounce, UNVMED_UBLK_BOUNCE_ALIGN, total)) {
 		unvmed_log_err("ublk q%d: failed to alloc bounce buffer (%zu B)",
 			       q->qid, total);
+		q->bounce = NULL;
 		return -1;
 	}
+	madvise(q->bounce, total, MADV_HUGEPAGE);
+	/* Fault the pages in now rather than on the first I/O. */
+	memset(q->bounce, 0, total);
 
 	/*
 	 * Map to IOMMU so libvfn can use this buffer as NVMe DMA target.
