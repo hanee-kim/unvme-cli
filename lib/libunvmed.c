@@ -4245,9 +4245,16 @@ int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
 				}
 			}
 		}
-
-		nvme_cq_update_head(ucq->q);
 	}
+
+	/*
+	 * Ring the CQ head doorbell once for the whole batch instead of once
+	 * per CQE.  Every doorbell is an uncached MMIO write to the BAR, and
+	 * all reaped entries have already been copied out above, so the
+	 * controller may safely reuse the slots from here on.
+	 */
+	if (nr)
+		nvme_cq_update_head(ucq->q);
 	unvmed_cq_exit(ucq);
 
 	if (nr) {
