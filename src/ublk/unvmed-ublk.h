@@ -150,12 +150,17 @@ struct unvmed_ublk_server {
  * to block direct I/O while the server runs.  The ublk block device is
  * made live as /dev/ublkb<N>.  Call unvmed_ublk_server_stop() to tear it down.
  *
+ * @cpus: optional CPU list ("2,3,8-11") to pin the busy-polling queue
+ * handler threads to; queue i runs on the (i % n)-th listed CPU.  NULL or
+ * empty leaves the threads unpinned.
+ *
  * Returns the server handle on success, NULL on error with errno set.
  */
 struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 						    uint32_t nsid,
 						    uint32_t queue_depth,
-						    uint32_t poll_spin_us);
+						    uint32_t poll_spin_us,
+						    const char *cpus);
 
 /*
  * Stop the server: signals handler threads, drains in-flight NVMe commands,

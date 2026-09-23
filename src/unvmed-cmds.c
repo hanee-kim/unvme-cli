@@ -4954,10 +4954,12 @@ int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
 					    "[O] Queue depth per ublk queue (default: 64)");
 	struct arg_int *spin_us  = arg_int0(NULL, "poll-spin-us", "<n>",
 					    "[O] NVMe CQ spin time in us before yield (default: 10)");
+	struct arg_str *cpus     = arg_str0("c", "cpus", "<list>",
+					    "[O] CPUs to pin queue handler threads to, e.g. 2,3,8-11 (default: unpinned)");
 	struct arg_lit *help     = arg_lit0("h", "help", "Show help message");
 	struct arg_end *end      = arg_end(UNVME_ARG_MAX_ERROR);
 
-	void *argtable[] = { dev, nsid, qdepth, spin_us, help, end };
+	void *argtable[] = { dev, nsid, qdepth, spin_us, cpus, help, end };
 
 	arg_intv(nsid)    = 1;
 	arg_intv(qdepth)  = UNVMED_UBLK_DEF_DEPTH;
@@ -4988,7 +4990,8 @@ int unvme_ublk_server(int argc, char *argv[], struct unvme_msg *msg)
 		unvmed_ublk_server_start(u,
 					 (uint32_t)arg_intv(nsid),
 					 (uint32_t)arg_intv(qdepth),
-					 (uint32_t)arg_intv(spin_us));
+					 (uint32_t)arg_intv(spin_us),
+					 arg_strv(cpus));
 	if (!server) {
 		if (errno == ENOENT)
 			unvme_pr_err("failed to start ublk server: 'ublk-drv' kernel module is not loaded.  Try 'modprobe ublk-drv'.\n");

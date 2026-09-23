@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -501,6 +502,45 @@ static int ublk_del_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 	return ublk_ctrl_cmd(ring, ctrl_fd, UBLK_U_CMD_DEL_DEV, &ctrl_cmd);
 }
 
+/*
+ * Parse a CPU list such as "2,3,8-11" into @out.  Returns the number of CPUs
+ * parsed, or -1 on a malformed list.
+ */
+static int unvmed_ublk_parse_cpus(const char *str, int *out, int max)
+{
+	const char *p = str;
+	int n = 0;
+
+	while (*p) {
+		char *end;
+		long lo, hi;
+
+		lo = strtol(p, &end, 10);
+		if (end == p || lo < 0)
+			return -1;
+		hi = lo;
+		p = end;
+		if (*p == '-') {
+			p++;
+			hi = strtol(p, &end, 10);
+			if (end == p || hi < lo)
+				return -1;
+			p = end;
+		}
+		for (long c = lo; c <= hi; c++) {
+			if (n >= max || c >= CPU_SETSIZE)
+				return -1;
+			out[n++] = (int)c;
+		}
+		if (*p == ',')
+			p++;
+		else if (*p)
+			return -1;
+	}
+
+	return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* Server start / stop                                                  */
 /* ------------------------------------------------------------------ */
@@ -508,8 +548,11 @@ static int ublk_del_dev(struct io_uring *ring, int ctrl_fd, int dev_id)
 struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 						    uint32_t nsid,
 						    uint32_t queue_depth,
-						    uint32_t poll_spin_us)
+						    uint32_t poll_spin_us,
+						    const char *cpus)
 {
+	int cpu_list[CPU_SETSIZE];
+	int nr_cpus = 0;
 	struct unvmed_ublk_server *server;
 	struct unvme_cq **io_cqs = NULL;
 	struct unvme_ns *ns;
@@ -522,6 +565,15 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 
 	unvmed_log_info("ublk: server_start: pid=%d tid=%d depth=%u nsid=%u",
 			(int)getpid(), (int)gettid(), queue_depth, nsid);
+
+	if (cpus && *cpus) {
+		nr_cpus = unvmed_ublk_parse_cpus(cpus, cpu_list, CPU_SETSIZE);
+		if (nr_cpus <= 0) {
+			unvmed_log_err("ublk: invalid cpu list '%s'", cpus);
+			errno = EINVAL;
+			return NULL;
+		}
+	}
 
 	/* Discover existing I/O CQs (skip admin CQ at qid=0). */
 	struct unvme_cq **all_cqs = NULL;
@@ -712,6 +764,25 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 				       i, strerror(ret));
 			atomic_store(&q->running, false);
 			goto err_queues;
+		}
+
+		/*
+		 * The handler busy-polls; keep it on one CPU so it neither
+		 * migrates nor lands on the CPUs issuing the block I/O.
+		 */
+		if (nr_cpus) {
+			cpu_set_t set;
+			int cpu = cpu_list[i % nr_cpus];
+
+			CPU_ZERO(&set);
+			CPU_SET(cpu, &set);
+			ret = pthread_setaffinity_np(q->thread, sizeof(set), &set);
+			if (ret)
+				unvmed_log_err("ublk q%u: failed to pin to cpu %d: %s",
+					       i, cpu, strerror(ret));
+			else
+				unvmed_log_info("ublk q%u: pinned to cpu %d",
+						i, cpu);
 		}
 	}
 
