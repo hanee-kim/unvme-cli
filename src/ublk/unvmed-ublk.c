@@ -195,10 +195,54 @@ static struct unvmed_ublk_queue *unvmed_ublk_queue_alloc(
 	q->server    = server;
 	q->qid       = qid;
 	q->slot_size = server->max_io_size;
+	q->page_size = unvmed_pagesize(server->u);
 	q->poll_spin_us = 0;
 	q->dev_fd    = -1;
 	sem_init(&q->fetch_submitted, 0, 0);
 	return q;
+}
+
+static int unvmed_ublk_queue_init_prplists(struct unvmed_ublk_queue *q)
+{
+	struct unvmed_ublk_server *s = q->server;
+	struct unvme *u = s->u;
+	size_t page = q->page_size;
+	size_t nr_entries = q->slot_size / page - 1;
+	uint64_t iova;
+
+	/* PRP1 + PRP2 as a direct pointer cover up to two pages. */
+	if (q->slot_size <= 2 * page)
+		return 0;
+
+	if (nr_entries > page / sizeof(uint64_t)) {
+		unvmed_log_err("ublk q%d: slot %zu B needs chained PRP lists",
+			       q->qid, q->slot_size);
+		return -1;
+	}
+
+	if (unvmed_pgmap(u, &q->prplists, s->queue_depth * page) < 0) {
+		unvmed_log_err("ublk q%d: failed to alloc PRP lists", q->qid);
+		return -1;
+	}
+
+	if (unvmed_map_vaddr(u, q->prplists, s->queue_depth * page, &iova, 0)) {
+		unvmed_log_err("ublk q%d: failed to IOMMU-map PRP lists", q->qid);
+		unvmed_pgunmap(q->prplists);
+		q->prplists = NULL;
+		return -1;
+	}
+	q->prplists_iova = iova;
+
+	/* Entry k of tag's list is the (k + 1)-th page of that tag's slot. */
+	for (uint32_t tag = 0; tag < s->queue_depth; tag++) {
+		uint64_t *list = (uint64_t *)((char *)q->prplists + tag * page);
+		uint64_t slot_iova = q->bounce_iova + (uint64_t)tag * q->slot_size;
+
+		for (size_t k = 0; k < nr_entries; k++)
+			list[k] = cpu_to_le64(slot_iova + (k + 1) * page);
+	}
+
+	return 0;
 }
 
 static int unvmed_ublk_queue_init_bounce(struct unvmed_ublk_queue *q)
@@ -230,6 +274,13 @@ static int unvmed_ublk_queue_init_bounce(struct unvmed_ublk_queue *q)
 
 	/* Cache base IOVA once — avoids per-I/O skiplist lookup in hot path */
 	q->bounce_iova = iova;
+
+	if (unvmed_ublk_queue_init_prplists(q)) {
+		unvmed_unmap_vaddr(u, q->bounce);
+		unvmed_pgunmap(q->bounce);
+		q->bounce = NULL;
+		return -1;
+	}
 
 	return 0;
 }
@@ -288,6 +339,11 @@ static int unvmed_ublk_queue_init(struct unvmed_ublk_queue *q, int dev_fd,
 	return 0;
 
 err_iodesc:
+	if (q->prplists) {
+		unvmed_unmap_vaddr(s->u, q->prplists);
+		unvmed_pgunmap(q->prplists);
+		q->prplists = NULL;
+	}
 	unvmed_unmap_vaddr(s->u, q->bounce);
 	unvmed_pgunmap(q->bounce);
 	q->bounce = NULL;
@@ -309,6 +365,12 @@ static void unvmed_ublk_queue_free(struct unvmed_ublk_queue *q)
 	if (q->io_descs) {
 		munmap(q->io_descs, q->io_descs_size);
 		q->io_descs = NULL;
+	}
+
+	if (q->prplists) {
+		unvmed_unmap_vaddr(q->server->u, q->prplists);
+		unvmed_pgunmap(q->prplists);
+		q->prplists = NULL;
 	}
 
 	if (q->bounce) {
@@ -507,6 +569,28 @@ struct unvmed_ublk_server *unvmed_ublk_server_start(struct unvme *u,
 		errno = EINVAL;
 		return NULL;
 	}
+
+	/*
+	 * Each ublk tag keeps at most one NVMe command in flight, so the ublk
+	 * queue depth must not exceed what the smallest SQ/CQ can hold
+	 * (qsize - 1, one slot always stays empty).  Otherwise the excess
+	 * tags just fail NVMe command allocation and complete with -EIO.
+	 */
+	for (uint32_t i = 0; i < nr_queues; i++) {
+		struct unvme_cq *ucq = io_cqs[i];
+		uint32_t max_depth = ucq->qsize - 1;
+
+		if (ucq->usq && (uint32_t)ucq->usq->qsize - 1 < max_depth)
+			max_depth = ucq->usq->qsize - 1;
+		if (queue_depth > max_depth) {
+			unvmed_log_info("ublk: clamping queue depth %u to %u "
+					"(qid %d queue size)",
+					queue_depth, max_depth, ucq->id);
+			queue_depth = max_depth;
+		}
+	}
+	if (queue_depth > UBLK_MAX_QUEUE_DEPTH)
+		queue_depth = UBLK_MAX_QUEUE_DEPTH;
 
 	/* Validate namespace. */
 	ns = unvmed_ns_get(u, nsid);

@@ -158,6 +158,7 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	}
 
 	uint16_t nlb = (uint16_t)(nr_sects / lba_ratio) - 1;
+	size_t len = (size_t)nr_sects << 9;
 	struct unvme_cmd *cmd;
 
 	if (op == UBLK_IO_OP_FLUSH ||
@@ -168,6 +169,13 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	}
 
 	if (op != UBLK_IO_OP_READ && op != UBLK_IO_OP_WRITE) {
+		submit_commit_and_fetch(q, tag, -EIO);
+		return 0;
+	}
+
+	if (len > q->slot_size) {
+		unvmed_log_err("ublk q%d tag %u: %zu B exceeds slot size %zu B",
+			       q->ucq->id, tag, len, q->slot_size);
 		submit_commit_and_fetch(q, tag, -EIO);
 		return 0;
 	}
@@ -189,11 +197,21 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 	 * Build the NVMe R/W SQE directly using the pre-cached bounce IOVA,
 	 * bypassing iommu_translate_vaddr() (skiplist + rwlock) that
 	 * unvmed_alloc_cmd(buf) and cmd_prep_read/write() would invoke on
-	 * every I/O.  4K I/O fits in a single page so prp2 is unused.
+	 * every I/O.
+	 *
+	 * The slot is page aligned and IOVA-contiguous, so PRP2 is either
+	 * unused (one page), the second page (two pages), or the tag's
+	 * pre-built PRP list (more than two pages).
 	 */
 	{
 		struct nvme_cmd_rw *sqe = (struct nvme_cmd_rw *)&cmd->sqe;
 		uint64_t iova = q->bounce_iova + (uint64_t)tag * q->slot_size;
+		uint64_t prp2 = 0;
+
+		if (len > 2 * q->page_size)
+			prp2 = q->prplists_iova + (uint64_t)tag * q->page_size;
+		else if (len > q->page_size)
+			prp2 = iova + q->page_size;
 
 		sqe->opcode = (op == UBLK_IO_OP_READ) ? 0x02 : 0x01;
 		sqe->nsid   = cpu_to_le32(s->nsid);
@@ -201,7 +219,7 @@ static int submit_nvme_io(struct unvmed_ublk_queue *q,
 		sqe->nlb    = cpu_to_le16(nlb);
 		sqe->cid    = cmd->cid;
 		sqe->dptr.prp1 = cpu_to_le64(iova);
-		sqe->dptr.prp2 = 0;
+		sqe->dptr.prp2 = cpu_to_le64(prp2);
 	}
 
 	cmd->opaque = (void *)(uintptr_t)tag;

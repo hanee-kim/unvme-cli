@@ -79,6 +79,16 @@ struct unvmed_ublk_queue {
 	size_t                      slot_size;    /* max bytes per I/O */
 
 	/*
+	 * Pre-built PRP lists, one controller page per tag.  Slot IOVAs are
+	 * fixed for the lifetime of the queue, so the PRP list describing a
+	 * full slot never changes; I/Os spanning more than two pages simply
+	 * point PRP2 at their tag's list.  NULL if a slot fits in two pages.
+	 */
+	void                       *prplists;
+	uint64_t                    prplists_iova;
+	size_t                      page_size;    /* controller MPS in bytes */
+
+	/*
 	 * cmd_buf: mmap of the ublk char device's UBLKSRV_CMD_BUF_OFFSET
 	 * region for this queue.  Contains ublksrv_io_desc[queue_depth]
 	 * written by the kernel on each FETCH_REQ completion.
