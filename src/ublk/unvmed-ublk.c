@@ -21,6 +21,8 @@
 
 #include <nvme/types.h>
 
+#include <vfn/nvme.h>
+
 #include "libunvmed.h"
 #include "libunvmed-private.h"
 

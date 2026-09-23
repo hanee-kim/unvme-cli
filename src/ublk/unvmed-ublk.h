@@ -12,6 +12,11 @@
 #include <liburing.h>
 #include <linux/ublk_cmd.h>
 
+/* Not yet in older kernel uapi headers; value from include/uapi/linux/ublk_cmd.h */
+#ifndef UBLK_F_NO_AUTO_PART_SCAN
+#define UBLK_F_NO_AUTO_PART_SCAN	(1ULL << 18)
+#endif
+
 struct unvme;
 struct unvme_sq;
 struct unvme_cq;

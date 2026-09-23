@@ -14,6 +14,8 @@
 #include <liburing.h>
 #include <linux/ublk_cmd.h>
 
+#include <vfn/nvme.h>
+
 #include "libunvmed.h"
 
 #include "unvmed-ublk.h"
