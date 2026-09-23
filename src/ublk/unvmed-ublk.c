@@ -267,29 +267,6 @@ static int unvmed_ublk_queue_init_iodesc(struct unvmed_ublk_queue *q)
 	return 0;
 }
 
-static int unvmed_ublk_queue_init_ring(struct unvmed_ublk_queue *q)
-{
-	struct unvmed_ublk_server *s = q->server;
-	struct io_uring_params params = {};
-	int ret;
-
-	/*
-	 * IORING_SETUP_SQE128: 128-byte SQEs, needed to embed
-	 * struct ublksrv_io_cmd (16 bytes) in the cmd[] tail area.
-	 */
-	params.flags = IORING_SETUP_SQE128;
-
-	/* +1 for occasional extra SQE during flush */
-	ret = io_uring_queue_init_params(s->queue_depth + 1, &q->ring, &params);
-	if (ret) {
-		unvmed_log_err("ublk q%d: io_uring init failed: %s",
-			       q->qid, strerror(-ret));
-		return -1;
-	}
-
-	return 0;
-}
-
 static int unvmed_ublk_queue_init(struct unvmed_ublk_queue *q, int dev_fd,
 				  uint32_t poll_spin_us)
 {
@@ -304,14 +281,12 @@ static int unvmed_ublk_queue_init(struct unvmed_ublk_queue *q, int dev_fd,
 	if (unvmed_ublk_queue_init_iodesc(q))
 		goto err_iodesc;
 
-	if (unvmed_ublk_queue_init_ring(q))
-		goto err_ring;
-
+	/*
+	 * The io_uring ring is set up by the handler thread itself; see
+	 * unvmed_ublk_queue_init_ring().
+	 */
 	return 0;
 
-err_ring:
-	munmap(q->io_descs, q->io_descs_size);
-	q->io_descs = NULL;
 err_iodesc:
 	unvmed_unmap_vaddr(s->u, q->bounce);
 	unvmed_pgunmap(q->bounce);
@@ -325,7 +300,11 @@ static void unvmed_ublk_queue_free(struct unvmed_ublk_queue *q)
 	if (!q)
 		return;
 
-	io_uring_queue_exit(&q->ring);
+	/* Normally torn down by the handler thread on exit. */
+	if (q->ring_ready) {
+		io_uring_queue_exit(&q->ring);
+		q->ring_ready = false;
+	}
 
 	if (q->io_descs) {
 		munmap(q->io_descs, q->io_descs_size);

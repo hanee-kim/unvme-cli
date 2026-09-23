@@ -44,8 +44,18 @@ struct unvmed_ublk_queue {
 	struct unvmed_ublk_server  *server;
 	int                         qid;
 
-	/* io_uring ring for ublk IO commands (SQE128 mode) */
+	/*
+	 * io_uring ring for ublk IO commands (SQE128 mode).  Created and
+	 * destroyed by the handler thread (IORING_SETUP_SINGLE_ISSUER).
+	 */
 	struct io_uring             ring;
+	bool                        ring_ready;
+	/*
+	 * true if the ring was set up with IORING_SETUP_TASKRUN_FLAG, i.e.
+	 * the kernel raises IORING_SQ_TASKRUN when ublk task-work is pending
+	 * and the handler can skip io_uring_enter(2) while it is clear.
+	 */
+	bool                        taskrun_flag;
 
 	/* per-queue ublk char device fd (/dev/ublkc<dev_id>) */
 	int                         dev_fd;

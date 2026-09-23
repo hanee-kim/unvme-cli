@@ -25,6 +25,80 @@
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
+/* io_uring ring setup                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Must be called from the handler thread: IORING_SETUP_SINGLE_ISSUER binds
+ * the ring to the creating task, and ublk requires FETCH/COMMIT to be issued
+ * by that same task anyway.
+ *
+ * IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN: ublk delivers new
+ * requests as task-work on the handler thread.  By default that task-work
+ * interrupts the busy-polling thread (TWA_SIGNAL); with these flags it is
+ * deferred until the thread enters the kernel itself.
+ *
+ * IORING_SETUP_TASKRUN_FLAG: the kernel sets IORING_SQ_TASKRUN in the SQ
+ * ring flags while task-work is pending, so the poll loop can tell from
+ * userspace whether io_uring_enter(2) is needed at all.
+ *
+ * Older kernels reject these flags; fall back to a plain SQE128 ring and
+ * enter the kernel on every iteration as before.
+ */
+static int unvmed_ublk_queue_init_ring(struct unvmed_ublk_queue *q)
+{
+	struct unvmed_ublk_server *s = q->server;
+	struct io_uring_params params = {};
+	int ret;
+
+	/*
+	 * IORING_SETUP_SQE128: 128-byte SQEs, needed to embed
+	 * struct ublksrv_io_cmd (16 bytes) in the cmd[] tail area.
+	 */
+	params.flags = IORING_SETUP_SQE128 |
+		       IORING_SETUP_COOP_TASKRUN |
+		       IORING_SETUP_TASKRUN_FLAG |
+		       IORING_SETUP_SINGLE_ISSUER |
+		       IORING_SETUP_DEFER_TASKRUN;
+
+	/* +1 for occasional extra SQE during flush */
+	ret = io_uring_queue_init_params(s->queue_depth + 1, &q->ring, &params);
+	if (ret == -EINVAL) {
+		unvmed_log_info("ublk q%d: io_uring DEFER_TASKRUN unsupported, "
+				"falling back to per-iteration io_uring_enter",
+				q->qid);
+		memset(&params, 0, sizeof(params));
+		params.flags = IORING_SETUP_SQE128;
+		ret = io_uring_queue_init_params(s->queue_depth + 1, &q->ring,
+						 &params);
+	}
+	if (ret) {
+		unvmed_log_err("ublk q%d: io_uring init failed: %s",
+			       q->qid, strerror(-ret));
+		return -1;
+	}
+
+	q->taskrun_flag = !!(params.flags & IORING_SETUP_TASKRUN_FLAG);
+	q->ring_ready = true;
+	return 0;
+}
+
+/*
+ * Whether this loop iteration has to call io_uring_enter(2): there are
+ * SQEs (COMMIT_AND_FETCH) to submit, or the kernel has ublk task-work
+ * (new requests, aborts) or overflowed CQEs waiting for us.
+ */
+static inline bool ublk_ring_needs_enter(struct unvmed_ublk_queue *q)
+{
+	if (!q->taskrun_flag)
+		return true;
+	if (io_uring_sq_ready(&q->ring))
+		return true;
+	return IO_URING_READ_ONCE(*q->ring.sq.kflags) &
+		(IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW);
+}
+
+/* ------------------------------------------------------------------ */
 /* ublk COMMIT_AND_FETCH_REQ submission                                */
 /* ------------------------------------------------------------------ */
 
@@ -235,6 +309,14 @@ void *unvmed_ublk_queue_handler(void *arg)
 		return NULL;
 	}
 
+	if (unvmed_ublk_queue_init_ring(q)) {
+		free(ublk_cqes);
+		free(nvme_cqes);
+		atomic_store(&q->running, false);
+		sem_post(&q->fetch_submitted);
+		return NULL;
+	}
+
 	unvmed_log_info("ublk q%d handler started", q->ucq->id);
 
 	/*
@@ -254,6 +336,8 @@ void *unvmed_ublk_queue_handler(void *arg)
 		if (!sqe) {
 			unvmed_log_err("ublk q%d: no SQE for initial FETCH tag %u",
 				       q->ucq->id, tag);
+			io_uring_queue_exit(&q->ring);
+			q->ring_ready = false;
 			free(ublk_cqes);
 			free(nvme_cqes);
 			atomic_store(&q->running, false);
@@ -284,8 +368,13 @@ void *unvmed_ublk_queue_handler(void *arg)
 		 * pending SQEs.  Without it, ublk FETCH_REQ completions for new
 		 * kernel IO requests would sit as task-work and never appear in
 		 * the CQ ring — causing a permanent hang.
+		 *
+		 * Skip the syscall entirely when there is nothing to submit
+		 * and no task-work pending; the loop then only polls the NVMe
+		 * CQ in userspace.
 		 */
-		io_uring_submit_and_get_events(&q->ring);
+		if (ublk_ring_needs_enter(q))
+			io_uring_submit_and_get_events(&q->ring);
 
 		/*
 		 * Signal the server start path that this queue's initial
@@ -341,6 +430,9 @@ void *unvmed_ublk_queue_handler(void *arg)
 
 		/* ── Phase 3: busy-poll, no yield ── */
 	}
+
+	io_uring_queue_exit(&q->ring);
+	q->ring_ready = false;
 
 	free(ublk_cqes);
 	free(nvme_cqes);
