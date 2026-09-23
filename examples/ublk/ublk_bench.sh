@@ -8,13 +8,13 @@
 # revisions.  Also records how many CPU cores unvmed (the ublk queue
 # handler threads) consumed during each workload.
 #
-# By default it compares every commit in <base>..HEAD (base: origin/ublk),
+# By default it compares every commit in <base>..HEAD (base: origin/main),
 # so each optimization commit can be measured on its own.
 
 set -e
 
 BDF=""
-BASE="origin/ublk"
+BASE="origin/main"
 REVS=""
 NR_QUEUES=1
 QSIZE=256
