@@ -4207,8 +4207,8 @@ int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
 int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
 			   struct nvme_cqe *cqes, int max)
 {
+	struct unvme_sq *usq = NULL;
 	struct nvme_cqe *cqe;
-	int nr_cmds;
 	int nr = 0;
 
 	unvmed_cq_enter(ucq);
@@ -4217,6 +4217,9 @@ int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
 		return 0;
 	}
 	while (nr < max) {
+		struct unvme_cmd *cmd;
+		uint16_t sqid;
+
 		cqe = nvme_cq_get_cqe(ucq->q);
 		if (!cqe)
 			break;
@@ -4231,19 +4234,25 @@ int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
 		 * We skip the VCQ push that unvmed_cmd_cmpl() would do —
 		 * ublk manages command lifecycle through cmd->opaque / sqid
 		 * lookup rather than the VCQ pipeline.
+		 *
+		 * unvmed_sq_find() takes the controller-wide sqs_lock, which
+		 * every queue thread shares.  CQEs in a batch almost always
+		 * come from the same SQ, so only look it up again when the
+		 * sqid changes.
 		 */
-		{
-			struct unvme_sq *usq = unvmed_sq_find(u, le16_to_cpu(cqe->sqid));
-			if (usq) {
-				struct unvme_cmd *cmd = unvmed_get_cmd(usq, le16_to_cpu(cqe->cid));
-				if (cmd) {
-					atomic_store_release(&cmd->state,
-							     UNVME_CMD_S_TO_BE_COMPLETED);
-					cmd->cqe = *cqe;
-					atomic_store_release(&cmd->state,
-							     UNVME_CMD_S_COMPLETED);
-				}
-			}
+		sqid = le16_to_cpu(cqe->sqid);
+		if (!usq || usq->id != sqid)
+			usq = unvmed_sq_find(u, sqid);
+		if (!usq)
+			continue;
+
+		cmd = unvmed_get_cmd(usq, le16_to_cpu(cqe->cid));
+		if (cmd) {
+			atomic_store_release(&cmd->state,
+					     UNVME_CMD_S_TO_BE_COMPLETED);
+			cmd->cqe = *cqe;
+			atomic_store_release(&cmd->state,
+					     UNVME_CMD_S_COMPLETED);
 		}
 	}
 
@@ -4257,12 +4266,13 @@ int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
 		nvme_cq_update_head(ucq->q);
 	unvmed_cq_exit(ucq);
 
-	if (nr) {
-		do {
-			nr_cmds = u->nr_cmds;
-		} while (!atomic_cmpxchg(&u->nr_cmds, nr_cmds, nr_cmds - nr));
-	}
-
+	/*
+	 * u->nr_cmds is not touched here: commands reaped by this function
+	 * are posted directly with nvme_sq_post() rather than
+	 * unvmed_cmd_post(), so they were never counted in the first place.
+	 * Decrementing it drove the counter negative and added a CAS on a
+	 * controller-wide cacheline for every batch.
+	 */
 	return nr;
 }
 

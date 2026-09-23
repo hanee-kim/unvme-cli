@@ -2060,6 +2060,9 @@ int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
  * the per-SQ VCQ pipeline.  The caller must release each command via
  * unvmed_cmd_put() after inspecting the returned CQEs.
  *
+ * Commands completed here are expected to have been posted without
+ * unvmed_cmd_post(), so @u->nr_cmds is left untouched.
+ *
  * Return: Number of CQEs reaped.
  */
 int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,

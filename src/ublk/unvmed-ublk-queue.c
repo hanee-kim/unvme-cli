@@ -175,8 +175,13 @@ static int poll_nvme_completions(struct unvmed_ublk_queue *q,
 		 * Look up the command by (sqid, cid).  unvmed_cq_run_n_multi()
 		 * already set cmd->state = COMPLETED, so unvmed_get_cmd()
 		 * returns non-NULL.  cmd->opaque carries the ublk tag.
+		 *
+		 * The queue submits only to q->usq, so resolve that directly
+		 * and fall back to unvmed_sq_find() (controller-wide rwlock)
+		 * only for an unexpected sqid.
 		 */
-		struct unvme_sq *usq = unvmed_sq_find(s->u, sqid);
+		struct unvme_sq *usq = likely(sqid == q->usq->id) ?
+			q->usq : unvmed_sq_find(s->u, sqid);
 		if (!usq) {
 			unvmed_log_err("ublk q%d: sqid=%u not found in cqe",
 				       q->ucq->id, sqid);
