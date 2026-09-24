@@ -3570,6 +3570,7 @@ static void __unvmed_delete_cq_all(struct unvme *u)
 		assert(refcnt > 0);
 
 		unvmed_discard_cq(u, qid);
+		unvmed_disable_cq(ucq);
 		unvmed_cq_put(u, ucq);
 	}
 
@@ -4189,6 +4190,90 @@ int unvmed_cq_run_n(struct unvme *u, struct unvme_sq *usq, struct unvme_cq *ucq,
 		return -1;
 
 	return ret + n;
+}
+
+/*
+ * unvmed_cq_run_n_multi - Reap CQ entries when multiple SQs share one CQ.
+ *
+ * Unlike unvmed_cq_run_n(), this function does NOT require a single owning
+ * SQ.  It reads raw CQEs directly from the hardware CQ, resolves the correct
+ * SQ for each entry via cqe->sqid, and marks the command as completed
+ * without going through the per-SQ VCQ pipeline.  The caller is responsible
+ * for looking up and releasing each command (unvmed_cmd_put) after processing
+ * the returned CQEs.
+ *
+ * Returns the number of CQEs reaped.
+ */
+int unvmed_cq_run_n_multi(struct unvme *u, struct unvme_cq *ucq,
+			   struct nvme_cqe *cqes, int max)
+{
+	struct unvme_sq *usq = NULL;
+	struct nvme_cqe *cqe;
+	int nr = 0;
+
+	unvmed_cq_enter(ucq);
+	if (!ucq->q) {
+		unvmed_cq_exit(ucq);
+		return 0;
+	}
+	while (nr < max) {
+		struct unvme_cmd *cmd;
+		uint16_t sqid;
+
+		cqe = nvme_cq_get_cqe(ucq->q);
+		if (!cqe)
+			break;
+
+		if (cqes)
+			memcpy(&cqes[nr], cqe, sizeof(*cqe));
+		nr++;
+
+		/*
+		 * Resolve the correct SQ by sqid and mark the command
+		 * completed so that unvmed_cmd_put() can free it correctly.
+		 * We skip the VCQ push that unvmed_cmd_cmpl() would do —
+		 * ublk manages command lifecycle through cmd->opaque / sqid
+		 * lookup rather than the VCQ pipeline.
+		 *
+		 * unvmed_sq_find() takes the controller-wide sqs_lock, which
+		 * every queue thread shares.  CQEs in a batch almost always
+		 * come from the same SQ, so only look it up again when the
+		 * sqid changes.
+		 */
+		sqid = le16_to_cpu(cqe->sqid);
+		if (!usq || usq->id != sqid)
+			usq = unvmed_sq_find(u, sqid);
+		if (!usq)
+			continue;
+
+		cmd = unvmed_get_cmd(usq, le16_to_cpu(cqe->cid));
+		if (cmd) {
+			atomic_store_release(&cmd->state,
+					     UNVME_CMD_S_TO_BE_COMPLETED);
+			cmd->cqe = *cqe;
+			atomic_store_release(&cmd->state,
+					     UNVME_CMD_S_COMPLETED);
+		}
+	}
+
+	/*
+	 * Ring the CQ head doorbell once for the whole batch instead of once
+	 * per CQE.  Every doorbell is an uncached MMIO write to the BAR, and
+	 * all reaped entries have already been copied out above, so the
+	 * controller may safely reuse the slots from here on.
+	 */
+	if (nr)
+		nvme_cq_update_head(ucq->q);
+	unvmed_cq_exit(ucq);
+
+	/*
+	 * u->nr_cmds is not touched here: commands reaped by this function
+	 * are posted directly with nvme_sq_post() rather than
+	 * unvmed_cmd_post(), so they were never counted in the first place.
+	 * Decrementing it drove the counter negative and added a CAS on a
+	 * controller-wide cacheline for every batch.
+	 */
+	return nr;
 }
 
 static int unvmed_sq_nr_pending_sqes(struct unvme_sq *usq)
